@@ -1,0 +1,7 @@
+; ISSUE-005: a public defn in a shared library is preempted by any same-named
+; symbol already in the process, including the library's own calls to it.
+; expect: prints "mine"; actual: libc's raise(SIGHUP=1) kills the process
+; run: $NUCLEUSC -c $P -o $W/p.o && clang -shared $W/p.o -o $W/p.so && printf '#include <dlfcn.h>\n#include <stdio.h>\nint main(void){void*h=dlopen("%s",RTLD_NOW);int(*f)(void)=(int(*)(void))dlsym(h,"go");printf("%%s\\n",f()==7?"mine":"theirs");return 0;}' $W/p.so > $W/m.c && cc $W/m.c -o $W/m -ldl && $W/m
+; fixed-when-output: mine
+(defn raise (sig:i32):i32 (return 7))
+(defn go ():i32 (return (raise 1)))

@@ -1,0 +1,7 @@
+.nucleus-work/
+build/
+reference/build/
+reference/tests/
+*.o
+*.so
+lib/

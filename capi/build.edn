@@ -1,0 +1,4 @@
+{:kind :library
+ :name "luacapi"
+ :version "5.5.1"
+ :cflags ["-I../include"]}

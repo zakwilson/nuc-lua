@@ -1,0 +1,7 @@
+; ISSUE-002: a C function declared `RET (name)(args)` is dropped without a word.
+; expect: prints 42; actual (before the fix): `unknown: twice`
+; run: $NUCLEUSC --cflag=-I$D $P --link-arg=$D/issue-002.c -o $W/p && $W/p
+; fixed-when-output: 42
+(import-use "issue-002.h")
+(import-use "stdio.h")
+(defn main ():i32 (printf "%lld\n" (twice 21)) (return 0))

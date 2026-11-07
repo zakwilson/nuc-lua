@@ -1,0 +1,12 @@
+;; Milestone 0's host: runs one script on the stock core. Milestone 2 replaces it
+;; with the port of lua.c.
+(import luacapi)
+
+(defn main (argc:i32 argv:(ptr CStr)):i32
+  (let (L:ptr (luaL_newstate))
+    (luaL_openlibs L)
+    (when (and (> argc 1) (luaL_dofile L (aref argv 1)))
+      (fprintf stderr "%s\n" (lua_tostring L -1))
+      (return 1))
+    (lua_close L)
+    (return 0)))

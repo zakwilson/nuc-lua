@@ -1,0 +1,13 @@
+; ISSUE-001: a C variadic can't be defined in Nucleus.
+; expect: compiles, and prints "6 2.50"
+; run: $NUCLEUSC $P -o $W/p && $W/p
+; fixed-when-output: 6 2.50
+(declare printf (fmt:CStr :varargs):i32)
+(defn sum (n:i32 :varargs ap):i32
+  (let (t:i32 0)
+    (dotimes (i n) (set! t (+ t (unsafe/va-arg ap i32))))
+    (return t)))
+(defn half (:varargs ap):f64 (return (/ (unsafe/va-arg ap f64) 2.0)))
+(defn main ():i32
+  (printf "%d %.2f\n" (sum 3 1 2 3) (half 5.0))
+  (return 0))

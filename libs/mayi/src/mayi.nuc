@@ -1,0 +1,28 @@
+; scratch/mayi.c in Nucleus: `mayi(seconds)` is whether stdin becomes readable
+; within that many seconds.
+(import-use luacapi)
+(import-use "sys/select.h")
+(import-use "string.h")
+
+(defn- f-mayi (L:&lua_State):i32
+  (let (s:&fd_set (alloca fd_set)
+        tm:&timeval (alloca timeval))
+    (memset s 0 (sizeof fd_set))
+    (memset tm 0 (sizeof timeval))
+    (when (!= (lua_isnumber L 1) 0)
+      (let (t:f64 (lua_tonumber L 1))
+        (set! (tm 'tv_sec) (as i64 (unsafe/cast i32 t)))
+        (set! (tm 'tv_usec) (as i64 (% (unsafe/cast i32 (* t 1000000.0)) 1000000)))
+        (when (>= (tm 'tv_usec) 1000000)
+          (set! (tm 'tv_usec) (- (tm 'tv_usec) 1000000))
+          (set! (tm 'tv_sec) (+ (tm 'tv_sec) 1)))))
+    ; FD_SET(0, &s): bit 0 of the first word.
+    (set! (aref (s '__fds_bits) 0) 1)
+    (lua_pushboolean L (select 1 s null null tm))
+    (return 1)))
+
+(defn luaopen_mayi (L:&lua_State):i32
+  (lua_newtable L)
+  (lua_pushcfunction L f-mayi)
+  (lua_setfield L -2 "mayi")
+  (return 1))

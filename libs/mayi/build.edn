@@ -1,0 +1,5 @@
+{:kind :library
+ :name "mayi"
+ :version "1.0"
+ :shared true
+ :deps {luacapi {:path "../../capi"}}}

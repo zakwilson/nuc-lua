@@ -1,0 +1,8 @@
+; ISSUE-003: a defvar array of a C header's struct is refused as opaque.
+; expect: prints 16; actual (before the fix): `array element: 'Reg' is an opaque type`
+; run: $NUCLEUSC --cflag=-I$D $P -o $W/p && $W/p
+; fixed-when-output: 16
+(import-use "issue-003.h")
+(import-use "stdio.h")
+(defvar regs:(array Reg 2))
+(defn main ():i32 (printf "%zu\n" (sizeof Reg)) (return 0))
