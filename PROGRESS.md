@@ -29,7 +29,7 @@ object model, the compiler, execution state, the collector and the VM (§10).
 | 1 Binding and first library | done: `capi/` (both layers), layout gate, `libs/mayi`, `tests/capi/capi.c`, stock column |
 | 2 Host and libraries | done: `lua.c`, `lauxlib.c`, `linit` and every standard library in Nucleus |
 | 3 Object model | done: `lctype`, `lzio`, `lmem`, `lobject`, `lstring`, `lfunc`, `ltm`, `ltable` |
-| 4 Compiler | in progress: `lopcodes`, `llex` ported; `lcode`, `lparser`, `ldump`, `lundump`, `luac.c` left |
+| 4 Compiler | in progress: `lopcodes`, `llex`, `lcode` ported; `lparser`, `ldump`, `lundump`, `luac.c` left |
 | 5–11 | not started |
 
 ### Nucleus
@@ -75,6 +75,8 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
   and the probes. Scripts that stress strings, metamethods, to-be-closed variables,
   varargs and tables printed the same as stock. A table-heavy loop ran in 0.41 s against
   stock's 0.38 s.
+- M4 so far: after `lopcodes`, `llex` and `lcode`, the suite and every gate pass;
+  compiling the suite and a 140,000-constant chunk 20 times takes as long as stock.
 - The spike: a Nucleus `luaopen_` module whose function raises with `luaL_error`
   (a real C variadic call) is caught by `pcall` in stock `lua`.
 
@@ -86,15 +88,19 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
 - `scripts/build-libs.sh` builds `libs/*` into `build/so/n/`; `setup.sh` builds the C
   modules into `build/so/c/`.
 - `scripts/check-probes.sh`.
-- `scripts/check-bytecode.sh`: the 68 dumps of the suite's files, stripped and not, must be
-  byte-identical to stock's; names the first differing function; cross-loads both ways.
+- `scripts/check-bytecode.sh`: the 78 dumps of the suite's files and of
+  `tests/bytecode/gen-stress.lua`'s sources (LOADKX, SETLIST's extra argument, absolute
+  line info, folding corners, every variable kind), stripped and not, must be
+  byte-identical to stock's; names the first differing function; cross-loads both ways;
+  `tests/bytecode/errors.lua`'s compile errors must read the same.
 - `scripts/check-tables.sh`: `luaP_opmodes` and `luai_ctype_` byte-identical to stock's.
 - `scripts/check-suite.sh` runs the official suite (`LUA=` picks the binary).
 
 ## Next
 
-M4, the compiler: `lcode`, `lparser`, `ldump`, `lundump`, then `luac.c`, with the suite
-and `check-bytecode.sh` after each. `opcodes.nuc` generates `luaP_opmodes` from one
+M4, the compiler: `lparser`, `ldump`, `lundump`, then `luac.c`, with the suite
+and `check-bytecode.sh` after each. `code.nuc` holds `lcode.h`'s macros and the
+`expdesc` union accessors (`u`, `set-u`, `ind`, `set-ind`, `uvar`) the parser will use. `opcodes.nuc` generates `luaP_opmodes` from one
 opcode row table (`with-opcodes`); `luac`'s opcode names come from the same rows.
 
 The core modules import the internal headers (`-Ireference/build/src` in `:cflags`) for

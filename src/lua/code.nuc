@@ -1,0 +1,1061 @@
+; The code generator: the parser calls it to emit each function's bytecode.
+;
+; lcode.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.code)
+(set-ir-prefix "")
+(import-use "lstate.h")
+(import-use "lcode.h")
+(import-use "llex.h")
+(import-use "lparser.h")
+(import-use "lopcodes.h")
+(import-use "ldebug.h")
+(import-use "ldo.h")
+(import-use "lgc.h")
+(import-use "lmem.h")
+(import-use "lobject.h")
+(import-use "lstring.h")
+(import-use "ltable.h")
+(import-use "lvm.h")
+(import-use "math.h")
+(import-use "string.h")
+(import-use lua.util)
+(import-use lua.core)
+(import-use lua.opcodes)
+
+(defconst INT_MAX 2147483647)
+(defconst LIMLINEDIFF 0x80)  ; the largest line difference kept as relative
+(defconst NOT_PF_VAHID 0xFE) ; cast_byte(~PF_VAHID)
+
+; ---- lcode.h ----
+(defmacro foldbinop (op) `(<= ~op OPR_SHR))
+(defmacro luaK_codeABC (fs o a b c) `(luaK_codeABCk ~fs ~o ~a ~b ~c 0))
+(defmacro code-at (fs pc) `(p+ ((~fs 'f) 'code) ~pc))
+(defmacro instr (fs e) `(code-at ~fs (u ~e 'info)))  ; &getinstruction(fs, e)
+(defmacro getinstruction (fs e) `(deref (instr ~fs ~e)))
+(defmacro luaK_setmultret (fs e) `(luaK_setreturns ~fs ~e LUA_MULTRET))
+(defmacro luaK_jumpto (fs t) `(luaK_patchlist ~fs (luaK_jump ~fs) ~t))
+
+; expdesc's union. A setter for each, as set! won't take a macro place (ISSUE-020).
+(defmacro u (e f) `((~e 'u) ~f))
+(defmacro set-u (e f v) `(set! ((~e 'u) ~f) ~v))
+(defmacro ind (e f) `(((~e 'u) 'ind) ~f))
+(defmacro set-ind (e f v) `(set! (((~e 'u) 'ind) ~f) ~v))
+(defmacro uvar (e f) `(((~e 'u) 'var) ~f))
+(defmacro copy-exp (dst src) `(memcpy ~dst ~src (sizeof expdesc)))
+
+; VJMP expressions have jumps too.
+(defmacro hasjumps (e) `(!= (~e 't) (~e 'f)))
+
+(defmacro vatab (p) `(!= (bit-and (~p 'flag) PF_VATAB) 0))
+(defmacro vahid (p) `(!= (bit-and (~p 'flag) PF_VAHID) 0))
+(defmacro needvatab (p) `(set! (~p 'flag) (cast_uchar (bit-or (~p 'flag) PF_VATAB))))
+
+; luaM_limitN is the identity here: MAX_SIZET/sizeof(t) exceeds every int limit.
+(defmacro luaM_growvector (L v nelems size T limit e)
+  `(set! ~v (unsafe/cast (ptr ~T) (luaM_growaux_ ~L (as ptr ~v) ~nelems (ref ~size)
+                                                 (unsafe/cast ui32 (sizeof ~T)) ~limit ~e))))
+
+(defn luaK_semerror (ls:(ptr LexState) fmt:CStr :varargs argp):void
+  (let (msg:CStr (luaO_pushvfstring (ls 'L) fmt argp))
+    (when (= (as ptr msg) null)
+      (luaD_throw (ls 'L) LUA_ERRMEM))
+    (set! ((ls 't) 'token) 0)  ; no "near <token>" in the message
+    (set! (ls 'linenumber) (ls 'lastline))  ; back to the last used token's line
+    (luaX_syntaxerror ls msg)))
+
+; Whether 'e' is a numeric constant; if so, and 'v' isn't null, its value.
+(defn- tonumeral (e:(ptr expdesc) v:(ptr TValue)):bool
+  (when (hasjumps e)
+    (return false))
+  (case (e 'k)
+    VKINT (do (when (!= (as ptr v) null) (setivalue v (u e 'ival)))
+              (return true))
+    VKFLT (do (when (!= (as ptr v) null) (setfltvalue v (u e 'nval)))
+              (return true))
+    (return false)))
+
+(defn- const2val (fs:(ptr FuncState) e:(ptr expdesc)):(ptr TValue)
+  (return (ref ((p+ ((((fs 'ls) 'dyd) 'actvar) 'arr) (u e 'info)) 'k))))
+
+(defn luaK_exp2const (fs:(ptr FuncState) e:(ptr expdesc) v:(ptr TValue)):i32
+  (when (hasjumps e)
+    (return 0))
+  (case (e 'k)
+    VFALSE (do (setbfvalue v) (return 1))
+    VTRUE (do (setbtvalue v) (return 1))
+    VNIL (do (setnilvalue v) (return 1))
+    VKSTR (do (setsvalue ((fs 'ls) 'L) v (u e 'strval)) (return 1))
+    VCONST (do (setobj ((fs 'ls) 'L) v (const2val fs e)) (return 1))
+    (return (if (tonumeral e v) 1 0))))
+
+(defvar- invalidinstruction:Instruction 0xFFFFFFFF)
+
+; A jump target may sit between this instruction and the one before; then an
+; invalid instruction stands in, to block wrong optimizations.
+(defn- previousinstruction (fs:(ptr FuncState)):(ptr Instruction)
+  (if (> (fs 'pc) (fs 'lasttarget))
+    (return (code-at fs (- (fs 'pc) 1)))
+    (return &invalidinstruction)))
+
+; An OP_LOADNIL, merged into the one before when the ranges meet.
+(defn luaK_nil (fs:(ptr FuncState) from:i32 n:i32):void
+  (let (l:i32 (- (+ from n) 1)  ; the last register set to nil
+        previous:(ptr Instruction) (previousinstruction fs))
+    (when (= (GET_OPCODE (deref previous)) OP_LOADNIL)
+      (let (pfrom:i32 (GETARG_A (deref previous))
+            pl:i32 (+ pfrom (GETARG_B (deref previous))))
+        (when (or (and (<= pfrom from) (<= from (+ pl 1)))
+                  (and (<= from pfrom) (<= pfrom (+ l 1))))
+          (when (< pfrom from) (set! from pfrom))
+          (when (> pl l) (set! l pl))
+          (SETARG_A (deref previous) from)
+          (SETARG_B (deref previous) (- l from))
+          (return))))
+    (luaK_codeABC fs OP_LOADNIL from (- n 1) 0)))
+
+; A jump's destination; a jump to itself ends a list.
+(defn- getjump (fs:(ptr FuncState) pc:i32):i32
+  (let (offset:i32 (GETARG_sJ (deref (code-at fs pc))))
+    (if (= offset NO_JUMP)
+      (return NO_JUMP)
+      (return (+ (+ pc 1) offset)))))
+
+(defn- fixjump (fs:(ptr FuncState) pc:i32 dest:i32):void
+  (let (jmp:(ptr Instruction) (code-at fs pc)
+        offset:i32 (- dest (+ pc 1)))
+    (when (not (and (<= (- 0 OFFSET_sJ) offset) (<= offset (- MAXARG_sJ OFFSET_sJ))))
+      (luaX_syntaxerror (fs 'ls) "control structure too long"))
+    (SETARG_sJ (deref jmp) offset)))
+
+; Appends jump list 'l2' to '*l1'.
+(defn luaK_concat (fs:(ptr FuncState) l1:(ptr i32) l2:i32):void
+  (when (= l2 NO_JUMP)
+    (return))
+  (if (= (deref l1) NO_JUMP)
+    (set! (deref l1) l2)
+    (let (list:i32 (deref l1)
+          next:i32 (getjump fs list))
+      (while (!= next NO_JUMP)  ; find the last element
+        (set! list next)
+        (set! next (getjump fs list)))
+      (fixjump fs list l2))))
+
+(defn luaK_jump (fs:(ptr FuncState)):i32
+  (return (codesJ fs OP_JMP NO_JUMP 0)))
+
+(defn luaK_ret (fs:(ptr FuncState) first:i32 nret:i32):void
+  (let (op:OpCode (unsafe/cast OpCode (case nret 0 OP_RETURN0 1 OP_RETURN1 OP_RETURN)))
+    (luaY_checklimit fs (+ nret 1) MAXARG_B "returns")
+    (luaK_codeABC fs op first (+ nret 1) 0)))
+
+; A test or comparison and the jump that follows it.
+(defn- condjump (fs:(ptr FuncState) op:OpCode a:i32 b:i32 c:i32 k:i32):i32
+  (luaK_codeABCk fs op a b c k)
+  (return (luaK_jump fs)))
+
+; Marks the current pc as a jump target, so it starts a new basic block.
+(defn luaK_getlabel (fs:(ptr FuncState)):i32
+  (set! (fs 'lasttarget) (fs 'pc))
+  (return (fs 'pc)))
+
+; The instruction that decides a jump: its test, or the jump itself.
+(defn- getjumpcontrol (fs:(ptr FuncState) pc:i32):(ptr Instruction)
+  (let (pi:(ptr Instruction) (code-at fs pc))
+    (if (and (>= pc 1) (testTMode (GET_OPCODE (deref (p+ pi -1)))))
+      (return (p+ pi -1))
+      (return pi))))
+
+; Points a TESTSET at register 'reg', or makes it a plain TEST when there's
+; no register (or the value is in place). False if it isn't a TESTSET.
+(defn- patchtestreg (fs:(ptr FuncState) node:i32 reg:i32):bool
+  (let (i:(ptr Instruction) (getjumpcontrol fs node))
+    (when (!= (GET_OPCODE (deref i)) OP_TESTSET)
+      (return false))
+    (if (and (!= reg NO_REG) (!= reg (GETARG_B (deref i))))
+      (SETARG_A (deref i) reg)
+      (set! (deref i) (CREATE_ABCk OP_TEST (GETARG_B (deref i)) 0 0 (GETARG_k (deref i)))))
+    (return true)))
+
+; No test in the list produces a value.
+(defn- removevalues (fs:(ptr FuncState) list:i32):void
+  (while (!= list NO_JUMP)
+    (patchtestreg fs list NO_REG)
+    (set! list (getjump fs list))))
+
+; Tests that produce values jump to 'vtarget' with them in 'reg'; the others
+; jump to 'dtarget'.
+(defn- patchlistaux (fs:(ptr FuncState) list:i32 vtarget:i32 reg:i32 dtarget:i32):void
+  (while (!= list NO_JUMP)
+    (let (next:i32 (getjump fs list))
+      (if (patchtestreg fs list reg)
+        (fixjump fs list vtarget)
+        (fixjump fs list dtarget))
+      (set! list next))))
+
+; Only backward targets: addresses are known once code is generated.
+(defn luaK_patchlist (fs:(ptr FuncState) list:i32 target:i32):void
+  (patchlistaux fs list target NO_REG target))
+
+(defn luaK_patchtohere (fs:(ptr FuncState) list:i32):void
+  (let (hr:i32 (luaK_getlabel fs))
+    (luaK_patchlist fs list hr)))
+
+; C's 'fs->iwthabs++ >= MAXIWTHABS'.
+(defn- iwthabs-full (fs:(ptr FuncState)):bool
+  (let (n:i32 (as i32 (fs 'iwthabs)))
+    (set! (fs 'iwthabs) (cast_uchar (+ n 1)))
+    (return (>= n MAXIWTHABS))))
+
+; A line difference that won't fit in a byte, or one after MAXIWTHABS
+; relative ones, is saved as absolute, with ABSLINEINFO in 'lineinfo'.
+(defn- savelineinfo (fs:(ptr FuncState) f:(ptr Proto) line:i32):void
+  (let (linedif:i32 (- line (fs 'previousline))
+        pc:i32 (- (fs 'pc) 1))  ; the last instruction coded
+    (when (or (>= (if (< linedif 0) (- 0 linedif) linedif) LIMLINEDIFF)
+              (iwthabs-full fs))
+      (luaM_growvector ((fs 'ls) 'L) (f 'abslineinfo) (fs 'nabslineinfo)
+                       (f 'sizeabslineinfo) AbsLineInfo INT_MAX "lines")
+      (let (a:(ptr AbsLineInfo) (p+ (f 'abslineinfo) (fs 'nabslineinfo)))
+        (set! (a 'pc) pc)
+        (set! (a 'line) line))
+      (set! (fs 'nabslineinfo) (+ (fs 'nabslineinfo) 1))
+      (set! linedif ABSLINEINFO)
+      (set! (fs 'iwthabs) 1))
+    (luaM_growvector ((fs 'ls) 'L) (f 'lineinfo) pc (f 'sizelineinfo) ls_byte INT_MAX "opcodes")
+    (set! (deref (p+ (f 'lineinfo) pc)) (unsafe/cast ls_byte linedif))
+    (set! (fs 'previousline) line)))
+
+; Drops the last instruction's line info. An absolute one forces the next to
+; be absolute too.
+(defn- removelastlineinfo (fs:(ptr FuncState)):void
+  (let (f:(ptr Proto) (fs 'f)
+        pc:i32 (- (fs 'pc) 1)
+        dif:i32 (as i32 (deref (p+ (f 'lineinfo) pc))))
+    (if (!= dif ABSLINEINFO)
+      (do (set! (fs 'previousline) (- (fs 'previousline) dif))
+          (set! (fs 'iwthabs) (cast_uchar (- (as i32 (fs 'iwthabs)) 1))))
+      (do (set! (fs 'nabslineinfo) (- (fs 'nabslineinfo) 1))
+          (set! (fs 'iwthabs) (cast_uchar (+ MAXIWTHABS 1)))))))
+
+(defn- removelastinstruction (fs:(ptr FuncState)):void
+  (removelastlineinfo fs)
+  (set! (fs 'pc) (- (fs 'pc) 1)))
+
+(defn luaK_code (fs:(ptr FuncState) i:Instruction):i32
+  (let (f:(ptr Proto) (fs 'f))
+    (luaM_growvector ((fs 'ls) 'L) (f 'code) (fs 'pc) (f 'sizecode) Instruction INT_MAX "opcodes")
+    (set! (deref (code-at fs (fs 'pc))) i)
+    (set! (fs 'pc) (+ (fs 'pc) 1))
+    (savelineinfo fs f ((fs 'ls) 'lastline))
+    (return (- (fs 'pc) 1))))
+
+(defn luaK_codeABCk (fs:(ptr FuncState) o:OpCode a:i32 b:i32 c:i32 k:i32):i32
+  (return (luaK_code fs (CREATE_ABCk o a b c k))))
+
+(defn luaK_codevABCk (fs:(ptr FuncState) o:OpCode a:i32 b:i32 c:i32 k:i32):i32
+  (return (luaK_code fs (CREATE_vABCk o a b c k))))
+
+(defn luaK_codeABx (fs:(ptr FuncState) o:OpCode a:i32 bc:i32):i32
+  (return (luaK_code fs (CREATE_ABx o a bc))))
+
+(defn- codeAsBx (fs:(ptr FuncState) o:OpCode a:i32 bc:i32):i32
+  (return (luaK_code fs (CREATE_ABx o a (+ bc OFFSET_sBx)))))
+
+(defn- codesJ (fs:(ptr FuncState) o:OpCode sj:i32 k:i32):i32
+  (return (luaK_code fs (CREATE_sJ o (+ sj OFFSET_sJ) k))))
+
+(defn- codeextraarg (fs:(ptr FuncState) a:i32):i32
+  (return (luaK_code fs (CREATE_Ax OP_EXTRAARG a))))
+
+; OP_LOADK while 'k' fits in Bx, else OP_LOADKX and an extra argument.
+(defn- luaK_codek (fs:(ptr FuncState) reg:i32 k:i32):i32
+  (if (<= k MAXARG_Bx)
+    (return (luaK_codeABx fs OP_LOADK reg k))
+    (let (p:i32 (luaK_codeABx fs OP_LOADKX reg 0))
+      (codeextraarg fs k)
+      (return p))))
+
+; Keeps 'maxstacksize' at the register stack's high-water mark.
+(defn luaK_checkstack (fs:(ptr FuncState) n:i32):void
+  (let (newstack:i32 (+ (as i32 (fs 'freereg)) n))
+    (when (> newstack (as i32 ((fs 'f) 'maxstacksize)))
+      (luaY_checklimit fs newstack MAX_FSTACK "registers")
+      (set! ((fs 'f) 'maxstacksize) (cast_uchar newstack)))))
+
+(defn luaK_reserveregs (fs:(ptr FuncState) n:i32):void
+  (luaK_checkstack fs n)
+  (set! (fs 'freereg) (cast_uchar (+ (as i32 (fs 'freereg)) n))))
+
+; Frees 'reg' unless it is a local variable's.
+(defn- freereg (fs:(ptr FuncState) reg:i32):void
+  (when (>= reg (as i32 (luaY_nvarstack fs)))
+    (set! (fs 'freereg) (cast_uchar (- (as i32 (fs 'freereg)) 1)))))
+
+; Highest first: registers are freed as a stack.
+(defn- freeregs (fs:(ptr FuncState) r1:i32 r2:i32):void
+  (if (> r1 r2)
+    (do (freereg fs r1) (freereg fs r2))
+    (do (freereg fs r2) (freereg fs r1))))
+
+(defn- freeexp (fs:(ptr FuncState) e:(ptr expdesc)):void
+  (when (= (e 'k) VNONRELOC)
+    (freereg fs (u e 'info))))
+
+(defn- freeexps (fs:(ptr FuncState) e1:(ptr expdesc) e2:(ptr expdesc)):void
+  (let (r1:i32 (if (= (e1 'k) VNONRELOC) (u e1 'info) -1)
+        r2:i32 (if (= (e2 'k) VNONRELOC) (u e2 'info) -1))
+    (freeregs fs r1 r2)))
+
+(defn- addk (fs:(ptr FuncState) f:(ptr Proto) v:(ptr TValue)):i32
+  (let (L:(ptr lua_State) ((fs 'ls) 'L)
+        oldsize:i32 (f 'sizek)
+        k:i32 (fs 'nk))
+    (luaM_growvector L (f 'k) k (f 'sizek) TValue MAXARG_Ax "constants")
+    (while (< oldsize (f 'sizek))
+      (setnilvalue (p+ (f 'k) oldsize))
+      (set! oldsize (+ oldsize 1)))
+    (setobj L (p+ (f 'k) k) v)
+    (set! (fs 'nk) (+ (fs 'nk) 1))
+    (luaC_barrier L f v)
+    (return k)))
+
+; The scanner's table maps each constant to its index, for reuse. The caller
+; picks a key that is safe to index by (nil can't be one; 1 and 1.0 collapse).
+(defn- k2proto (fs:(ptr FuncState) key:(ptr TValue) v:(ptr TValue)):i32
+  (let (val:(ptr TValue) (alloca TValue)
+        f:(ptr Proto) (fs 'f)
+        tag:i32 (as i32 (luaH_get (fs 'kcache) key val)))
+    (if (not (tagisempty tag))
+      (return (cast_int (ivalue val)))  ; only float keys can collide
+      (let (k:i32 (addk fs f v))
+        ; a number needs no barrier, and the cache is no metatable
+        (setivalue val (as lua_Integer k))
+        (luaH_set ((fs 'ls) 'L) (fs 'kcache) key val)
+        (return k)))))
+
+(defn- stringK (fs:(ptr FuncState) s:(ptr TString)):i32
+  (let (o:(ptr TValue) (alloca TValue))
+    (setsvalue ((fs 'ls) 'L) o s)
+    (return (k2proto fs o o))))
+
+(defn- luaK_intK (fs:(ptr FuncState) n:lua_Integer):i32
+  (let (o:(ptr TValue) (alloca TValue))
+    (setivalue o n)
+    (return (k2proto fs o o))))
+
+; An integral float's key gets its smallest significant power-of-two fraction
+; added, so it can't meet the integer. Where that fails, a duplicate is made.
+(defn- luaK_numberK (fs:(ptr FuncState) r:lua_Number):i32
+  (let (o:(ptr TValue) (alloca TValue)
+        kv:(ptr TValue) (alloca TValue)
+        ik:(ptr lua_Integer) (alloca lua_Integer))
+    (setfltvalue o r)
+    (when (= r 0.0)  ; zero's key is the FuncState: it can't collide
+      (set! ((kv 'value_) 'p) (as ptr fs))  ; setpvalue
+      (set! (kv 'tt_) LUA_VLIGHTUSERDATA)
+      (return (k2proto fs kv o)))
+    (let (q:lua_Number (ldexp 1.0 -52)  ; 2^(1 - DBL_MANT_DIG)
+          k:lua_Number (* r (+ 1.0 q)))
+      (setfltvalue kv k)
+      (when (= (luaV_flttointeger k ik F2Ieq) 0)  ; not an integral value?
+        (let (n:i32 (k2proto fs kv o))
+          (when (!= (luaV_equalobj null (p+ ((fs 'f) 'k) n) o) 0)  ; the right value?
+            (return n))))
+      (return (addk fs (fs 'f) o)))))
+
+(defn- boolF (fs:(ptr FuncState)):i32
+  (let (o:(ptr TValue) (alloca TValue))
+    (setbfvalue o)
+    (return (k2proto fs o o))))
+
+(defn- boolT (fs:(ptr FuncState)):i32
+  (let (o:(ptr TValue) (alloca TValue))
+    (setbtvalue o)
+    (return (k2proto fs o o))))
+
+; nil can't be a key, so the cache table stands in for it.
+(defn- nilK (fs:(ptr FuncState)):i32
+  (let (L:(ptr lua_State) ((fs 'ls) 'L)
+        k:(ptr TValue) (alloca TValue))
+    (sethvalue L k (fs 'kcache))
+    (return (k2proto fs k (ref ((G L) 'nilvalue))))))
+
+; Whether 'i' fits in an sC operand, without int2sC's overflow.
+(defn- fitsC (i:lua_Integer):bool
+  (return (<= (+ (l_castS2U i) (as lua_Unsigned OFFSET_sC)) (as lua_Unsigned MAXARG_C))))
+
+(defn- fitsBx (i:lua_Integer):bool
+  (return (and (<= (as lua_Integer (- 0 OFFSET_sBx)) i)
+               (<= i (as lua_Integer (- MAXARG_Bx OFFSET_sBx))))))
+
+(defn luaK_int (fs:(ptr FuncState) reg:i32 i:lua_Integer):void
+  (if (fitsBx i)
+    (codeAsBx fs OP_LOADI reg (cast_int i))
+    (luaK_codek fs reg (luaK_intK fs i))))
+
+(defn- luaK_float (fs:(ptr FuncState) reg:i32 f:lua_Number):void
+  (let (fi:(ptr lua_Integer) (alloca lua_Integer))
+    (if (and (!= (luaV_flttointeger f fi F2Ieq) 0) (fitsBx (deref fi)))
+      (codeAsBx fs OP_LOADF reg (cast_int (deref fi)))
+      (luaK_codek fs reg (luaK_numberK fs f)))))
+
+; Checks that the global in 'var' is nil. 'k' indexes its name in the
+; constants; 0 (no name: '?') when that won't fit in Bx.
+(defn luaK_codecheckglobal (fs:(ptr FuncState) var:(ptr expdesc) k:i32 line:i32):void
+  (luaK_exp2anyreg fs var)
+  (luaK_fixline fs line)
+  (set! k (if (>= k MAXARG_Bx) 0 (+ k 1)))
+  (luaK_codeABx fs OP_ERRNNIL (u var 'info) k)
+  (luaK_fixline fs line)
+  (freeexp fs var))
+
+(defn- const2exp (v:(ptr TValue) e:(ptr expdesc)):void
+  (case (ttypetag v)
+    LUA_VNUMINT (do (set! (e 'k) VKINT) (set-u e 'ival (ivalue v)))
+    LUA_VNUMFLT (do (set! (e 'k) VKFLT) (set-u e 'nval (fltvalue v)))
+    LUA_VFALSE (set! (e 'k) VFALSE)
+    LUA_VTRUE (set! (e 'k) VTRUE)
+    LUA_VNIL (set! (e 'k) VNIL)
+    (:or LUA_VSHRSTR LUA_VLNGSTR) (do (set! (e 'k) VKSTR) (set-u e 'strval (tsvalue v)))
+    (do)))
+
+; 'e' is a call or a vararg: open, to give 'nresults' results.
+(defn luaK_setreturns (fs:(ptr FuncState) e:(ptr expdesc) nresults:i32):void
+  (let (pc:(ptr Instruction) (instr fs e))
+    (luaY_checklimit fs (+ nresults 1) MAXARG_C "multiple results")
+    (SETARG_C (deref pc) (+ nresults 1))
+    (when (!= (e 'k) VCALL)  ; a vararg
+      (SETARG_A (deref pc) (fs 'freereg))
+      (luaK_reserveregs fs 1))))
+
+(defn- str2K (fs:(ptr FuncState) e:(ptr expdesc)):i32
+  (set-u e 'info (stringK fs (u e 'strval)))
+  (set! (e 'k) VK)
+  (return (u e 'info)))
+
+; A call's one result is fixed in its base register; a vararg's can go anywhere.
+(defn luaK_setoneret (fs:(ptr FuncState) e:(ptr expdesc)):void
+  (cond (= (e 'k) VCALL)  ; it already gives one value
+          (do (set! (e 'k) VNONRELOC)
+              (set-u e 'info (GETARG_A (getinstruction fs e))))
+        (= (e 'k) VVARARG)
+          (do (SETARG_C (deref (instr fs e)) 2)
+              (set! (e 'k) VRELOC))))
+
+; The function will need a vararg table; then the parameter is a plain local.
+(defn luaK_vapar2local (fs:(ptr FuncState) var:(ptr expdesc)):void
+  (needvatab (fs 'f))
+  (set! (var 'k) VLOCAL))
+
+; 'e' is no longer a variable (nor a <const>); it may still have jump lists.
+(defn luaK_dischargevars (fs:(ptr FuncState) e:(ptr expdesc)):void
+  (case (e 'k)
+    VCONST (const2exp (const2val fs e) e)
+    (:or VVARGVAR VLOCAL)
+      (do (when (= (e 'k) VVARGVAR)
+            (luaK_vapar2local fs e))
+          (let (temp:i32 (as i32 (uvar e 'ridx)))  ; the union's fields overlap
+            (set-u e 'info temp)
+            (set! (e 'k) VNONRELOC)))
+    VUPVAL
+      (do (set-u e 'info (luaK_codeABC fs OP_GETUPVAL 0 (u e 'info) 0))
+          (set! (e 'k) VRELOC))
+    VINDEXUP
+      (do (set-u e 'info (luaK_codeABC fs OP_GETTABUP 0 (ind e 't) (ind e 'idx)))
+          (set! (e 'k) VRELOC))
+    VINDEXI
+      (do (freereg fs (ind e 't))
+          (set-u e 'info (luaK_codeABC fs OP_GETI 0 (ind e 't) (ind e 'idx)))
+          (set! (e 'k) VRELOC))
+    VINDEXSTR
+      (do (freereg fs (ind e 't))
+          (set-u e 'info (luaK_codeABC fs OP_GETFIELD 0 (ind e 't) (ind e 'idx)))
+          (set! (e 'k) VRELOC))
+    VINDEXED
+      (do (freeregs fs (ind e 't) (ind e 'idx))
+          (set-u e 'info (luaK_codeABC fs OP_GETTABLE 0 (ind e 't) (ind e 'idx)))
+          (set! (e 'k) VRELOC))
+    VVARGIND
+      (do (freeregs fs (ind e 't) (ind e 'idx))
+          (set-u e 'info (luaK_codeABC fs OP_GETVARG 0 (ind e 't) (ind e 'idx)))
+          (set! (e 'k) VRELOC))
+    (:or VVARARG VCALL) (luaK_setoneret fs e)
+    (do)))  ; one value, available somewhere
+
+; The value goes in 'reg'; 'e' becomes VNONRELOC (jump lists aside).
+(defn- discharge2reg (fs:(ptr FuncState) e:(ptr expdesc) reg:i32):void
+  (luaK_dischargevars fs e)
+  (case (e 'k)
+    VNIL (luaK_nil fs reg 1)
+    VFALSE (luaK_codeABC fs OP_LOADFALSE reg 0 0)
+    VTRUE (luaK_codeABC fs OP_LOADTRUE reg 0 0)
+    (:or VKSTR VK)
+      (do (when (= (e 'k) VKSTR)
+            (str2K fs e))
+          (luaK_codek fs reg (u e 'info)))
+    VKFLT (luaK_float fs reg (u e 'nval))
+    VKINT (luaK_int fs reg (u e 'ival))
+    VRELOC (SETARG_A (deref (instr fs e)) reg)  ; the instruction targets 'reg'
+    VNONRELOC
+      (when (!= reg (u e 'info))
+        (luaK_codeABC fs OP_MOVE reg (u e 'info) 0))
+    (return))  ; a VJMP: nothing to do
+  (set-u e 'info reg)
+  (set! (e 'k) VNONRELOC))
+
+(defn- discharge2anyreg (fs:(ptr FuncState) e:(ptr expdesc)):void
+  (when (!= (e 'k) VNONRELOC)  ; no fixed register yet?
+    (luaK_reserveregs fs 1)
+    (discharge2reg fs e (- (as i32 (fs 'freereg)) 1))))
+
+(defn- code_loadbool (fs:(ptr FuncState) a:i32 op:OpCode):i32
+  (luaK_getlabel fs)  ; these may be jump targets
+  (return (luaK_codeABC fs op a 0 0)))
+
+; Whether some jump in the list produces no value, or an inverted one.
+(defn- need_value (fs:(ptr FuncState) list:i32):bool
+  (while (!= list NO_JUMP)
+    (when (!= (GET_OPCODE (deref (getjumpcontrol fs list))) OP_TESTSET)
+      (return true))
+    (set! list (getjump fs list)))
+  (return false))
+
+; The whole result, jump lists included, goes in 'reg': each jump is patched
+; to the end, or to a load for tests that produce no value.
+(defn- exp2reg (fs:(ptr FuncState) e:(ptr expdesc) reg:i32):void
+  (discharge2reg fs e reg)
+  (when (= (e 'k) VJMP)  ; the expression is itself a test?
+    (luaK_concat fs (ref (e 't)) (u e 'info)))
+  (when (hasjumps e)
+    (let (p_f:i32 NO_JUMP  ; an eventual LOAD false
+          p_t:i32 NO_JUMP)  ; an eventual LOAD true
+      (when (or (need_value fs (e 't)) (need_value fs (e 'f)))
+        (let (fj:i32 (if (= (e 'k) VJMP) NO_JUMP (luaK_jump fs)))
+          (set! p_f (code_loadbool fs reg OP_LFALSESKIP))  ; skips the next
+          (set! p_t (code_loadbool fs reg OP_LOADTRUE))
+          (luaK_patchtohere fs fj)))  ; around the booleans when 'e' isn't a test
+      (let (final:i32 (luaK_getlabel fs))  ; after the whole expression
+        (patchlistaux fs (e 'f) final reg p_f)
+        (patchlistaux fs (e 't) final reg p_t))))
+  (set! (e 'f) NO_JUMP)
+  (set! (e 't) NO_JUMP)
+  (set-u e 'info reg)
+  (set! (e 'k) VNONRELOC))
+
+(defn luaK_exp2nextreg (fs:(ptr FuncState) e:(ptr expdesc)):void
+  (luaK_dischargevars fs e)
+  (freeexp fs e)
+  (luaK_reserveregs fs 1)
+  (exp2reg fs e (- (as i32 (fs 'freereg)) 1)))
+
+(defn luaK_exp2anyreg (fs:(ptr FuncState) e:(ptr expdesc)):i32
+  (luaK_dischargevars fs e)
+  (when (= (e 'k) VNONRELOC)
+    (when (not (hasjumps e))
+      (return (u e 'info)))  ; already in a register
+    (when (>= (u e 'info) (as i32 (luaY_nvarstack fs)))  ; not a local's?
+      (exp2reg fs e (u e 'info))
+      (return (u e 'info))))
+    ; else a local's register can't take the jump values
+  (luaK_exp2nextreg fs e)
+  (return (u e 'info)))
+
+; In a register, an upvalue, or the vararg parameter.
+(defn luaK_exp2anyregup (fs:(ptr FuncState) e:(ptr expdesc)):void
+  (when (or (and (!= (e 'k) VUPVAL) (!= (e 'k) VVARGVAR)) (hasjumps e))
+    (luaK_exp2anyreg fs e)))
+
+; In a register, or a constant.
+(defn luaK_exp2val (fs:(ptr FuncState) e:(ptr expdesc)):void
+  (if (or (= (e 'k) VJMP) (hasjumps e))
+    (luaK_exp2anyreg fs e)
+    (luaK_dischargevars fs e)))
+
+; Makes 'e' a K expression whose index fits an R/K operand, if it can.
+(defn- luaK_exp2K (fs:(ptr FuncState) e:(ptr expdesc)):bool
+  (when (not (hasjumps e))
+    (let (info:i32 (case (e 'k)
+                     VTRUE (boolT fs)
+                     VFALSE (boolF fs)
+                     VNIL (nilK fs)
+                     VKINT (luaK_intK fs (u e 'ival))
+                     VKFLT (luaK_numberK fs (u e 'nval))
+                     VKSTR (stringK fs (u e 'strval))
+                     VK (u e 'info)
+                     -1))  ; not a constant
+      (when (and (>= info 0) (<= info MAXINDEXRK))
+        (set! (e 'k) VK)
+        (set-u e 'info info)
+        (return true))))
+  (return false))
+
+; In a register, or a K in the R/K range: true for a K.
+(defn- exp2RK (fs:(ptr FuncState) e:(ptr expdesc)):bool
+  (when (luaK_exp2K fs e)
+    (return true))
+  (luaK_exp2anyreg fs e)
+  (return false))
+
+(defn- codeABRK (fs:(ptr FuncState) o:OpCode a:i32 b:i32 ec:(ptr expdesc)):void
+  (let (k:i32 (if (exp2RK fs ec) 1 0))
+    (luaK_codeABCk fs o a b (u ec 'info) k)))
+
+(defn luaK_storevar (fs:(ptr FuncState) var:(ptr expdesc) ex:(ptr expdesc)):void
+  (case (var 'k)
+    VLOCAL
+      (do (freeexp fs ex)
+          (exp2reg fs ex (as i32 (uvar var 'ridx)))  ; computed in place
+          (return))
+    VUPVAL
+      (let (e:i32 (luaK_exp2anyreg fs ex))
+        (luaK_codeABC fs OP_SETUPVAL e (u var 'info) 0))
+    VINDEXUP (codeABRK fs OP_SETTABUP (ind var 't) (ind var 'idx) ex)
+    VINDEXI (codeABRK fs OP_SETI (ind var 't) (ind var 'idx) ex)
+    VINDEXSTR (codeABRK fs OP_SETFIELD (ind var 't) (ind var 'idx) ex)
+    (:or VVARGIND VINDEXED)
+      (do (when (= (var 'k) VVARGIND)
+            (needvatab (fs 'f)))  ; then it's a store to a plain table
+          (codeABRK fs OP_SETTABLE (ind var 't) (ind var 'idx) ex))
+    (do))
+  (freeexp fs ex))
+
+; 'e' is a comparison.
+(defn- negatecondition (fs:(ptr FuncState) e:(ptr expdesc)):void
+  (let (pc:(ptr Instruction) (getjumpcontrol fs (u e 'info)))
+    (SETARG_k (deref pc) (bit-xor (GETARG_k (deref pc)) 1))))
+
+; A jump taken when 'e' is 'c'. 'not x' becomes a test of x, inverted.
+(defn- jumponcond (fs:(ptr FuncState) e:(ptr expdesc) c:i32):i32
+  (when (= (e 'k) VRELOC)
+    (let (ie:Instruction (getinstruction fs e))
+      (when (= (GET_OPCODE ie) OP_NOT)
+        (removelastinstruction fs)  ; drop the OP_NOT
+        (return (condjump fs OP_TEST (GETARG_B ie) 0 0 (if (= c 0) 1 0))))))
+  (discharge2anyreg fs e)
+  (freeexp fs e)
+  (return (condjump fs OP_TESTSET NO_REG (u e 'info) 0 c)))
+
+; Falls through when 'e' is true, jumps otherwise.
+(defn luaK_goiftrue (fs:(ptr FuncState) e:(ptr expdesc)):void
+  (let (pc:i32 NO_JUMP)  ; the new jump
+    (luaK_dischargevars fs e)
+    (case (e 'k)
+      VJMP (do (negatecondition fs e)  ; jump when false
+               (set! pc (u e 'info)))
+      (:or VK VKFLT VKINT VKSTR VTRUE) (do)  ; always true
+      (set! pc (jumponcond fs e 0)))
+    (luaK_concat fs (ref (e 'f)) pc)  ; into the false list
+    (luaK_patchtohere fs (e 't))  ; the true list falls through here
+    (set! (e 't) NO_JUMP)))
+
+; Falls through when 'e' is false, jumps otherwise.
+(defn- luaK_goiffalse (fs:(ptr FuncState) e:(ptr expdesc)):void
+  (let (pc:i32 NO_JUMP)
+    (luaK_dischargevars fs e)
+    (case (e 'k)
+      VJMP (set! pc (u e 'info))  ; already jumps when true
+      (:or VNIL VFALSE) (do)  ; always false
+      (set! pc (jumponcond fs e 1)))
+    (luaK_concat fs (ref (e 't)) pc)
+    (luaK_patchtohere fs (e 'f))
+    (set! (e 'f) NO_JUMP)))
+
+; 'not e', folded for constants.
+(defn- codenot (fs:(ptr FuncState) e:(ptr expdesc)):void
+  (case (e 'k)
+    (:or VNIL VFALSE) (set! (e 'k) VTRUE)
+    (:or VK VKFLT VKINT VKSTR VTRUE) (set! (e 'k) VFALSE)
+    VJMP (negatecondition fs e)
+    (:or VRELOC VNONRELOC)
+      (do (discharge2anyreg fs e)
+          (freeexp fs e)
+          (set-u e 'info (luaK_codeABC fs OP_NOT 0 (u e 'info) 0))
+          (set! (e 'k) VRELOC))
+    (do))
+  (let (temp:i32 (e 'f))  ; the true and false lists swap
+    (set! (e 'f) (e 't))
+    (set! (e 't) temp))
+  (removevalues fs (e 'f))  ; negated values are useless
+  (removevalues fs (e 't)))
+
+; A short literal string, in the R/K range.
+(defn- isKstr (fs:(ptr FuncState) e:(ptr expdesc)):bool
+  (return (and (= (e 'k) VK) (not (hasjumps e)) (<= (u e 'info) MAXINDEXRK)
+               (ttisshrstring (p+ ((fs 'f) 'k) (u e 'info))))))
+
+(defn- isKint (e:(ptr expdesc)):bool
+  (return (and (= (e 'k) VKINT) (not (hasjumps e)))))
+
+; A literal integer that fits register C.
+(defn- isCint (e:(ptr expdesc)):bool
+  (return (and (isKint e) (<= (l_castS2U (u e 'ival)) (l_castS2U MAXARG_C)))))
+
+; One that fits sC.
+(defn- isSCint (e:(ptr expdesc)):bool
+  (return (and (isKint e) (fitsC (u e 'ival)))))
+
+; A literal integer or float that fits sB or sC: '*pim' gets it encoded.
+(defn- isSCnumber (e:(ptr expdesc) pim:(ptr i32) isfloat:(ptr i32)):bool
+  (let (i:(ptr lua_Integer) (alloca lua_Integer))
+    (cond (= (e 'k) VKINT) (set! (deref i) (u e 'ival))
+          (and (= (e 'k) VKFLT) (!= (luaV_flttointeger (u e 'nval) i F2Ieq) 0))
+            (set! (deref isfloat) 1)
+          true (return false))  ; not a number
+    (when (and (not (hasjumps e)) (fitsC (deref i)))
+      (set! (deref pim) (int2sC (cast_int (deref i))))
+      (return true))
+    (return false)))
+
+; 'e:key(e,' as OP_SELF, or a move and a gettable.
+(defn luaK_self (fs:(ptr FuncState) e:(ptr expdesc) key:(ptr expdesc)):void
+  (luaK_exp2anyreg fs e)
+  (let (ereg:i32 (u e 'info))  ; the receiver's register
+    (freeexp fs e)
+    (let (base:i32 (as i32 (fs 'freereg)))
+      (set-u e 'info base)
+      (set! (e 'k) VNONRELOC)
+      (luaK_reserveregs fs 2)  ; the method and 'self'
+      (if (and (strisshr (u key 'strval)) (luaK_exp2K fs key))  ; a short name, in K range?
+        (luaK_codeABCk fs OP_SELF base ereg (u key 'info) 0)
+        (do (luaK_exp2anyreg fs key)
+            (luaK_codeABC fs OP_MOVE (+ base 1) ereg 0)
+            (luaK_codeABC fs OP_GETTABLE base ereg (u key 'info))))
+      (freeexp fs key))))
+
+; C stores cast_byte(idx) in the short 'idx'.
+(defn- fillidxk (t:(ptr expdesc) idx:i32 k:expkind):void
+  (set-ind t 'idx (as i16 (cast_uchar idx)))
+  (set! (t 'k) k))
+
+; 't[k]'. 't' is already in a register or an upvalue; an upvalue is indexed
+; only by a literal string.
+(defn luaK_indexed (fs:(ptr FuncState) t:(ptr expdesc) k:(ptr expdesc)):void
+  (let (keystr:i32 -1)
+    (when (= (k 'k) VKSTR)
+      (set! keystr (str2K fs k)))
+    (when (and (= (t 'k) VUPVAL) (not (isKstr fs k)))
+      (luaK_exp2anyreg fs t))  ; then it goes in a register
+    ; each reads its register first: the union's fields overlap
+    (cond (= (t 'k) VUPVAL)
+            (let (temp:ui8 (cast_uchar (u t 'info)))
+              (set-ind t 't temp)
+              (fillidxk t (u k 'info) VINDEXUP))
+          (= (t 'k) VVARGVAR)  ; the vararg parameter
+            (let (kreg:i32 (luaK_exp2anyreg fs k)
+                  vreg:ui8 (uvar t 'ridx))
+              (set-ind t 't vreg)
+              (fillidxk t kreg VVARGIND))
+          true
+            (let (temp:ui8 (cast_uchar (if (= (t 'k) VLOCAL) (as i32 (uvar t 'ridx)) (u t 'info))))
+              (set-ind t 't temp)
+              (cond (isKstr fs k) (fillidxk t (u k 'info) VINDEXSTR)
+                    (isCint k) (fillidxk t (cast_int (u k 'ival)) VINDEXI)
+                    true (fillidxk t (luaK_exp2anyreg fs k) VINDEXED))))
+    (set-ind t 'keystr keystr)
+    (set-ind t 'ro 0)))
+
+; False when folding could raise an error: a bitwise operand that isn't an
+; integer, or a zero divisor.
+(defn- validop (op:i32 v1:(ptr TValue) v2:(ptr TValue)):bool
+  (case op
+    (:or LUA_OPBAND LUA_OPBOR LUA_OPBXOR LUA_OPSHL LUA_OPSHR LUA_OPBNOT)
+      (let (i:(ptr lua_Integer) (alloca lua_Integer))
+        (return (and (!= (luaV_tointegerns v1 i LUA_FLOORN2I) 0)
+                     (!= (luaV_tointegerns v2 i LUA_FLOORN2I) 0))))
+    (:or LUA_OPDIV LUA_OPIDIV LUA_OPMOD) (return (!= (nvalue v2) 0.0))
+    (return true)))
+
+; Folds 'e1 op e2' into 'e1', if it can.
+(defn- constfolding (fs:(ptr FuncState) op:i32 e1:(ptr expdesc) e2:(ptr expdesc)):bool
+  (let (v1:(ptr TValue) (alloca TValue)
+        v2:(ptr TValue) (alloca TValue)
+        res:(ptr TValue) (alloca TValue))
+    (when (or (not (tonumeral e1 v1)) (not (tonumeral e2 v2)) (not (validop op v1 v2)))
+      (return false))
+    (luaO_rawarith ((fs 'ls) 'L) op v1 v2 res)
+    (if (ttisinteger res)
+      (do (set! (e1 'k) VKINT)
+          (set-u e1 'ival (ivalue res)))
+      (let (n:lua_Number (fltvalue res))
+        (when (or (luai_numisnan n) (= n 0.0))  ; not NaN, nor 0.0 (for -0.0's sake)
+          (return false))
+        (set! (e1 'k) VKFLT)
+        (set-u e1 'nval n)))
+    (return true)))
+
+; ORDER OPR - ORDER OP, and ORDER OPR - ORDER TM.
+(defmacro binopr2op (opr baser base) `(unsafe/cast OpCode (+ (- (cast_int ~opr) (cast_int ~baser)) (cast_int ~base))))
+(defmacro unopr2op (opr) `(unsafe/cast OpCode (+ (- (cast_int ~opr) (cast_int OPR_MINUS)) (cast_int OP_UNM))))
+(defmacro binopr2TM (opr) `(unsafe/cast TMS (+ (- (cast_int ~opr) (cast_int OPR_ADD)) (cast_int TM_ADD))))
+
+; Unary operators that produce values: all but 'not'.
+(defn- codeunexpval (fs:(ptr FuncState) op:OpCode e:(ptr expdesc) line:i32):void
+  (let (r:i32 (luaK_exp2anyreg fs e))  ; operands are registers
+    (freeexp fs e)
+    (set-u e 'info (luaK_codeABC fs op 0 r 0))
+    (set! (e 'k) VRELOC)
+    (luaK_fixline fs line)))
+
+; Binary operators that produce values, and the metamethod call after them.
+(defn- finishbinexpval (fs:(ptr FuncState) e1:(ptr expdesc) e2:(ptr expdesc) op:OpCode
+                        v2:i32 flip:i32 line:i32 mmop:OpCode event:TMS):void
+  (let (v1:i32 (luaK_exp2anyreg fs e1)
+        pc:i32 (luaK_codeABCk fs op 0 v1 v2 0))
+    (freeexps fs e1 e2)
+    (set-u e1 'info pc)
+    (set! (e1 'k) VRELOC)
+    (luaK_fixline fs line)
+    (luaK_codeABCk fs mmop v1 v2 (cast_int event) flip)
+    (luaK_fixline fs line)))
+
+; Over two registers.
+(defn- codebinexpval (fs:(ptr FuncState) opr:BinOpr e1:(ptr expdesc) e2:(ptr expdesc) line:i32):void
+  (let (op:OpCode (binopr2op opr OPR_ADD OP_ADD)
+        v2:i32 (luaK_exp2anyreg fs e2))
+    (finishbinexpval fs e1 e2 op v2 0 line OP_MMBIN (binopr2TM opr))))
+
+; With an immediate operand.
+(defn- codebini (fs:(ptr FuncState) op:OpCode e1:(ptr expdesc) e2:(ptr expdesc) flip:i32
+                 line:i32 event:TMS):void
+  (let (v2:i32 (int2sC (cast_int (u e2 'ival))))
+    (finishbinexpval fs e1 e2 op v2 flip line OP_MMBINI event)))
+
+; With a K operand.
+(defn- codebinK (fs:(ptr FuncState) opr:BinOpr e1:(ptr expdesc) e2:(ptr expdesc) flip:i32 line:i32):void
+  (let (event:TMS (binopr2TM opr)
+        v2:i32 (u e2 'info)
+        op:OpCode (binopr2op opr OPR_ADD OP_ADDK))
+    (finishbinexpval fs e1 e2 op v2 flip line OP_MMBINK event)))
+
+; Negates a small constant second operand; the metamethod still gets the
+; original.
+(defn- finishbinexpneg (fs:(ptr FuncState) e1:(ptr expdesc) e2:(ptr expdesc) op:OpCode
+                        line:i32 event:TMS):bool
+  (when (not (isKint e2))
+    (return false))
+  (let (i2:lua_Integer (u e2 'ival))
+    (when (not (and (fitsC i2) (fitsC (- 0 i2))))
+      (return false))
+    (let (v2:i32 (cast_int i2))
+      (finishbinexpval fs e1 e2 op (int2sC (- 0 v2)) 0 line OP_MMBINI event)
+      (SETARG_B (deref (code-at fs (- (fs 'pc) 1))) (int2sC v2))  ; the metamethod's argument
+      (return true))))
+
+(defn- swapexps (e1:(ptr expdesc) e2:(ptr expdesc)):void
+  (let (temp:(ptr expdesc) (alloca expdesc))
+    (copy-exp temp e1)
+    (copy-exp e1 e2)
+    (copy-exp e2 temp)))
+
+(defn- codebinNoK (fs:(ptr FuncState) opr:BinOpr e1:(ptr expdesc) e2:(ptr expdesc) flip:i32 line:i32):void
+  (when (!= flip 0)
+    (swapexps e1 e2))  ; back to the original order
+  (codebinexpval fs opr e1 e2 line))
+
+; Arithmetic, with a K operand when 'e2' is a constant in range.
+(defn- codearith (fs:(ptr FuncState) opr:BinOpr e1:(ptr expdesc) e2:(ptr expdesc) flip:i32 line:i32):void
+  (if (and (tonumeral e2 null) (luaK_exp2K fs e2))
+    (codebinK fs opr e1 e2 flip line)
+    (codebinNoK fs opr e1 e2 flip line)))
+
+; '+' and '*': a constant first operand swaps to second, for an immediate or K.
+(defn- codecommutative (fs:(ptr FuncState) op:BinOpr e1:(ptr expdesc) e2:(ptr expdesc) line:i32):void
+  (let (flip:i32 0)
+    (when (tonumeral e1 null)
+      (swapexps e1 e2)
+      (set! flip 1))
+    (if (and (= op OPR_ADD) (isSCint e2))
+      (codebini fs OP_ADDI e1 e2 flip line TM_ADD)
+      (codearith fs op e1 e2 flip line))))
+
+; Bitwise operators all commute: an integer constant goes second, as K.
+(defn- codebitwise (fs:(ptr FuncState) opr:BinOpr e1:(ptr expdesc) e2:(ptr expdesc) line:i32):void
+  (let (flip:i32 0)
+    (when (= (e1 'k) VKINT)
+      (swapexps e1 e2)
+      (set! flip 1))
+    (if (and (= (e2 'k) VKINT) (luaK_exp2K fs e2))
+      (codebinK fs opr e1 e2 flip line)
+      (codebinNoK fs opr e1 e2 flip line))))
+
+; Order comparisons; with an immediate, 'isfloat' says it was a float.
+(defn- codeorder (fs:(ptr FuncState) opr:BinOpr e1:(ptr expdesc) e2:(ptr expdesc)):void
+  (let (r1:i32 0 r2:i32 0
+        op:OpCode OP_LT
+        im:(ptr i32) (alloca i32)
+        isfloat:(ptr i32) (alloca i32))
+    (set! (deref isfloat) 0)
+    (cond (isSCnumber e2 im isfloat)
+            (do (set! r1 (luaK_exp2anyreg fs e1))
+                (set! r2 (deref im))
+                (set! op (binopr2op opr OPR_LT OP_LTI)))
+          (isSCnumber e1 im isfloat)  ; A < B as B > A, A <= B as B >= A
+            (do (set! r1 (luaK_exp2anyreg fs e2))
+                (set! r2 (deref im))
+                (set! op (binopr2op opr OPR_LT OP_GTI)))
+          true
+            (do (set! r1 (luaK_exp2anyreg fs e1))
+                (set! r2 (luaK_exp2anyreg fs e2))
+                (set! op (binopr2op opr OPR_LT OP_LT))))
+    (freeexps fs e1 e2)
+    (set-u e1 'info (condjump fs op r1 r2 (deref isfloat) 1))
+    (set! (e1 'k) VJMP)))
+
+; '==' and '~='; luaK_infix already made 'e1' an R/K.
+(defn- codeeq (fs:(ptr FuncState) opr:BinOpr e1:(ptr expdesc) e2:(ptr expdesc)):void
+  (let (r1:i32 0 r2:i32 0
+        op:OpCode OP_EQ
+        im:(ptr i32) (alloca i32)
+        isfloat:(ptr i32) (alloca i32))  ; unused here, as in C
+    (set! (deref isfloat) 0)
+    (when (!= (e1 'k) VNONRELOC)  ; a constant: it goes second
+      (swapexps e1 e2))
+    (set! r1 (luaK_exp2anyreg fs e1))
+    (cond (isSCnumber e2 im isfloat)
+            (do (set! op OP_EQI) (set! r2 (deref im)))
+          (exp2RK fs e2)
+            (do (set! op OP_EQK) (set! r2 (u e2 'info)))
+          true
+            (do (set! op OP_EQ) (set! r2 (luaK_exp2anyreg fs e2))))
+    (freeexps fs e1 e2)
+    (set-u e1 'info (condjump fs op r1 r2 (deref isfloat) (if (= opr OPR_EQ) 1 0)))
+    (set! (e1 'k) VJMP)))
+
+(defvar- ef:expdesc (expdesc (k VKINT) (t NO_JUMP) (f NO_JUMP)))  ; a fake 2nd operand, 0
+
+(defn luaK_prefix (fs:(ptr FuncState) opr:UnOpr e:(ptr expdesc) line:i32):void
+  (luaK_dischargevars fs e)
+  (case opr
+    (:or OPR_MINUS OPR_BNOT)
+      (when (not (constfolding fs (+ (cast_int opr) LUA_OPUNM) e &ef))
+        (codeunexpval fs (unopr2op opr) e line))
+    OPR_LEN (codeunexpval fs (unopr2op opr) e line)
+    OPR_NOT (codenot fs e)
+    (do)))
+
+; The first operand of a binary operator, before the second is read.
+(defn luaK_infix (fs:(ptr FuncState) op:BinOpr v:(ptr expdesc)):void
+  (luaK_dischargevars fs v)
+  (case op
+    OPR_AND (luaK_goiftrue fs v)  ; go on only if 'v' is true
+    OPR_OR (luaK_goiffalse fs v)  ; go on only if 'v' is false
+    OPR_CONCAT (luaK_exp2nextreg fs v)  ; operands go on the stack
+    (:or OPR_ADD OPR_SUB OPR_MUL OPR_DIV OPR_IDIV OPR_MOD OPR_POW
+         OPR_BAND OPR_BOR OPR_BXOR OPR_SHL OPR_SHR)
+      (when (not (tonumeral v null))  ; a numeral may fold, or be an immediate
+        (luaK_exp2anyreg fs v))
+    (:or OPR_EQ OPR_NE)
+      (when (not (tonumeral v null))  ; a numeral may be an immediate
+        (exp2RK fs v))
+    (:or OPR_LT OPR_LE OPR_GT OPR_GE)
+      (let (dummy:(ptr i32) (alloca i32)
+            dummy2:(ptr i32) (alloca i32))
+        (when (not (isSCnumber v dummy dummy2))
+          (luaK_exp2anyreg fs v)))
+    (do)))
+
+; 'e1 .. e2'. Concatenation is right associative, so when 'e2' is itself one,
+; its CONCAT takes in 'e1'.
+(defn- codeconcat (fs:(ptr FuncState) e1:(ptr expdesc) e2:(ptr expdesc) line:i32):void
+  (let (ie2:(ptr Instruction) (previousinstruction fs))
+    (if (= (GET_OPCODE (deref ie2)) OP_CONCAT)
+      (let (n:i32 (GETARG_B (deref ie2)))  ; how many 'e2' joins
+        (freeexp fs e2)
+        (SETARG_A (deref ie2) (u e1 'info))
+        (SETARG_B (deref ie2) (+ n 1)))
+      (do (luaK_codeABC fs OP_CONCAT (u e1 'info) 2 0)
+          (freeexp fs e2)
+          (luaK_fixline fs line)))))
+
+; A binary operation, once its second operand is read.
+(defn luaK_posfix (fs:(ptr FuncState) opr:BinOpr e1:(ptr expdesc) e2:(ptr expdesc) line:i32):void
+  (luaK_dischargevars fs e2)
+  (when (and (foldbinop opr) (constfolding fs (+ (cast_int opr) LUA_OPADD) e1 e2))
+    (return))
+  (case opr
+    OPR_AND (do (luaK_concat fs (ref (e2 'f)) (e1 'f))  ; luaK_infix closed e1's true list
+                (copy-exp e1 e2))
+    OPR_OR (do (luaK_concat fs (ref (e2 't)) (e1 't))
+               (copy-exp e1 e2))
+    OPR_CONCAT (do (luaK_exp2nextreg fs e2)
+                   (codeconcat fs e1 e2 line))
+    (:or OPR_ADD OPR_MUL) (codecommutative fs opr e1 e2 line)
+    (:or OPR_SUB OPR_DIV OPR_IDIV OPR_MOD OPR_POW)
+      (when (not (and (= opr OPR_SUB) (finishbinexpneg fs e1 e2 OP_ADDI line TM_SUB)))  ; r1 + -I?
+        (codearith fs opr e1 e2 0 line))
+    (:or OPR_BAND OPR_BOR OPR_BXOR) (codebitwise fs opr e1 e2 line)
+    OPR_SHL
+      (cond (isSCint e1)
+              (do (swapexps e1 e2)
+                  (codebini fs OP_SHLI e1 e2 1 line TM_SHL))  ; I << r2
+            (finishbinexpneg fs e1 e2 OP_SHRI line TM_SHL) (do)  ; r1 >> -I
+            true (codebinexpval fs opr e1 e2 line))
+    OPR_SHR
+      (if (isSCint e2)
+        (codebini fs OP_SHRI e1 e2 0 line TM_SHR)  ; r1 >> I
+        (codebinexpval fs opr e1 e2 line))
+    (:or OPR_EQ OPR_NE) (codeeq fs opr e1 e2)
+    (:or OPR_GT OPR_GE OPR_LT OPR_LE)
+      (do (when (or (= opr OPR_GT) (= opr OPR_GE))  ; a > b is b < a; a >= b is b <= a
+            (swapexps e1 e2)
+            (set! opr (unsafe/cast BinOpr (+ (- (cast_int opr) (cast_int OPR_GT)) (cast_int OPR_LT)))))
+          (codeorder fs opr e1 e2))
+    (do)))
+
+; The line of the current instruction, replaced.
+(defn luaK_fixline (fs:(ptr FuncState) line:i32):void
+  (removelastlineinfo fs)
+  (savelineinfo fs (fs 'f) line))
+
+(defn luaK_settablesize (fs:(ptr FuncState) pc:i32 ra:i32 asize:i32 hsize:i32):void
+  (let (inst:(ptr Instruction) (code-at fs pc)
+        extra:i32 (/ asize (+ MAXARG_vC 1))  ; the array size's high bits
+        rc:i32 (% asize (+ MAXARG_vC 1))  ; and its low bits
+        k:i32 (if (> extra 0) 1 0))  ; whether it needs the extra argument
+    (set! hsize (if (!= hsize 0) (+ (as i32 (luaO_ceillog2 (cast_uint hsize))) 1) 0))
+    (set! (deref inst) (CREATE_vABCk OP_NEWTABLE ra hsize rc k))
+    (set! (deref (p+ inst 1)) (CREATE_Ax OP_EXTRAARG extra))))
+
+; A SETLIST of the table in 'base': 'nelems' counts the table's items with
+; those stored now, 'tostore' of them from 'base + 1' on (LUA_MULTRET: to top).
+(defn luaK_setlist (fs:(ptr FuncState) base:i32 nelems:i32 tostore:i32):void
+  (when (= tostore LUA_MULTRET)
+    (set! tostore 0))
+  (if (<= nelems MAXARG_vC)
+    (luaK_codevABCk fs OP_SETLIST base tostore nelems 0)
+    (let (extra:i32 (/ nelems (+ MAXARG_vC 1)))
+      (set! nelems (% nelems (+ MAXARG_vC 1)))
+      (luaK_codevABCk fs OP_SETLIST base tostore nelems 1)
+      (codeextraarg fs extra)))
+  (set! (fs 'freereg) (cast_uchar (+ base 1))))  ; the list's registers are free
+
+; A jump's final target, through jumps to jumps (at most 100: no endless loop).
+(defn- finaltarget (code:(ptr Instruction) i:i32):i32
+  (for (count:i32 0) (< count 100) (inc! count)
+    (let (pc:Instruction (deref (p+ code i)))
+      (when (!= (GET_OPCODE pc) OP_JMP)
+        (return i))
+      (set! i (+ i (+ (GETARG_sJ pc) 1)))))
+  (return i))
+
+; A last pass over a function's code: small peephole fixes.
+(defn luaK_finish (fs:(ptr FuncState)):void
+  (let (p:(ptr Proto) (fs 'f))
+    (when (vatab p)  ; a vararg table means no hidden arguments
+      (set! (p 'flag) (cast_uchar (bit-and (p 'flag) NOT_PF_VAHID))))
+    (for (i:i32 0) (< i (fs 'pc)) (inc! i)
+      (let (pc:(ptr Instruction) (p+ (p 'code) i)
+            op:i32 (GET_OPCODE (deref pc)))
+        (case op
+          (:or OP_RETURN0 OP_RETURN1 OP_RETURN OP_TAILCALL)
+            (when (or (= op OP_RETURN) (= op OP_TAILCALL) (!= (fs 'needclose) 0) (vahid p))
+              (when (or (= op OP_RETURN0) (= op OP_RETURN1))
+                (SET_OPCODE (deref pc) OP_RETURN))  ; OP_RETURN does the extra work
+              (when (!= (fs 'needclose) 0)
+                (SETARG_k (deref pc) 1))  ; it must close upvalues
+              (when (vahid p)
+                (SETARG_C (deref pc) (+ (as i32 (p 'numparams)) 1))))  ; it has hidden args
+          OP_GETVARG (when (vatab p) (SET_OPCODE (deref pc) OP_GETTABLE))
+          OP_VARARG (when (vatab p) (SETARG_k (deref pc) 1))
+          OP_JMP (fixjump fs i (finaltarget (p 'code) i))  ; straight to the end of the chain
+          (do))))))

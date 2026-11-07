@@ -123,7 +123,12 @@
 
 (with-opcodes defopmodes)
 
+(defmacro getOpMode (m) `(as i32 (bit-and (aref luaP_opmodes ~m) 7)))
+(defmacro testAMode (m) `(!= (bit-and (aref luaP_opmodes ~m) 0x08) 0))
+(defmacro testTMode (m) `(!= (bit-and (aref luaP_opmodes ~m) 0x10) 0))
 (defmacro testITMode (m) `(!= (bit-and (aref luaP_opmodes ~m) 0x20) 0))
+(defmacro testOTMode (m) `(!= (bit-and (aref luaP_opmodes ~m) 0x40) 0))
+(defmacro testMMMode (m) `(!= (bit-and (aref luaP_opmodes ~m) 0x80) 0))
 
 ; Whether the instruction uses top: OP_VARARGPREP does, and so do those taking
 ; the values the previous instruction left.
