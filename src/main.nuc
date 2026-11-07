@@ -15,6 +15,10 @@
 (import lua.iolib)
 (import lua.loadlib)
 (import lua.strlib)
+(import lua.ctype)  ; the core
+(import lua.zio)
+(import lua.mem)
+(import lua.object)
 (import lua.init)
 (import-use lua.util)
 (import-use "stdio.h")

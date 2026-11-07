@@ -44,6 +44,15 @@
 ; set! won't expand a macro in its place, so (set! (errno) 0) is refused (ISSUE-020).
 (defmacro set-errno (v) `(set! (deref (__errno_location)) ~v))
 
+; The largest size that fits both size_t and lua_Integer (llimits.h's MAX_SIZE).
+(defmacro MAX_SIZE () `(cast_sizet LUA_MAXINTEGER))
+
+; 'p' moved by 'n' elements, whatever integer type 'n' is.
+(defmacro p+ (p n) `(unsafe/ptr+ ~p (unsafe/cast i64 ~n)))
+
+; A byte as C's ctype functions want it: unsigned, promoted to int.
+(defmacro uc (c) `(as i32 (cast_uchar ~c)))
+
 ; How many bytes 'q' is past 'p'. Pointers can't be subtracted (ISSUE-021).
 (defmacro byte-diff (q p) `(- (unsafe/cast i64 (as ptr ~q)) (unsafe/cast i64 (as ptr ~p))))
 

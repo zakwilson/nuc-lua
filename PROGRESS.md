@@ -28,7 +28,8 @@ object model, the compiler, execution state, the collector and the VM (§10).
 | 0 Setup | done: env and setup scripts, reference and suite, spike, probes, hybrid build |
 | 1 Binding and first library | done: `capi/` (both layers), layout gate, `libs/mayi`, `tests/capi/capi.c`, stock column |
 | 2 Host and libraries | done: `lua.c`, `lauxlib.c`, `linit` and every standard library in Nucleus |
-| 3–11 | not started |
+| 3 Object model | in progress: `lctype`, `lzio`, `lmem`, `lobject` ported; `lstring`, `lfunc`, `ltm`, `ltable` left |
+| 4–11 | not started |
 
 ### Nucleus
 
@@ -41,6 +42,10 @@ Compiler: `.nucleus-work` on `lua-bugfixes` (see CLAUDE.md).
   header struct (ISSUE-003)
 - `5dab7cb` an imported file defines a function its header declares (ISSUE-013)
 - `0081d2a` an array field of a nested place decays into the place (ISSUE-023)
+- uncommitted in `.nucleus-work`: `cheader.nuc` skips an attribute after a return type
+  (ISSUE-026), and `C-MAX-PARAMS` is 64. The first gate failed only `w3b-sdl`; the rerun
+  with the limit raised was in flight. Once it passes: commit, fast-forward `../nucleus`,
+  format-patch as 0006, and set ISSUE-026's sha in ISSUES.md.
 
 ### Still stock
 
@@ -79,8 +84,10 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
 
 ## Next
 
-M3, the object model: `lctype`, `lzio`, `lmem`, `lobject`, `lstring`, `lfunc`, `ltm`,
-`ltable`, with the suite after each. These share layouts with the stock core, so each
+M3, the object model: `lstring`, `lfunc`, `ltm`, `ltable`, with the suite after each.
+The core modules import the internal headers (`-Ireference/build/src` in `:cflags`) for
+their layouts; `src/lua/core.nuc` holds the `lobject.h`/`lstate.h` macros, with the
+variant tags written out (ISSUE-029); `src/lua/ctype.nuc` holds `lctype.h`'s. These share layouts with the stock core, so each
 struct is declared from the C headers' layout (`check-layout.sh` covers the public ones
 only; the internal ones need their own `offsetof` check first).
 

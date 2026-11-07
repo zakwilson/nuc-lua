@@ -1,0 +1,168 @@
+; The core's macros, from lobject.h, lstate.h and the other internal headers,
+; added as the ported modules need them. A module using them imports those
+; headers itself, for the types the expansions name.
+;
+; Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.core)
+
+; ---- llimits.h ----
+(defconst MAX_LMEM 9223372036854775807)  ; l_mem is ptrdiff_t (ISSUE-029)
+
+; C's arithmetic on lua_Integer, done unsigned so that it wraps.
+(defmacro intop (op v1 v2) `(l_castU2S (~op (l_castS2U ~v1) (l_castS2U ~v2))))
+
+; ---- lobject.h: type tags ----
+
+(defmacro makevariant (t v) `(bit-or ~t (bit-shl ~v 4)))
+
+; The variant tags, makevariant(type, variant) written out (ISSUE-029).
+(defconst LUA_VNIL 0)
+(defconst LUA_VEMPTY 16)      ; an empty slot, which may differ from nil
+(defconst LUA_VABSTKEY 32)    ; what a missing key gives
+(defconst LUA_VNOTABLE 48)    ; a fast get of a non-table
+(defconst LUA_VFALSE 1)
+(defconst LUA_VTRUE 17)
+(defconst LUA_VLIGHTUSERDATA 2)
+(defconst LUA_VNUMINT 3)
+(defconst LUA_VNUMFLT 19)
+(defconst LUA_VSHRSTR 4)
+(defconst LUA_VLNGSTR 20)
+(defconst LUA_VTABLE 5)
+(defconst LUA_VLCL 6)         ; a Lua closure
+(defconst LUA_VLCF 22)        ; a light C function
+(defconst LUA_VCCL 38)        ; a C closure
+(defconst LUA_VUSERDATA 7)
+(defconst LUA_VTHREAD 8)
+(defconst LUA_VUPVAL 9)
+(defconst LUA_VPROTO 10)
+
+(defmacro rawtt (o) `(~o 'tt_))
+(defmacro val_ (o) `(~o 'value_))
+(defmacro novariant (t) `(bit-and ~t 0x0F))
+(defmacro withvariant (t) `(bit-and ~t 0x3F))
+(defmacro ttypetag (o) `(withvariant (rawtt ~o)))
+(defmacro ttype (o) `(novariant (rawtt ~o)))
+(defmacro checktag (o t) `(= (rawtt ~o) ~t))
+(defmacro checktype (o t) `(= (ttype ~o) ~t))
+(defmacro ctb (t) `(bit-or ~t BIT_ISCOLLECTABLE))  ; the tag of a collectable
+(defmacro iscollectable (o) `(!= (bit-and (rawtt ~o) BIT_ISCOLLECTABLE) 0))
+
+; A stack slot's value: StackValue is a union over a TValue.
+(defmacro s2v (o) `(ref (~o 'val)))
+
+; Copies a value and its tag only: on the stack, a TValue's padding holds the
+; tbclist's 'delta', which a whole-struct copy would clobber.
+(defmacro setobj (L obj1 obj2)
+  (let (a (gensym) b (gensym))
+    `(let ((~a (ptr TValue)) ~obj1
+           (~b (ptr TValue)) ~obj2)
+       (set! (~a 'value_) (~b 'value_))
+       (set! (~a 'tt_) (~b 'tt_)))))
+(defmacro setobjs2s (L o1 o2) `(setobj ~L (s2v ~o1) (s2v ~o2)))
+(defmacro setobj2s (L o1 o2) `(setobj ~L (s2v ~o1) ~o2))
+(defmacro setobj2t (L o1 o2) `(setobj ~L ~o1 ~o2))
+(defmacro setobj2n (L o1 o2) `(setobj ~L ~o1 ~o2))
+
+(defmacro gcvalue (o) `((val_ ~o) 'gc))
+(defmacro obj2gco (v) `(unsafe/cast (ptr GCObject) ~v))
+(defmacro gco2ts (o) `(unsafe/cast (ptr TString) ~o))
+(defmacro gco2t (o) `(unsafe/cast (ptr Table) ~o))
+(defmacro gco2u (o) `(unsafe/cast (ptr Udata) ~o))
+(defmacro gco2lcl (o) `(unsafe/cast (ptr LClosure) ~o))
+(defmacro gco2ccl (o) `(unsafe/cast (ptr CClosure) ~o))
+(defmacro gco2cl (o) `(unsafe/cast (ptr Closure) ~o))
+(defmacro gco2p (o) `(unsafe/cast (ptr Proto) ~o))
+(defmacro gco2th (o) `(unsafe/cast (ptr lua_State) ~o))
+(defmacro gco2upv (o) `(unsafe/cast (ptr UpVal) ~o))
+
+; ---- nil, empty and booleans ----
+(defmacro ttisnil (v) `(checktype ~v LUA_TNIL))
+(defmacro ttisstrictnil (o) `(checktag ~o LUA_VNIL))
+(defmacro isabstkey (v) `(checktag ~v LUA_VABSTKEY))
+(defmacro isempty (v) `(ttisnil ~v))
+(defmacro tagisempty (tag) `(= (novariant ~tag) LUA_TNIL))
+(defmacro setnilvalue (obj) `(set! (~obj 'tt_) LUA_VNIL))
+(defmacro setempty (v) `(set! (~v 'tt_) LUA_VEMPTY))
+(defmacro ttisboolean (o) `(checktype ~o LUA_TBOOLEAN))
+(defmacro ttisfalse (o) `(checktag ~o LUA_VFALSE))
+(defmacro ttistrue (o) `(checktag ~o LUA_VTRUE))
+(defmacro l_isfalse (o) `(or (ttisfalse ~o) (ttisnil ~o)))
+(defmacro tagisfalse (t) `(or (= ~t LUA_VFALSE) (= (novariant ~t) LUA_TNIL)))
+(defmacro setbfvalue (obj) `(set! (~obj 'tt_) LUA_VFALSE))
+(defmacro setbtvalue (obj) `(set! (~obj 'tt_) LUA_VTRUE))
+
+; ---- numbers ----
+(defmacro ttisnumber (o) `(checktype ~o LUA_TNUMBER))
+(defmacro ttisfloat (o) `(checktag ~o LUA_VNUMFLT))
+(defmacro ttisinteger (o) `(checktag ~o LUA_VNUMINT))
+(defmacro fltvalue (o) `((val_ ~o) 'n))
+(defmacro ivalue (o) `((val_ ~o) 'i))
+(defmacro nvalue (o)
+  (let (a (gensym))
+    `(let ((~a (ptr TValue)) ~o)
+       (if (ttisinteger ~a) (cast_num (ivalue ~a)) (fltvalue ~a)))))
+(defmacro setfltvalue (obj x)
+  (let (a (gensym))
+    `(let ((~a (ptr TValue)) ~obj)
+       (set! ((~a 'value_) 'n) ~x)
+       (set! (~a 'tt_) LUA_VNUMFLT))))
+(defmacro chgfltvalue (obj x) `(set! ((~obj 'value_) 'n) ~x))
+(defmacro setivalue (obj x)
+  (let (a (gensym))
+    `(let ((~a (ptr TValue)) ~obj)
+       (set! ((~a 'value_) 'i) ~x)
+       (set! (~a 'tt_) LUA_VNUMINT))))
+(defmacro chgivalue (obj x) `(set! ((~obj 'value_) 'i) ~x))
+
+; ---- strings ----
+(defmacro ttisstring (o) `(checktype ~o LUA_TSTRING))
+(defmacro ttisshrstring (o) `(checktag ~o (ctb LUA_VSHRSTR)))
+(defmacro ttislngstring (o) `(checktag ~o (ctb LUA_VLNGSTR)))
+(defmacro tsvalue (o) `(gco2ts (gcvalue ~o)))
+(defmacro setsvalue (L obj x)
+  (let (a (gensym) s (gensym))
+    `(let ((~a (ptr TValue)) ~obj
+           (~s (ptr TString)) ~x)
+       (set! ((~a 'value_) 'gc) (obj2gco ~s))
+       (set! (~a 'tt_) (ctb (~s 'tt))))))
+(defmacro setsvalue2s (L o s) `(setsvalue ~L (s2v ~o) ~s))
+(defmacro setsvalue2n (L o s) `(setsvalue ~L ~o ~s))
+
+(defmacro strisshr (ts) `(>= (~ts 'shrlen) 0))
+; A short string's bytes start where a long one keeps its 'contents' pointer.
+(defmacro rawgetshrstr (ts) `(as (ptr i8) (as ptr (ref (~ts 'contents)))))
+(defmacro getshrstr (ts) `(rawgetshrstr ~ts))
+(defmacro getlngstr (ts) `(~ts 'contents))
+(defmacro getstr (ts)
+  (let (a (gensym))
+    `(let ((~a (ptr TString)) ~ts)
+       (if (strisshr ~a) (rawgetshrstr ~a) (~a 'contents)))))
+(defmacro tsslen (ts)
+  (let (a (gensym))
+    `(let ((~a (ptr TString)) ~ts)
+       (if (strisshr ~a) (cast_sizet (~a 'shrlen)) ((~a 'u) 'lnglen)))))
+
+; ---- lvm.h ----
+; Float 'n' from a number, without string coercion; false if it isn't one.
+(defmacro tonumberns (o n)
+  (let (a (gensym))
+    `(let ((~a (ptr TValue)) ~o)
+       (cond (ttisfloat ~a) (do (set! ~n (fltvalue ~a)) true)
+             (ttisinteger ~a) (do (set! ~n (cast_num (ivalue ~a))) true)
+             true false))))
+; Integer '*i' from a number, without string coercion: a float must be integral.
+(defmacro tointegerns (o i)
+  (let (a (gensym))
+    `(let ((~a (ptr TValue)) ~o)
+       (if (ttisinteger ~a)
+         (do (set! (deref ~i) (ivalue ~a)) true)
+         (!= (luaV_tointegerns ~a ~i F2Ieq) 0)))))
+
+; ---- lstate.h ----
+(defmacro G (L) `(~L 'l_G))
+; Whether the state is fully built: its nilvalue is a nil only then.
+(defmacro completestate (g) `(ttisnil (ref (~g 'nilvalue))))
+
+; ---- lmem.h ----
+(defmacro luaM_error (L) `(luaD_throw ~L LUA_ERRMEM))
+(defmacro luaM_freemem (L b s) `(luaM_free_ ~L ~b ~s))

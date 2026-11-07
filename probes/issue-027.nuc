@@ -1,0 +1,9 @@
+; ISSUE-027: unary minus on a float is `0 - x`, so negating 0.0 gives 0.0, not -0.0.
+; expect: prints `-0 -0`; actual: `0 -0`
+; run: $NUCLEUSC $P -o $W/p && $W/p
+; fixed-when-output: -0 -0
+(import-use "stdio.h")
+(defn main ():i32
+  (let (z:f64 0.0)
+    (printf "%g %g\n" (- z) (* -1.0 z))
+    (return 0)))

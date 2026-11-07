@@ -341,14 +341,12 @@
 ; compares contents, so the addresses are compared as plain pointers.
 (defmacro- buffonstack (B) `(!= (as ptr (~B 'b)) (as ptr ((~B 'init) 'b))))
 
-(defconst MAX_SIZE 0x7fffffffffffffff)  ; LUA_MAXINTEGER, smaller than MAX_SIZET
-
 ; A size for 'B' with room for 'sz' more bytes and a terminating zero.
 (defn- newbuffsize (B:&luaL_Buffer sz:usize):usize
   (let (newsize:usize (B 'size))
-    (when (>= sz (- MAX_SIZE (B 'n)))
+    (when (>= sz (- (MAX_SIZE) (B 'n)))
       (return (cast_sizet (luaL_error (B 'L) "resulting string too large"))))
-    (when (<= newsize (* (/ MAX_SIZE 3) 2))  ; no overflow?
+    (when (<= newsize (* (/ (MAX_SIZE) 3) 2))  ; no overflow?
       (set! newsize (+ newsize (bit-shr newsize 1))))  ; grow by half
     (when (< newsize (+ (B 'n) sz 1))  ; not big enough?
       (set! newsize (+ (B 'n) sz 1)))

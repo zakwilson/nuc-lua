@@ -1,0 +1,61 @@
+; Buffered streams: what the lexer and the undumper read through.
+;
+; lzio.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.zio)
+(set-ir-prefix "")
+(import-use "lzio.h")
+(import-use "string.h")
+(import-use lua.util)
+
+; Refills the buffer and returns its first byte, or EOZ.
+(defn luaZ_fill (z:(ptr ZIO)):i32
+  (let (L:(ptr lua_State) (z 'L)
+        size:usize 0
+        buff:CStr ((z 'reader) L (z 'data) &size))
+    (when (or (= (as ptr buff) null) (= size 0))
+      (return EOZ))
+    (set! (z 'n) (- size 1))  ; less the byte returned
+    (set! (z 'p) (unsafe/ptr+ (bytes buff) 1))
+    (return (as i32 (cast_uchar (deref (bytes buff)))))))
+
+(defn luaZ_init (L:(ptr lua_State) z:(ptr ZIO) reader:lua_Reader data:ptr):void
+  (set! (z 'L) L)
+  (set! (z 'reader) reader)
+  (set! (z 'data) data)
+  (set! (z 'n) 0)
+  (set! (z 'p) null))
+
+; Whether the buffer has a byte, refilling it if it's empty.
+(defn- checkbuffer (z:(ptr ZIO)):bool
+  (when (= (z 'n) 0)
+    (when (= (luaZ_fill z) EOZ)
+      (return false))  ; no more input
+    (set! (z 'n) (+ (z 'n) 1))  ; luaZ_fill took the first byte: put it back
+    (set! (z 'p) (unsafe/ptr+ (z 'p) -1)))
+  (return true))
+
+; Reads 'n' bytes into 'b', and returns how many were missing.
+(defn luaZ_read (z:(ptr ZIO) b0:ptr n0:usize):usize
+  (let (b:(ptr i8) (as (ptr i8) b0)
+        n:usize n0)
+    (while (!= n 0)
+      (when (not (checkbuffer z))
+        (return n))  ; no more input
+      (let (m:usize (if (<= n (z 'n)) n (z 'n)))
+        (memcpy b (z 'p) m)
+        (set! (z 'n) (- (z 'n) m))
+        (set! (z 'p) (unsafe/ptr+ (z 'p) (unsafe/cast i64 m)))
+        (set! b (unsafe/ptr+ b (unsafe/cast i64 m)))
+        (set! n (- n m))))
+    (return 0)))
+
+; The address of the next 'n' bytes, consumed, if the buffer holds them whole.
+(defn luaZ_getaddr (z:(ptr ZIO) n:usize):ptr
+  (when (not (checkbuffer z))
+    (return null))  ; no more input
+  (when (< (z 'n) n)
+    (return null))  ; the block isn't whole
+  (let (res:ptr (as ptr (z 'p)))
+    (set! (z 'n) (- (z 'n) n))
+    (set! (z 'p) (unsafe/ptr+ (z 'p) (unsafe/cast i64 n)))
+    (return res)))

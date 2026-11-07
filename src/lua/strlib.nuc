@@ -17,15 +17,6 @@
 (defconst CAP_POSITION -2)
 (defconst SPECIALS "^$*+?.([%-")
 
-; The largest size that fits both size_t and lua_Integer.
-(defmacro MAX_SIZE () `(cast_sizet LUA_MAXINTEGER))
-
-; 'p' moved by 'n' bytes, whatever integer type 'n' is.
-(defmacro p+ (p n) `(unsafe/ptr+ ~p (unsafe/cast i64 ~n)))
-
-; A byte as C's ctype functions want it: unsigned, promoted to int.
-(defmacro uc (c) `(as i32 (cast_uchar ~c)))
-
 (defn- str_len (L:(ptr lua_State)):i32
   (let (l:usize 0)
     (luaL_checklstring L 1 &l)

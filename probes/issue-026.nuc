@@ -1,0 +1,6 @@
+; ISSUE-026: a declaration with an attribute after its return type is skipped.
+; expect: prints `died 7`; actual (before the fix): `unknown: 'die' — its C header declaration was skipped`
+; run: $NUCLEUSC --cflag=-I$D $P --link-arg=$D/issue-026.c -o $W/p && $W/p
+; fixed-when-output: died 7
+(import-use "issue-026.h")
+(defn main ():i32 (die "%s %d\n" "died" 7) (return 1))

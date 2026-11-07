@@ -1,0 +1,9 @@
+; ISSUE-028: `bit-not` of an unsigned operand is refused: it is `(_bit-xor x -1)`.
+; expect: prints `4294967290`; actual: `error: integer literal -1 does not fit ui32`
+; run: $NUCLEUSC $P -o $W/p && $W/p
+; fixed-when-output: 4294967290
+(import-use "stdio.h")
+(defn main ():i32
+  (let (u:ui32 5)
+    (printf "%u\n" (bit-not u))
+    (return 0)))

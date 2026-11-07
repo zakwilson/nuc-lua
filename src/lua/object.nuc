@@ -1,0 +1,438 @@
+; Generic functions over Lua objects: numeric conversions, arithmetic on
+; constants, and the core's formatted messages.
+;
+; lobject.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.object)
+(set-ir-prefix "")
+(import-use "lstate.h")
+(import-use "ldebug.h")
+(import-use "ldo.h")
+(import-use "lmem.h")
+(import-use "lstring.h")
+(import-use "ltm.h")
+(import-use "lvm.h")
+(import-use "locale.h")
+(import-use "math.h")
+(import-use "stdio.h")
+(import-use "stdlib.h")
+(import-use "string.h")
+(import-use lua.util)
+(import-use lua.core)
+(import-use lua.ctype)
+
+; log_2[i - 1] = ceil(log2(i))
+(defvar- log_2:(array ui8 256)
+  (array ui8
+    0 1 2 2 3 3 3 3 4 4 4 4 4 4 4 4 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5
+    6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6
+    7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7
+    7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7
+    8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8
+    8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8
+    8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8
+    8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8))
+
+; ceil(log2(x)): the least n with x <= 1 << n.
+(defn luaO_ceillog2 (x0:ui32):lu_byte
+  (let (l:i32 0
+        x:ui32 (- x0 1))
+    (while (>= x 256)
+      (set! l (+ l 8))
+      (set! x (bit-shr x 8)))
+    (return (unsafe/cast lu_byte (+ l (as i32 (aref log_2 x)))))))
+
+; 'p'% as a floating-point byte, eeeexxxx: the exponent in excess-7 and, when it
+; isn't 0, an implicit 1 before the mantissa, as IEEE 754 does.
+(defn luaO_codeparam (p0:ui32):lu_byte
+  (when (>= p0 (* (bit-shl 0x1F (- 0xF 7 1)) 100))  ; overflow?
+    (return 0xFF))
+  (let (p:ui32 (/ (+ (* p0 128) 99) 100))  ; the division rounded up
+    (when (< p 0x10)  ; subnormal: the exponent bits are already 0
+      (return (unsafe/cast lu_byte p)))
+    ; p >= 0x10 makes ceil(log2(p + 1)) >= 5; keep 5 bits of 'p'
+    (let (lg:ui32 (- (as ui32 (luaO_ceillog2 (+ p 1))) 5))
+      (return (unsafe/cast lu_byte (bit-or (- (bit-shr p lg) 0x10)
+                                            (bit-shl (+ lg 1) 4)))))))
+
+; 'p' times 'x', for a floating-point byte 'p'. With a negative exponent,
+; multiplying first keeps more bits, when the product can't overflow.
+(defn luaO_applyparam (p:lu_byte x:l_mem):l_mem
+  (let (m:l_mem (as l_mem (bit-and p 0xF))  ; the mantissa
+        e:l_mem (as l_mem (bit-shr p 4)))  ; the exponent
+    (when (> e 0)  ; normalized?
+      (dec! e)
+      (set! m (+ m 0x10)))  ; at most 0x1F
+    (set! e (- e 7))  ; excess-7
+    (if (>= e 0)
+      (if (< x (bit-shr (/ MAX_LMEM 0x1F) e))  ; no overflow?
+        (return (bit-shl (* x m) e))
+        (return MAX_LMEM))
+      (do (set! e (- 0 e))
+          (cond
+            (< x (/ MAX_LMEM 0x1F)) (return (bit-shr (* x m) e))
+            (< (bit-shr x e) (/ MAX_LMEM 0x1F)) (return (* (bit-shr x e) m))
+            true (return MAX_LMEM))))))
+
+(defn- intarith (L:(ptr lua_State) op:i32 v1:lua_Integer v2:lua_Integer):lua_Integer
+  (return (case op
+            LUA_OPADD (intop + v1 v2)
+            LUA_OPSUB (intop - v1 v2)
+            LUA_OPMUL (intop * v1 v2)
+            LUA_OPMOD (luaV_mod L v1 v2)
+            LUA_OPIDIV (luaV_idiv L v1 v2)
+            LUA_OPBAND (intop bit-and v1 v2)
+            LUA_OPBOR (intop bit-or v1 v2)
+            LUA_OPBXOR (intop bit-xor v1 v2)
+            LUA_OPSHL (luaV_shiftl v1 v2)
+            LUA_OPSHR (luaV_shiftl v1 (intop - 0 v2))  ; luaV_shiftr
+            LUA_OPUNM (intop - 0 v1)
+            LUA_OPBNOT (intop bit-xor -1 v1)  ; ~0 ^ v1
+            0)))
+
+(defn- numarith (L:(ptr lua_State) op:i32 v1:lua_Number v2:lua_Number):lua_Number
+  (return (case op
+            LUA_OPADD (+ v1 v2)
+            LUA_OPSUB (- v1 v2)
+            LUA_OPMUL (* v1 v2)
+            LUA_OPDIV (/ v1 v2)
+            LUA_OPPOW (if (= v2 2.0) (* v1 v1) (pow v1 v2))
+            LUA_OPIDIV (floor (/ v1 v2))
+            LUA_OPUNM (* -1.0 v1)  ; not (- v1), which gives 0.0 for 0.0 (ISSUE-027)
+            LUA_OPMOD (luaV_modf L v1 v2)
+            0.0)))
+
+(defn luaO_rawarith (L:(ptr lua_State) op:i32 p1:(ptr TValue) p2:(ptr TValue)
+                     res:(ptr TValue)):i32
+  (let (i1:lua_Integer 0
+        i2:lua_Integer 0
+        n1:lua_Number 0.0
+        n2:lua_Number 0.0)
+    (cond
+      (or (= op LUA_OPBAND) (= op LUA_OPBOR) (= op LUA_OPBXOR)
+          (= op LUA_OPSHL) (= op LUA_OPSHR) (= op LUA_OPBNOT))  ; integers only
+        (when (and (tointegerns p1 &i1) (tointegerns p2 &i2))
+          (setivalue res (intarith L op i1 i2))
+          (return 1))
+      (or (= op LUA_OPDIV) (= op LUA_OPPOW))  ; floats only
+        (when (and (tonumberns p1 n1) (tonumberns p2 n2))
+          (setfltvalue res (numarith L op n1 n2))
+          (return 1))
+      true
+        (cond
+          (and (ttisinteger p1) (ttisinteger p2))
+            (do (setivalue res (intarith L op (ivalue p1) (ivalue p2)))
+                (return 1))
+          (and (tonumberns p1 n1) (tonumberns p2 n2))
+            (do (setfltvalue res (numarith L op n1 n2))
+                (return 1))))
+    (return 0)))
+
+(defn luaO_arith (L:(ptr lua_State) op:i32 p1:(ptr TValue) p2:(ptr TValue) res:StkId):void
+  (when (= (luaO_rawarith L op p1 p2 (s2v res)) 0)
+    ; no raw operation: try a metamethod
+    (luaT_trybinTM L p1 p2 res (unsafe/cast TMS (+ (- op LUA_OPADD) TM_ADD)))))
+
+(defn luaO_hexavalue (c:i32):lu_byte
+  (if (lisdigit c)
+    (return (unsafe/cast lu_byte (- c (ch \0))))
+    (return (unsafe/cast lu_byte (+ (- (ltolower c) (ch \a)) 10)))))
+
+(defn- isneg (s:(ptr (ptr i8))):bool
+  (cond
+    (= (deref (deref s)) (ch \-))
+      (do (set! (deref s) (p+ (deref s) 1))
+          (return true))
+    (= (deref (deref s)) (ch \+))
+      (set! (deref s) (p+ (deref s) 1)))
+  (return false))
+
+(defconst L_MAXLENNUM 200)  ; the longest numeral converted
+
+; A float from 's' into 'result', or null; else the address of the closing
+; '\0'. luaconf's lua_strx2number is strtod as well, so 'mode' changes nothing.
+(defn- l_str2dloc (s:(ptr i8) result:(ptr lua_Number) mode:i32):(ptr i8)
+  (let (endptr:(ptr i8) null)
+    (set! (deref result) (strtod (cstr s) &endptr))
+    (when (= endptr s)  ; nothing recognized?
+      (return null))
+    (while (lisspace (uc (deref endptr)))  ; skip trailing spaces
+      (set! endptr (p+ endptr 1)))
+    (return (if (= (deref endptr) 0) endptr null))))
+
+; As l_str2dloc, accepting a dot as the radix mark whatever the locale: on
+; failure, the numeral is copied with its dot changed to the locale's. 'mode'
+; is 'n' for inf or nan (refused), 'x' for hex, or '.'.
+(defn- l_str2d (s:(ptr i8) result:(ptr lua_Number)):(ptr i8)
+  (let (pmode:(ptr i8) (strpbrk (cstr s) ".xXnN")
+        mode:i32 (if (!= pmode null) (ltolower (uc (deref pmode))) 0))
+    (when (= mode (ch \n))  ; inf or nan
+      (return null))
+    (let (endptr:(ptr i8) (l_str2dloc s result mode))
+      (when (= endptr null)  ; perhaps another locale
+        (let (buff:(ptr i8) (alloca i8 (+ L_MAXLENNUM 1))
+              pdot:(ptr i8) (strchr (cstr s) (ch \.)))
+          (when (or (= pdot null) (> (strlen (cstr s)) L_MAXLENNUM))
+            (return null))  ; too long, or no dot
+          (strcpy buff (cstr s))
+          (set! (aref buff (byte-diff pdot s)) (lua_getlocaledecpoint))
+          (set! endptr (l_str2dloc buff result mode))
+          (when (!= endptr null)
+            (set! endptr (p+ s (byte-diff endptr buff))))))
+      (return endptr))))
+
+(defmacro MAXBY10 () `(l_castS2U (/ LUA_MAXINTEGER 10)))
+(defmacro MAXLASTD () `(cast_int (% LUA_MAXINTEGER 10)))
+
+(defn- l_str2int (s0:(ptr i8) result:(ptr lua_Integer)):(ptr i8)
+  (let (a:lua_Unsigned 0
+        empty:bool true
+        s:(ptr i8) s0)
+    (while (lisspace (uc (deref s)))  ; skip leading spaces
+      (set! s (p+ s 1)))
+    (let (neg:bool (isneg &s))
+      (if (and (= (aref s 0) (ch \0)) (or (= (aref s 1) (ch \x)) (= (aref s 1) (ch \X))))
+        (do (set! s (p+ s 2))  ; hex
+            (while (lisxdigit (uc (deref s)))
+              (set! a (+ (* a 16) (as lua_Unsigned (luaO_hexavalue (as i32 (deref s))))))
+              (set! empty false)
+              (set! s (p+ s 1))))
+        (while (lisdigit (uc (deref s)))  ; decimal
+          (let (d:i32 (- (as i32 (deref s)) (ch \0)))
+            (when (and (>= a (MAXBY10))
+                       (or (> a (MAXBY10)) (> d (+ (MAXLASTD) (if neg 1 0)))))
+              (return null))  ; overflow: not an integer
+            (set! a (+ (* a 10) (l_castS2U d)))
+            (set! empty false)
+            (set! s (p+ s 1)))))
+      (while (lisspace (uc (deref s)))  ; skip trailing spaces
+        (set! s (p+ s 1)))
+      (when (or empty (!= (deref s) 0))
+        (return null))
+      (set! (deref result) (l_castU2S (if neg (- 0 a) a)))
+      (return s))))
+
+; Converts 's' into 'o', integer first, and returns its size plus one, or 0.
+(defn luaO_str2num (s:CStr o:(ptr TValue)):usize
+  (let (i:lua_Integer 0
+        n:lua_Number 0.0
+        e:(ptr i8) (l_str2int (bytes s) &i))
+    (if (!= e null)
+      (setivalue o i)
+      (do (set! e (l_str2d (bytes s) &n))
+          (if (!= e null)
+            (setfltvalue o n)
+            (return 0))))
+    (return (+ (cast_sizet (byte-diff e (bytes s))) 1))))
+
+; Puts 'x' as UTF-8 at the end of 'buff', and returns how many bytes it took.
+(defn luaO_utf8esc (buff:(ptr i8) x0:l_uint32):i32
+  (let (n:i32 1
+        x:ui32 x0)
+    (if (< x 0x80)  ; ASCII
+      (set! (aref buff (- UTF8BUFFSZ 1)) (cast_char x))
+      (let (mfb:ui32 0x3f)  ; the most that fits in the first byte
+        (while true  ; continuation bytes
+          (set! (aref buff (- UTF8BUFFSZ n)) (cast_char (bit-or 0x80 (bit-and x 0x3f))))
+          (inc! n)
+          (set! x (bit-shr x 6))
+          (set! mfb (bit-shr mfb 1))  ; one bit fewer in the first byte
+          (when (<= x mfb) (break)))
+        ; ~mfb << 1, with 0xFFFFFFFF as ~0 (ISSUE-028)
+        (set! (aref buff (- UTF8BUFFSZ n))
+              (cast_char (bit-or (bit-shl (bit-xor mfb 0xFFFFFFFF) 1) x)))))
+    (return n)))
+
+; A float as a numeral: "%.15g", or "%.17g" if that doesn't read back the same,
+; with ".0" added when it looks like an integer.
+(defn- tostringbuffFloat (n:lua_Number buff:(ptr i8)):i32
+  (let (len:i32 (snprintf buff LUA_N2SBUFFSZ "%.15g" n)
+        check:lua_Number (strtod (cstr buff) null))
+    (when (!= check n)  ; not precise enough?
+      (set! len (snprintf buff LUA_N2SBUFFSZ "%.17g" n)))
+    (when (= (aref buff (strspn (cstr buff) "-0123456789")) 0)  ; like an integer?
+      (set! (aref buff len) (lua_getlocaledecpoint))
+      (inc! len)
+      (set! (aref buff len) (ch \0))
+      (inc! len))
+    (return len)))
+
+(defn luaO_tostringbuff (obj:(ptr TValue) buff:(ptr i8)):ui32
+  (let (len:i32 (if (ttisinteger obj)
+                  (snprintf buff LUA_N2SBUFFSZ "%lld" (ivalue obj))
+                  (tostringbuffFloat (fltvalue obj) buff)))
+    (return (cast_uint len))))
+
+; Replaces the number at 'obj' with its string.
+(defn luaO_tostring (L:(ptr lua_State) obj:(ptr TValue)):void
+  (let (buff:(ptr i8) (alloca i8 LUA_N2SBUFFSZ)
+        len:ui32 (luaO_tostringbuff obj buff))
+    (setsvalue L obj (luaS_newlstr L (cstr buff) (as usize len)))))
+
+; ---- luaO_pushvfstring ----
+
+; Room for luaG_addinfo to work in the static buffer: LUA_IDSIZE (60) +
+; LUA_N2SBUFFSZ (64) + 95 for the message, written out (ISSUE-030).
+(defconst BUFVFS 219)
+
+; 'err' is 1 after a memory error, 2 after the result overflowed.
+(defstruct BuffFS
+  L:(ptr lua_State)
+  b:(ptr i8)
+  buffsize:usize
+  blen:usize  ; the length of the string in 'b'
+  err:i32
+  space:(array i8 BUFVFS))  ; the starting buffer
+
+(defmacro space-of (buff) `(as (ptr i8) (as ptr (ref (~buff 'space)))))
+
+(defn- initbuff (L:(ptr lua_State) buff:&BuffFS):void
+  (set! (buff 'L) L)
+  (set! (buff 'b) (space-of buff))
+  (set! (buff 'buffsize) BUFVFS)
+  (set! (buff 'blen) 0)
+  (set! (buff 'err) 0))
+
+; Pushes the result. It may raise errors, so it runs protected.
+(defn- pushbuff (L:(ptr lua_State) ud:ptr):void
+  (let (buff:&BuffFS (unsafe/cast &BuffFS ud))
+    (when (= (buff 'err) 1)  ; a memory error
+      (luaD_throw L LUA_ERRMEM))
+    (when (= (buff 'err) 2)  ; too long: end the result with "..."
+      (if (< (- (buff 'buffsize) (buff 'blen)) 3)
+        (strcpy (p+ (buff 'b) (- (buff 'blen) 3)) "...")  ; 'blen' > 3 here
+        (do (strcpy (p+ (buff 'b) (buff 'blen)) "...")
+            (set! (buff 'blen) (+ (buff 'blen) 3)))))
+    (let (ts:(ptr TString) (luaS_newlstr L (cstr (buff 'b)) (buff 'blen)))
+      (setsvalue2s L ((L 'top) 'p) ts)
+      (set! ((L 'top) 'p) (p+ ((L 'top) 'p) 1)))))
+
+(defn- clearbuff (buff:&BuffFS):CStr
+  (let (L:(ptr lua_State) (buff 'L)
+        res:CStr (as CStr null))
+    (when (= (luaD_rawrunprotected L pushbuff (as ptr buff)) LUA_OK)
+      (set! res (cstr (getstr (tsvalue (s2v (p+ ((L 'top) 'p) -1)))))))
+    ; else the error message is on the top
+    (when (!= (buff 'b) (space-of buff))  ; a dynamic buffer?
+      (luaM_free_ L (as ptr (buff 'b)) (buff 'buffsize)))
+    (return res)))
+
+(defn- addstr2buff (buff:&BuffFS str:(ptr i8) slen:usize):void
+  (let (left:usize (- (buff 'buffsize) (buff 'blen)))  ; the space left
+    (when (!= (buff 'err) 0)  ; nothing more after an error
+      (return))
+    (when (> slen left)  ; it doesn't fit?
+      (if (> slen (- (/ (MAX_SIZE) 2) (buff 'blen)))  ; overflow?
+        (do (memcpy (p+ (buff 'b) (buff 'blen)) str left)  ; what fits
+            (set! (buff 'blen) (buff 'buffsize))
+            (set! (buff 'err) 2)
+            (return))
+        (let (newsize:usize (+ (buff 'buffsize) slen)  ; at most MAX_SIZE/2
+              static:bool (= (buff 'b) (space-of buff))
+              newb:(ptr i8) (as (ptr i8)
+                              (if static
+                                (luaM_realloc_ (buff 'L) null 0 newsize)
+                                (luaM_realloc_ (buff 'L) (as ptr (buff 'b)) (buff 'buffsize) newsize))))
+          (when (= newb null)  ; a memory error
+            (set! (buff 'err) 1)
+            (return))
+          (when static  ; a new buffer, not a reallocated one
+            (memcpy newb (buff 'b) (buff 'blen)))
+          (set! (buff 'b) newb)
+          (set! (buff 'buffsize) newsize))))
+    (memcpy (p+ (buff 'b) (buff 'blen)) str slen)
+    (set! (buff 'blen) (+ (buff 'blen) slen))))
+
+(defn- addnum2buff (buff:&BuffFS num:(ptr TValue)):void
+  (let (numbuff:(ptr i8) (alloca i8 LUA_N2SBUFFSZ)
+        len:ui32 (luaO_tostringbuff num numbuff))
+    (addstr2buff buff numbuff (as usize len))))
+
+; Formats only '%d', '%c', '%f', '%p', '%s' and '%%', and Lua's '%I' (a
+; lua_Integer) and '%U' (an unsigned long as UTF-8).
+(defn luaO_pushvfstring (L:(ptr lua_State) fmt:CStr argp:VaList):CStr
+  (let (buff:&BuffFS (alloca BuffFS)  ; the last part of the result
+        f:(ptr i8) (bytes fmt)
+        e:(ptr i8) null  ; the next '%'
+        num:&TValue (alloca TValue)
+        bf:(ptr i8) (alloca i8 LUA_N2SBUFFSZ))  ; for '%p' and '%U'
+    (initbuff L buff)
+    (while true
+      (set! e (strchr (cstr f) (ch \%)))
+      (when (= e null) (break))
+      (addstr2buff buff f (cast_sizet (byte-diff e f)))  ; 'fmt' up to the '%'
+      (case (aref e 1)
+        (ch \s)
+          (let (s:CStr (unsafe/va-arg argp CStr))
+            (when (= (as ptr s) null) (set! s "(null)"))
+            (addstr2buff buff (bytes s) (strlen s)))
+        (ch \c)  ; an int as a character
+          (let (c:i8 (cast_char (unsafe/va-arg argp i32)))
+            (addstr2buff buff (as (ptr i8) (as ptr &c)) 1))
+        (ch \d)
+          (do (setivalue num (as lua_Integer (unsafe/va-arg argp i32)))
+              (addnum2buff buff num))
+        (ch \I)
+          (do (setivalue num (unsafe/va-arg argp i64))
+              (addnum2buff buff num))
+        (ch \f)
+          (do (setfltvalue num (unsafe/va-arg argp f64))
+              (addnum2buff buff num))
+        (ch \p)
+          (let (p:ptr (unsafe/va-arg argp ptr)
+                len:i32 (snprintf bf LUA_N2SBUFFSZ "%p" p))
+            (addstr2buff buff bf (cast_sizet len)))
+        (ch \U)
+          (let (arg:ui64 (unsafe/va-arg argp ui64)
+                len:i32 (luaO_utf8esc bf (unsafe/cast ui32 arg)))
+            (addstr2buff buff (p+ bf (- UTF8BUFFSZ len)) (cast_sizet len)))
+        (ch \%)
+          (addstr2buff buff (bytes "%") 1)
+        (addstr2buff buff e 2))  ; an unknown format stays in the result
+      (set! f (p+ e 2)))  ; past the '%' and the conversion
+    (addstr2buff buff f (strlen (cstr f)))  ; the rest of 'fmt'
+    (return (clearbuff buff))))
+
+(defn luaO_pushfstring (L:(ptr lua_State) fmt:CStr :varargs argp):CStr
+  (let (msg:CStr (luaO_pushvfstring L fmt argp))
+    (when (= (as ptr msg) null)  ; an error?
+      (luaD_throw L LUA_ERRMEM))
+    (return msg)))
+
+; A source's name for messages, in LUA_IDSIZE bytes: "=name" as it is,
+; "@file" with its start cut to "...", else [string "first line..."].
+(defn luaO_chunkid (out0:(ptr i8) source:CStr srclen0:usize):void
+  (let (out:(ptr i8) out0
+        src:(ptr i8) (bytes source)
+        srclen:usize srclen0
+        bufflen:usize LUA_IDSIZE)  ; the free space
+    (cond
+      (= (deref src) (ch \=))  ; a literal source
+        (if (<= srclen bufflen)
+          (memcpy out (p+ src 1) srclen)
+          (do (memcpy out (p+ src 1) (- bufflen 1))  ; truncated
+              (set! out (p+ out (- bufflen 1)))
+              (set! (deref out) 0)))
+      (= (deref src) (ch \@))  ; a file name
+        (if (<= srclen bufflen)
+          (memcpy out (p+ src 1) srclen)
+          (do (memcpy out (bytes "...") 3)  ; "..." before the rest of the name
+              (set! out (p+ out 3))
+              (set! bufflen (- bufflen 3))
+              (memcpy out (p+ src (- (+ 1 srclen) bufflen)) bufflen)))
+      true  ; a string: [string "source"]
+        (let (nl:(ptr i8) (strchr source 10))  ; the first newline
+          (memcpy out (bytes "[string \"") 9)
+          (set! out (p+ out 9))
+          (set! bufflen (- bufflen 15))  ; prefix, "...", suffix and '\0'
+          (if (and (< srclen bufflen) (= nl null))  ; one short line?
+            (do (memcpy out src srclen)
+                (set! out (p+ out srclen)))
+            (do (when (!= nl null)
+                  (set! srclen (cast_sizet (byte-diff nl src))))  ; up to the newline
+                (when (> srclen bufflen)
+                  (set! srclen bufflen))
+                (memcpy out src srclen)
+                (set! out (p+ out srclen))
+                (memcpy out (bytes "...") 3)
+                (set! out (p+ out 3))))
+          (memcpy out (bytes "\"]") 3)))))  ; with its '\0'

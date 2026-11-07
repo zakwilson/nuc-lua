@@ -1,0 +1,9 @@
+; ISSUE-030: a defconst over a header constant is refused once a defstruct uses it as an array length.
+; expect: prints `60 64`; actual: `defconst: 'X' needs a run-time initializer`
+; run: $NUCLEUSC --cflag=-I$D/../include $P -o $W/p && $W/p
+; fixed-when-output: 60 64
+(import-use "stdio.h")
+(import-use "lua.h")
+(defconst X LUA_IDSIZE)
+(defstruct S a:i32 b:(array i8 X))
+(defn main ():i32 (printf "%d %d\n" (as i32 X) (as i32 (sizeof S))) (return 0))
