@@ -353,6 +353,8 @@
   `(unsafe/cast (ptr ~t) (luaM_realloc_ ~L (as ptr ~v)
                                          (* (cast_sizet ~oldn) (cast_sizet (sizeof ~t)))
                                          (* (cast_sizet ~n) (cast_sizet (sizeof ~t))))))
+; luaM_checksize never fires for an int count: sizeof(int) < sizeof(size_t).
+(defmacro luaM_newvectorchecked (L n t) `(luaM_newvector ~L ~n ~t))
 ; luaM_limitN is the identity here: MAX_SIZET/sizeof(t) exceeds every int limit.
 (defmacro luaM_growvector (L v nelems size T limit e)
   `(set! ~v (unsafe/cast (ptr ~T) (luaM_growaux_ ~L (as ptr ~v) ~nelems (ref ~size)

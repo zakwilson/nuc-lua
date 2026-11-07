@@ -575,6 +575,19 @@ static void t_load(lua_State *L) {
   say("binary %d %s ", st, show(L, -2));
   say("%s\n", show(L, -1));
   lua_settop(L, 0);
+  /* 'B' loads from a fixed buffer: code and long strings stay in 'sink' */
+  luaL_loadstring(L, "local s = 'a string longer than forty bytes, used in place'\n"
+                     "return s, #s");
+  sink.n = 0;
+  sink.calls = 0;
+  st = lua_dump(L, writer, &sink, 0);
+  say("dump %d calls %d ", st, sink.calls);
+  lua_pop(L, 1);
+  st = luaL_loadbufferx(L, sink.data, sink.n, "=fixed", "B");
+  lua_call(L, 0, 2);
+  say("fixed %d %s ", st, show(L, -2));
+  say("%s\n", show(L, -1));
+  lua_settop(L, 0);
   st = luaL_loadstring(L, "return +");
   say("syntax %d %s\n", st, show(L, -1));
   lua_pop(L, 1);

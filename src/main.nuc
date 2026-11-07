@@ -27,6 +27,8 @@
 (import lua.lex)
 (import lua.code)
 (import lua.parser)
+(import lua.dump)
+(import lua.undump)
 (import lua.init)
 (import-use lua.util)
 (import-use "stdio.h")

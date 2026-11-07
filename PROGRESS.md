@@ -29,7 +29,7 @@ object model, the compiler, execution state, the collector and the VM (§10).
 | 1 Binding and first library | done: `capi/` (both layers), layout gate, `libs/mayi`, `tests/capi/capi.c`, stock column |
 | 2 Host and libraries | done: `lua.c`, `lauxlib.c`, `linit` and every standard library in Nucleus |
 | 3 Object model | done: `lctype`, `lzio`, `lmem`, `lobject`, `lstring`, `lfunc`, `ltm`, `ltable` |
-| 4 Compiler | in progress: `lopcodes`, `llex`, `lcode`, `lparser` ported; `ldump`, `lundump`, `luac.c` left |
+| 4 Compiler | in progress: `lopcodes`, `llex`, `lcode`, `lparser`, `ldump`, `lundump` ported; `luac.c` left |
 | 5–11 | not started |
 
 ### Nucleus
@@ -79,6 +79,9 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
   pass. Compiling the suite and a 140,000-constant chunk 20 times takes 3.2 s against
   stock's 3.1 s. Nesting 100 to 100,000 deep (parentheses, unary minus, blocks,
   constructors, calls, concatenations, assignment lists) fails or compiles as stock does.
+  After `ldump` and `lundump`, loading every truncation of a dump and every byte of it
+  set to 0, 0x80 and 0xff (`tests/bytecode/badload.lua`, 1696 results) reads as stock
+  does, and `capi.c` reloads a dump from a fixed buffer.
 - The spike: a Nucleus `luaopen_` module whose function raises with `luaL_error`
   (a real C variadic call) is caught by `pcall` in stock `lua`.
 
@@ -94,14 +97,15 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
   `tests/bytecode/gen-stress.lua`'s sources (LOADKX, SETLIST's extra argument, absolute
   line info, folding corners, every variable kind), stripped and not, must be
   byte-identical to stock's; names the first differing function; cross-loads both ways;
-  `tests/bytecode/errors.lua`'s compile errors must read the same.
+  `tests/bytecode/errors.lua`'s compile errors and `tests/bytecode/badload.lua`'s
+  corrupted loads must read the same.
 - `scripts/check-tables.sh`: `luaP_opmodes` and `luai_ctype_` byte-identical to stock's.
 - `scripts/check-suite.sh` runs the official suite (`LUA=` picks the binary).
 
 ## Next
 
-M4, the compiler: `ldump`, `lundump`, then `luac.c`, with the suite and
-`check-bytecode.sh` after each. `code.nuc` holds `lcode.h`'s macros and the `expdesc`
+M4, the compiler: `luac.c`, a second executable, its opcode names from the
+`with-opcodes` rows. `code.nuc` holds `lcode.h`'s macros and the `expdesc`
 union accessors (`u`, `set-u`, `ind`, `set-ind`, `uvar`, `set-uvar`) that `parser.nuc`
 uses; `parser.nuc`'s `Block` is C's `BlockCnt` (ISSUE-037). `opcodes.nuc` generates `luaP_opmodes` from one
 opcode row table (`with-opcodes`); `luac`'s opcode names come from the same rows.

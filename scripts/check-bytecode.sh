@@ -2,7 +2,7 @@
 # The port's dumps must be byte-identical to stock's (PROMPT §7.4): it dumps every
 # suite file with each binary, stripped and not, and names the first differing
 # function; so too for generated stress sources. Then each loads the other's
-# dumps, a sample runs from both, and compile errors must read the same.
+# dumps, a sample runs from both, and compile and load errors must read the same.
 set -uo pipefail
 source "$(dirname "$0")/env.sh"
 LUA=$(realpath "${LUA:-$ROOT/build/lua}")
@@ -39,7 +39,10 @@ for run in "$LUA $W/sample.stock" "$REFLUA $W/sample.port"; do
   got=$($run a b 2>&1)
   [ "$got" = "$want" ] || { echo "check-bytecode: '$run' printed differently:"; diff <(echo "$want") <(echo "$got") | head -5; fail=1; }
 done
-# Compile errors read the same.
+# Compile errors read the same, and so do loads of corrupted dumps (with memory
+# capped, as a corrupted size may ask for gigabytes).
 diff <("$REFLUA" "$T/errors.lua" 2>&1) <("$LUA" "$T/errors.lua" 2>&1) > "$W/e" ||
   { echo "check-bytecode: compile errors differ:"; head -6 "$W/e"; fail=1; }
+diff <(ulimit -v 1000000; "$REFLUA" "$T/badload.lua" 2>&1) <(ulimit -v 1000000; "$LUA" "$T/badload.lua" 2>&1) > "$W/e" ||
+  { echo "check-bytecode: loading corrupted dumps differs:"; head -6 "$W/e"; fail=1; }
 if [ $fail -eq 0 ]; then echo "check-bytecode: pass ($n dumps identical, cross-loading ok)"; else exit 1; fi
