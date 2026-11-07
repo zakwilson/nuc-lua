@@ -31,7 +31,7 @@ fixed point needs a second round), `make`, then `make -k test` and `make bootstr
 
 **Baseline** (lua-bugfixes at `bc1b05d`, before any change of this port's):
 `nuctests: 1725 passed, 0 failed, 0 skipped`, bootstrap fixed point holds.
-Latest (`d2c75f7`): 1743 passed, bootstrap holds. After `a64ac73` it held only from
+Latest (`b8e711e`): 1744 passed, bootstrap holds. After `a64ac73` it held only from
 the third round (a fix the compiler's own sources depend on changes the order a
 compiler built without it emits).
 
@@ -42,5 +42,7 @@ compiler built without it emits).
 - The official suite needs stdin to be a pipe: `cd build/suite && : | lua all.lua`.
 - An idle pipe is `sleep 1 | lua …`; `printf '' |` is at EOF, which `select` calls readable.
 - A `:shared true` library builds `build/lib/lib<name>.so`; `require` wants `<name>.so`.
+- After editing `capi/` (the binding), rebuild `lua` itself too: the port imports the
+  binding, and gates run on a stale `build/lua` pass without noticing.
 - A public `defn` in a `.so` is preempted by any same-named symbol in the process
   (ISSUE-005), so Lua C functions in a library are `defn-`.

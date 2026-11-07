@@ -1,0 +1,382 @@
+; A Lua library in idiomatic Nucleus, built on the binding (capi/) and the
+; Nucleus standard library, loadable unchanged into stock lua and the port.
+;
+; The error rule (docs/writing-libraries.md): Lua raises with longjmp, which
+; skips the `defer`s and `with` cleanups of every frame it crosses (ISSUE-047).
+; So a function Lua calls holds no such cleanup across a call that can raise or
+; yield. Owning work runs in helpers that never call Lua and return a Result;
+; the Lua function raises only after they have returned. A resource that must
+; live while Lua runs is anchored in a userdata whose __gc releases it.
+(ns nucdemo)
+(set-ir-prefix "")  ; luaopen_nucdemo keeps its C name; the rest is private
+(import-use luacapi)
+(import-use "string.h")
+(import-use "stdlib.h")
+(import-use "ctype.h")
+(import-use "math.h")
+(import-use nucleus.allocator)
+(import-use nucleus.coll)
+(import-use nucleus.vector)
+(import-use nucleus.hash)
+(import-use nucleus.hashmap)
+(import-use nucleus.strview)
+(import-use nucleus.combinators)
+
+(deferror no-samples "no samples")
+(deferror not-a-number "not an integer")
+(deferror too-large "integer overflow")
+
+; Raises a Nucleus error as a Lua error. Only call it from a frame that owns
+; nothing: luaL_error never returns.
+(defmacro raise-err (L e) `(luaL_error ~L "%s" (err-message ~e)))
+
+; ---- Stats: a userdata owning a Vector ----
+
+(defconst STATS "nucdemo.Stats")
+(defstruct Stats samples:(Vector f64) live:bool)
+
+(defn- stats-mean (v:&(Vector f64)):!f64
+  (when (= (count v) 0)
+    (return (err no-samples)))
+  (let (sum:f64 0.0)
+    (for (i:usize 0) (< i (count v)) (set! i (+ i 1))
+      (set! sum (+ sum (v i))))
+    (return (ok (/ sum (unsafe/cast f64 (count v)))))))
+
+(defn- stats-stddev (v:&(Vector f64)):!f64
+  (let (m:f64 (try (stats-mean v))
+        acc:f64 0.0)
+    (for (i:usize 0) (< i (count v)) (set! i (+ i 1))
+      (let (d:f64 (- (v i) m))
+        (set! acc (+ acc (* d d)))))
+    (return (ok (sqrt (/ acc (unsafe/cast f64 (count v))))))))
+
+(defn- before (a:f64 b:f64):i32
+  (return (if (< a b) 1 0)))
+
+; Sorts a copy, which the `with` frees on both returns.
+(defn- stats-median (v:&(Vector f64)):!f64
+  (when (= (count v) 0)
+    (return (err no-samples)))
+  (with (c:&(Vector f64) (alloca (Vector f64)))
+    (init c (handle heap) v)
+    (sort before c)
+    (let (n:usize (count c)
+          h:usize (/ n 2))
+      (if (= (% n 2) 1)
+        (return (ok (c h)))
+        (return (ok (/ (+ (c (- h 1)) (c h)) 2.0)))))))
+
+; The live Stats at argument 1; a closed one is an error.
+(defn- check-stats (L:&lua_State):&Stats
+  (let (s:&Stats (unsafe/cast &Stats (luaL_checkudata L 1 STATS)))
+    (when (not (s 'live))
+      (luaL_error L "stats is closed"))
+    (return s)))
+
+(defn- stats-release (s:&Stats):void
+  (when (s 'live)
+    (set! (s 'live) false)
+    (drop (ref (s 'samples)))))
+
+(defn-lua stats-new (L)
+  (let (n:i32 (lua_gettop L)
+        s:&Stats (lua-new-udata L Stats STATS))
+    (init (ref (s 'samples)))
+    (set! (s 'live) true)
+    (for (i:i32 1) (<= i n) (set! i (+ i 1))
+      (conj (ref (s 'samples)) (luaL_checknumber L i)))
+    (return 1)))
+
+(defn-lua stats-add (L)
+  (let (s:&Stats (check-stats L)
+        n:i32 (lua_gettop L))
+    (for (i:i32 2) (<= i n) (set! i (+ i 1))
+      (conj (ref (s 'samples)) (luaL_checknumber L i)))
+    (lua_settop L 1)  ; returns itself, to chain
+    (return 1)))
+
+(defmacro defn-stat (name f)
+  `(defn-lua ~name (L)
+     (let (s:&Stats (check-stats L))
+       (match (~f (ref (s 'samples)))
+         ((ok x) (lua_pushnumber L x))
+         ((err e) (raise-err L e)))
+       (return 1))))
+(defn-stat stats-mean-lua stats-mean)
+(defn-stat stats-stddev-lua stats-stddev)
+(defn-stat stats-median-lua stats-median)
+
+(defn-lua stats-len (L)
+  (let (s:&Stats (check-stats L))
+    (lua_pushinteger L (unsafe/cast lua_Integer (count (ref (s 'samples)))))
+    (return 1)))
+
+; "Stats(n=3, mean=2.0)", through a luaL_Buffer
+(defn-lua stats-tostring (L)
+  (let (s:&Stats (unsafe/cast &Stats (luaL_checkudata L 1 STATS))
+        B:&luaL_Buffer (alloca luaL_Buffer))
+    (luaL_buffinit L B)
+    (luaL_addstring B "Stats(")
+    (if (not (s 'live))
+      (luaL_addstring B "closed")
+      (do (lua_pushfstring L "n=%d" (unsafe/cast i32 (count (ref (s 'samples)))))
+          (luaL_addvalue B)
+          (match (stats-mean (ref (s 'samples)))
+            ((ok m) (do (lua_pushfstring L ", mean=%f" m) (luaL_addvalue B)))
+            ((err e) 0))))
+    (luaL_addchar B (as i8 41))  ; ')'
+    (luaL_pushresult B)
+    (return 1)))
+
+; __gc and __close both release; a second release does nothing.
+(defn-lua stats-gc (L)
+  (stats-release (unsafe/cast &Stats (luaL_checkudata L 1 STATS)))
+  (return 0))
+
+; ---- counter: a C closure over two upvalues ----
+
+(defn-lua counter-next (L)
+  (let (n:lua_Integer (lua_tointeger L (lua_upvalueindex 1))
+        step:lua_Integer (lua_tointeger L (lua_upvalueindex 2)))
+    (lua_pushinteger L (+ n step))
+    (lua_copy L -1 (lua_upvalueindex 1))
+    (lua_pushinteger L n)
+    (return 1)))
+
+(defn-lua counter-lua (L (start integer 1) (step integer 1))
+  (lua_pushinteger L start)
+  (lua_pushinteger L step)
+  (lua_pushcclosure L counter-next 2)
+  (return 1))
+
+; ---- words: a HashMap anchored in a userdata ----
+
+(defconst WORDS "nucdemo.Words")
+(defstruct Words counts:(HashMap StrView i64) order:(Vector StrView) live:bool)
+
+; Counts the words of s into w, in first-seen order. Calls no Lua.
+(defn- count-words (w:&Words s:&ui8 len:usize):void
+  (let (i:usize 0)
+    (while (< i len)
+      (while (and (< i len) (= (isalnum (as i32 (aref s i))) 0))
+        (set! i (+ i 1)))
+      (let (start:usize i)
+        (while (and (< i len) (!= (isalnum (as i32 (aref s i))) 0))
+          (set! i (+ i 1)))
+        (when (> i start)
+          (let (key:StrView (strview (unsafe/ptr+ s start) (- i start)))
+            (match (get (ref (w 'counts)) key)
+              ((some n) (assoc (ref (w 'counts)) key (+ n 1)))
+              (none (do (assoc (ref (w 'counts)) key 1)
+                        (conj (ref (w 'order)) key))))))))))
+
+(defn- words-release (w:&Words):void
+  (when (w 'live)
+    (set! (w 'live) false)
+    (drop (ref (w 'counts)))
+    (drop (ref (w 'order)))))
+
+(defn-lua words-gc (L)
+  (words-release (unsafe/cast &Words (luaL_checkudata L 1 WORDS)))
+  (return 0))
+
+; words(s): {word = count}, and the words in first-seen order. The keys point
+; into 's', which stays on the stack; the map lives in a userdata, so a memory
+; error while the results are pushed leaks nothing: __gc frees it.
+(defn-lua words-lua (L (s any))
+  (let (len:&usize (alloca usize)
+        p:&ui8 (unsafe/cast &ui8 (luaL_checklstring L s len))
+        w:&Words (lua-new-udata L Words WORDS))
+    (init (ref (w 'counts)))
+    (init (ref (w 'order)))
+    (set! (w 'live) true)
+    (count-words w p (deref len))
+    (let (n:usize (count (ref (w 'order))))
+      (lua_createtable L 0 (unsafe/cast i32 n))  ; counts
+      (lua_createtable L (unsafe/cast i32 n) 0)  ; order
+      (for (i:usize 0) (< i n) (set! i (+ i 1))
+        (let (k:StrView ((ref (w 'order)) i))
+          (lua_pushlstring L (as CStr (as ptr (k 'data))) (k 'len))
+          (lua_pushvalue L -1)
+          (lua_rawseti L -3 (unsafe/cast lua_Integer (+ i 1)))
+          (match (get (ref (w 'counts)) k)
+            ((some c) (lua_pushinteger L c))
+            (none (lua_pushinteger L 0)))
+          (lua_rawset L -4))))
+    (words-release w)  ; early, not waiting for the collector
+    (return 2)))
+
+; ---- join: a luaL_Buffer over any values ----
+
+(defn-lua join-lua (L (t table) (sep string ""))
+  (let (n:lua_Integer (luaL_len L t)
+        B:&luaL_Buffer (alloca luaL_Buffer))
+    (luaL_buffinit L B)
+    (for (i:lua_Integer 1) (<= i n) (set! i (+ i 1))
+      (lua_geti L t i)
+      (luaL_tolstring L -1 null)  ; __tostring and __name respected
+      (lua_remove L -2)
+      (luaL_addvalue B)
+      (when (< i n)
+        (luaL_addstring B sep)))
+    (luaL_pushresult B)
+    (return 1)))
+
+; ---- handlers: registry references, callbacks, errors as values ----
+
+(defconst HANDLERS "nucdemo.handlers")  ; registry: ref -> function
+(defconst ORDER "nucdemo.Order")
+(defstruct Order refs:(Vector i32) live:bool)
+
+(defn-lua order-gc (L)
+  (let (o:&Order (unsafe/cast &Order (luaL_checkudata L 1 ORDER)))
+    (when (o 'live)
+      (set! (o 'live) false)
+      (drop (ref (o 'refs)))))
+  (return 0))
+
+; The handler table and the registration order, made on first use. Leaves the
+; table on the stack.
+(defn- handlers (L:&lua_State):&Order
+  (luaL_getsubtable L LUA_REGISTRYINDEX HANDLERS)
+  (when (!= (lua_getfield L -1 "order") LUA_TUSERDATA)
+    (lua_pop L 1)
+    (let (o:&Order (lua-new-udata L Order ORDER))
+      (init (ref (o 'refs)))
+      (set! (o 'live) true)
+      (lua_setfield L -2 "order")
+      (return o)))
+  (let (o:&Order (unsafe/cast &Order (lua_touserdata L -1)))
+    (lua_pop L 1)
+    (return o)))
+
+(defn-lua on-lua (L (f function))
+  (let (o:&Order (handlers L))
+    (lua_pushvalue L f)
+    (let (r:i32 (luaL_ref L -2))
+      (conj (ref (o 'refs)) r)
+      (lua_pushinteger L r)
+      (return 1))))
+
+(defn-lua off-lua (L (r integer))
+  (let (o:&Order (handlers L)
+        v:&(Vector i32) (ref (o 'refs))
+        id:i32 (unsafe/cast i32 r))
+    (for (i:usize 0) (< i (count v)) (set! i (+ i 1))
+      (when (= (v i) id)
+        (remove-at v i)
+        (luaL_unref L -1 id)
+        (lua_pushboolean L 1)
+        (return 1)))
+    (lua_pushboolean L 0)
+    (return 1)))
+
+; emit(...): calls each handler with the arguments, in registration order. An
+; error in one is caught (lua_pcall: Lua to Nucleus) and collected; returns the
+; number that succeeded and a table of the error messages.
+(defn-lua emit-lua (L)
+  (let (nargs:i32 (lua_gettop L)
+        o:&Order (handlers L)  ; the table at nargs + 1
+        tab:i32 (+ nargs 1)
+        ok:i32 0
+        nerr:i32 0)
+    (lua_newtable L)  ; the errors, at nargs + 2
+    (let (i:usize 0)
+      (while (< i (count (ref (o 'refs))))  ; a handler may call off()
+        (lua_rawgeti L tab (unsafe/cast lua_Integer ((ref (o 'refs)) i)))
+        (for (a:i32 1) (<= a nargs) (set! a (+ a 1))
+          (lua_pushvalue L a))
+        (if (= (lua_pcall L nargs 0 0) LUA_OK)
+          (set! ok (+ ok 1))
+          (do (set! nerr (+ nerr 1))
+              (lua_rawseti L (+ nargs 2) nerr)))
+        (set! i (+ i 1))))
+    (lua_pushinteger L ok)
+    (lua_insert L -2)
+    (return 2)))
+
+; ---- each and try: yields across a call, through continuations ----
+
+; Calls f(i, t[i]) for i from 'from' on; ctx carries the index across a yield,
+; since this frame is gone when the coroutine resumes.
+(defn- each-from (L:&lua_State from:lua_Integer):i32
+  (let (n:lua_Integer (luaL_len L 1))
+    (for (i:lua_Integer from) (<= i n) (set! i (+ i 1))
+      (lua_pushvalue L 2)
+      (lua_pushinteger L i)
+      (lua_geti L 1 i)
+      (lua_callk L 2 0 i each-k))
+    (lua_pushinteger L n)
+    (return 1)))
+
+(defn- each-k (L:&lua_State status:i32 ctx:lua_KContext):i32
+  (return (each-from L (+ ctx 1))))
+
+(defn-lua each-lua (L (t table) (f function))
+  (lua_settop L 2)
+  (return (each-from L 1)))
+
+; try(f, ...): true and f's results, or false and the error; f may yield.
+(defn- try-k (L:&lua_State status:i32 ctx:lua_KContext):i32
+  (when (and (!= status LUA_OK) (!= status LUA_YIELD))
+    (lua_pushboolean L 0)
+    (lua_pushvalue L -2)
+    (return 2))
+  (return (lua_gettop L)))  ; the true below the results
+
+(defn-lua try-lua (L (f any))
+  (lua_pushboolean L 1)
+  (lua_insert L 1)
+  (return (try-k L (lua_pcallk L (- (lua_gettop L) 2) LUA_MULTRET 0 0 try-k) 0)))
+
+; ---- parse: a Nucleus Result raised as a Lua error ----
+
+; A decimal integer with optional sign and surrounding space. The trimmed copy
+; is freed by the `with` on every return, error or not.
+(defn- parse-int (s:CStr len:usize):!i64
+  (with (buf:(ptr i8) (as (ptr i8) (malloc (+ len 1))))
+    (let (n:usize 0
+          i:usize 0
+          src:(ptr i8) (as (ptr i8) (as ptr s)))
+      (while (and (< i len) (!= (isspace (as i32 (aref src i))) 0)) (set! i (+ i 1)))
+      (while (and (< i len) (= (isspace (as i32 (aref src i))) 0))
+        (set! (aref buf n) (aref src i))
+        (set! n (+ n 1))
+        (set! i (+ i 1)))
+      (while (and (< i len) (!= (isspace (as i32 (aref src i))) 0)) (set! i (+ i 1)))
+      (when (or (< i len) (= n 0))
+        (return (err not-a-number)))
+      (let (neg:bool (= (aref buf 0) (as i8 45))  ; '-'
+            j:usize (if (or neg (= (aref buf 0) (as i8 43))) 1 0)  ; '+'
+            acc:ui64 0)
+        (when (= j n)
+          (return (err not-a-number)))
+        (while (< j n)
+          (let (c:i32 (- (as i32 (aref buf j)) 48))
+            (when (or (< c 0) (> c 9))
+              (return (err not-a-number)))
+            (when (> acc (/ (- 9223372036854775808 (as ui64 c)) 10))
+              (return (err too-large)))
+            (set! acc (+ (* acc 10) (as ui64 c))))
+          (set! j (+ j 1)))
+        (when (and (not neg) (> acc 9223372036854775807))
+          (return (err too-large)))
+        (return (ok (if neg (- 0 (unsafe/cast i64 acc)) (unsafe/cast i64 acc))))))))
+
+(defn-lua parse-lua (L (s any))
+  (let (len:&usize (alloca usize)
+        p:CStr (luaL_checklstring L s len))
+    (match (parse-int p (deref len))
+      ((ok v) (lua_pushinteger L v))
+      ((err e) (raise-err L e)))  ; parse-int has returned: its `with` has run
+    (return 1)))
+
+(deflualib luaopen_nucdemo
+  (("stats" stats-new) ("counter" counter-lua) ("words" words-lua) ("join" join-lua)
+   ("on" on-lua) ("off" off-lua) ("emit" emit-lua) ("each" each-lua) ("try" try-lua) ("parse" parse-lua))
+  (("nucdemo.Stats" ("add" stats-add) ("mean" stats-mean-lua) ("stddev" stats-stddev-lua)
+                    ("median" stats-median-lua) ("__len" stats-len)
+                    ("__tostring" stats-tostring) ("__gc" stats-gc) ("__close" stats-gc))
+   ("nucdemo.Words" ("__gc" words-gc))
+   ("nucdemo.Order" ("__gc" order-gc))))

@@ -2,6 +2,7 @@
 ;; (scripts/setup.sh); no stock object is linked.
 {:name "lua"
  :opt 2
+ :tests "tests/unit/main.nuc"
  :cflags ["-Iinclude" "-Ireference/build/src" "-DLUA_USE_LINUX"]
  :link-args ["-Wl,--dynamic-list=src/lua.dynlist"]
  :libs ["m" "dl"]

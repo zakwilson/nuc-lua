@@ -1,0 +1,6 @@
+{:kind :library
+ :name "nucdemo"
+ :version "1.0"
+ :shared true
+ :link-args ["-Wl,--version-script=exports.map"]
+ :deps {luacapi {:path "../../capi"}}}

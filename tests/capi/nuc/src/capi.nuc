@@ -8,6 +8,10 @@
 (import-use "errno.h")
 (import-use "setjmp.h")
 
+; `extern const char lua_ident[]`, which the importer skips (ISSUE-046); the
+; length is a guess, harmless while only the address is read.
+(extern lua_ident:(array i8 1))
+
 (defmacro say (:rest args) `(do (printf ~@args) (fflush stdout)))
 (defmacro b (c) `(if ~c 1 0))  ; a C truth value, for %d
 (defmacro same (p q) `(= (unsafe/cast ptr ~p) (unsafe/cast ptr ~q)))  ; pointers, functions included
@@ -937,6 +941,38 @@ print('tbc', co()) print('tbc', co())"))
     (say "luaopen_* top %d\n" (lua_gettop L))
     (lua_close L)))
 
+;---- two Nucleus libraries in one state, unloaded at lua_close ----
+
+; Whether a file whose path ends in 'name' is mapped into this process.
+(defn- mapped (name:CStr):i32
+  (let (line:(ptr i8) (alloca i8 1024)
+        found:i32 0
+        n:usize (strlen name)
+        f:(ptr FILE) (fopen "/proc/self/maps" "r"))
+    (when (nullp f)
+      (return -1))
+    (while (not (nullp (fgets line 1024 f)))
+      (let (nl:(ptr i8) (as (ptr i8) (as ptr (strchr (as CStr (as ptr line)) 10))))
+        (when (not (nullp nl))
+          (set! (deref nl) 0))
+        (let (len:usize (strlen (as CStr (as ptr line))))
+          (when (and (>= len n)
+                     (= (strcmp (as CStr (as ptr (unsafe/ptr+ line (- len n)))) name) 0))
+            (set! found 1)))))
+    (fclose f)
+    (return found)))
+
+(defn- t-unload ():void
+  (let (L:(ptr lua_State) (luaL_newstate))
+    (luaL_openlibs L)
+    (run L "package.cpath = 'so/n/?.so'
+local d, m = require 'nucdemo', require 'mayi'
+capi_keep = d.stats(1, 2)  -- finalized at lua_close, before the unload
+print('unload: loaded', tostring(capi_keep), type(m.mayi))")
+    (say "mapped before %d %d\n" (mapped "/nucdemo.so") (mapped "/mayi.so"))
+    (lua_close L)
+    (say "mapped after %d %d\n" (mapped "/nucdemo.so") (mapped "/mayi.so"))))
+
 (defn- f-run (L:&lua_State):i32
   (say "ident %d\n" (b (= (strncmp (as CStr (as ptr lua_ident)) "$LuaVersion: " 13) 0)))
   (t-stack L)
@@ -957,6 +993,7 @@ print('tbc', co()) print('tbc', co())"))
   (t-coroutines L)
   (t-gc L)
   (t-states)
+  (t-unload)
   (say "done\n")
   (return 0))
 

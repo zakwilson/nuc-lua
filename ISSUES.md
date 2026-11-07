@@ -5,51 +5,55 @@ Ranked by porter pain removed per unit of language work.
 | Rank | Issue | Claim | Severity | Kind | Status |
 |---|---|---|---|---|---|
 | 1 | ISSUE-005 | A library's public `defn` is preempted by any same-named symbol in the process | major | design | open |
-| 2 | ISSUE-023 | An array field of a nested place decayed to a copy's address, losing every store | major | bug | fixed in nucleus `0081d2a` |
-| 3 | ISSUE-032 | A store to a field of a union member was refused as a temporary | major | bug | fixed in nucleus `1ae171b` |
-| 4 | ISSUE-043 | A place under a macro call, `&G(L)->mainth.l`, gave the address of a copy | major | bug | fixed in nucleus `275b612`, `d2c75f7` |
-| 5 | ISSUE-033 | A compilation could hold at most 256 macros | blocker | bug | fixed in nucleus `1ae171b` |
-| 6 | ISSUE-026 | A declaration with an attribute between its return type and its name was skipped | blocker | bug | fixed in nucleus `f282cfe` |
-| 7 | ISSUE-022 | A definition that misses its header's prototype silently becomes a mangled overload | major | design | worked-around |
-| 8 | ISSUE-004 | A function's address isn't a constant in an aggregate initializer | major | missing-feature | worked-around |
-| 9 | ISSUE-013 | An imported file can't define a function its header declares | blocker | bug | fixed in nucleus `5dab7cb` |
-| 10 | ISSUE-001 | A C variadic couldn't be defined in Nucleus | major | known-limitation | fixed in nucleus `336a93b` |
-| 11 | ISSUE-002 | `RET (name)(args)`, how Lua declares every function, was skipped by a header import | blocker | known-limitation | fixed in nucleus `beb0472` |
-| 12 | ISSUE-006 | Calling a C variadic by `declare` passed the tail unpromoted, with `%al` unset | major | bug | fixed in nucleus `cd516e6` |
-| 13 | ISSUE-003 | A `defvar` array of a header's struct was refused as opaque | major | bug | fixed in nucleus `beb0472` |
-| 14 | ISSUE-008 | Integer to float takes `unsafe/cast` | major | design | worked-around |
-| 15 | ISSUE-027 | Unary minus on a float is `0 - x`, so `(- 0.0)` is `0.0`, not `-0.0` | major | bug | worked-around |
-| 16 | ISSUE-045 | A computed goto's jump table can be neither a local array nor a static one | minor | missing-feature | worked-around |
-| 17 | ISSUE-019 | A header's `char *` is `(ptr i8)`, and an `if` won't join it with a string literal | minor | design | worked-around |
-| 18 | ISSUE-021 | Pointers can't be subtracted | minor | missing-feature | worked-around |
-| 19 | ISSUE-028 | `bit-not` of an unsigned operand is refused | minor | bug | worked-around |
-| 20 | ISSUE-029 | A constant macro built with a function-like macro isn't imported: `LUA_VNUMINT` | minor | known-limitation | worked-around |
-| 21 | ISSUE-030 | A `defconst` over a header constant is refused once a `defstruct` uses it as an array length | minor | bug | worked-around |
-| 22 | ISSUE-031 | A row of a header's 2-D array field doesn't decay, so it can't be indexed | minor | bug | worked-around |
-| 23 | ISSUE-034 | In a namespaced file, a header type named like a prelude type is silently the prelude's | minor | design | worked-around |
-| 24 | ISSUE-018 | A header's expression macros aren't imported: `errno`, `WIFEXITED` | minor | known-limitation | worked-around |
-| 25 | ISSUE-007 | A shared library is always named `lib<name>.so` | minor | tooling | worked-around |
-| 26 | ISSUE-010 | There is no `offsetof` | minor | missing-feature | worked-around |
-| 27 | ISSUE-012 | A header's string macros aren't imported | minor | known-limitation | worked-around |
-| 28 | ISSUE-011 | No `sizeof` of an expression, so no array length | minor | missing-feature | worked-around |
-| 29 | ISSUE-015 | Only the entry file can export a strong symbol | minor | design | worked-around |
-| 30 | ISSUE-016 | No byte literal: `\e` is a 32-bit Char and won't convert to `i8` | minor | design | worked-around |
-| 31 | ISSUE-017 | A `CStr` can't be indexed | minor | design | worked-around |
-| 32 | ISSUE-014 | `SIG_DFL` imports as the integer 0 | minor | interop | worked-around |
-| 33 | ISSUE-040 | A later declarator in a field list (`*previous, *next`) imported as a bare `ptr` | minor | bug | fixed in nucleus `a64ac73` |
-| 34 | ISSUE-042 | `=` on two `CStr`s compares contents, so a C pointer test ported as written reads through null | minor | design | worked-around |
-| 35 | ISSUE-041 | `bit-not` of an unsigned value is refused: `-1` doesn't fit it | papercut | bug | worked-around |
-| 36 | ISSUE-044 | A global `i8` array takes no string initializer, so `lua_ident` is spelled out in bytes | papercut | missing-feature | worked-around |
-| 37 | ISSUE-046 | A header's array variable, `extern const char lua_ident[]`, isn't imported | papercut | known-limitation | worked-around |
-| 38 | ISSUE-024 | A `_`-prefixed macro isn't imported, even ISO C's `_IOFBF` | papercut | design | worked-around |
-| 39 | ISSUE-020 | `set!` won't expand a macro in its place | papercut | missing-feature | worked-around |
-| 40 | ISSUE-025 | `sizeof` is a signed integer, so comparing a size with it is refused | papercut | design | worked-around |
-| 41 | ISSUE-035 | `unsafe/cast` from a function pointer to an integer is refused | papercut | bug | worked-around |
-| 42 | ISSUE-036 | A `defvar`'s array initializer isn't macroexpanded before its shape is checked | papercut | bug | worked-around |
-| 43 | ISSUE-037 | A `defstruct` can't complete a struct its header declares without a body | papercut | missing-feature | worked-around |
-| 44 | ISSUE-038 | A parameter named like a special form is accepted, then misparsed at its use | papercut | design | worked-around |
-| 45 | ISSUE-039 | A `build.edn` makes one program, and a second sharing its sources warns at every build | papercut | tooling | worked-around |
-| 46 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
+| 2 | ISSUE-047 | A `longjmp` over a Nucleus frame skips its `defer` and `with` cleanups, silently | major | design | open |
+| 3 | ISSUE-049 | A shared library exports every standard-library instance it uses, data included | major | design | worked-around |
+| 4 | ISSUE-023 | An array field of a nested place decayed to a copy's address, losing every store | major | bug | fixed in nucleus `0081d2a` |
+| 5 | ISSUE-032 | A store to a field of a union member was refused as a temporary | major | bug | fixed in nucleus `1ae171b` |
+| 6 | ISSUE-043 | A place under a macro call, `&G(L)->mainth.l`, gave the address of a copy | major | bug | fixed in nucleus `275b612`, `d2c75f7` |
+| 7 | ISSUE-033 | A compilation could hold at most 256 macros | blocker | bug | fixed in nucleus `1ae171b` |
+| 8 | ISSUE-026 | A declaration with an attribute between its return type and its name was skipped | blocker | bug | fixed in nucleus `f282cfe` |
+| 9 | ISSUE-022 | A definition that misses its header's prototype silently becomes a mangled overload | major | design | worked-around |
+| 10 | ISSUE-004 | A function's address isn't a constant in an aggregate initializer | major | missing-feature | worked-around |
+| 11 | ISSUE-013 | An imported file can't define a function its header declares | blocker | bug | fixed in nucleus `5dab7cb` |
+| 12 | ISSUE-001 | A C variadic couldn't be defined in Nucleus | major | known-limitation | fixed in nucleus `336a93b` |
+| 13 | ISSUE-002 | `RET (name)(args)`, how Lua declares every function, was skipped by a header import | blocker | known-limitation | fixed in nucleus `beb0472` |
+| 14 | ISSUE-006 | Calling a C variadic by `declare` passed the tail unpromoted, with `%al` unset | major | bug | fixed in nucleus `cd516e6` |
+| 15 | ISSUE-003 | A `defvar` array of a header's struct was refused as opaque | major | bug | fixed in nucleus `beb0472` |
+| 16 | ISSUE-008 | Integer to float takes `unsafe/cast` | major | design | worked-around |
+| 17 | ISSUE-027 | Unary minus on a float is `0 - x`, so `(- 0.0)` is `0.0`, not `-0.0` | major | bug | worked-around |
+| 18 | ISSUE-045 | A computed goto's jump table can be neither a local array nor a static one | minor | missing-feature | worked-around |
+| 19 | ISSUE-019 | A header's `char *` is `(ptr i8)`, and an `if` won't join it with a string literal | minor | design | worked-around |
+| 20 | ISSUE-021 | Pointers can't be subtracted | minor | missing-feature | worked-around |
+| 21 | ISSUE-028 | `bit-not` of an unsigned operand is refused | minor | bug | worked-around |
+| 22 | ISSUE-029 | A constant macro built with a function-like macro isn't imported: `LUA_VNUMINT` | minor | known-limitation | worked-around |
+| 23 | ISSUE-030 | A `defconst` over a header constant is refused once a `defstruct` uses it as an array length | minor | bug | worked-around |
+| 24 | ISSUE-031 | A row of a header's 2-D array field doesn't decay, so it can't be indexed | minor | bug | worked-around |
+| 25 | ISSUE-034 | In a namespaced file, a header type named like a prelude type is silently the prelude's | minor | design | worked-around |
+| 26 | ISSUE-018 | A header's expression macros aren't imported: `errno`, `WIFEXITED` | minor | known-limitation | worked-around |
+| 27 | ISSUE-007 | A shared library is always named `lib<name>.so` | minor | tooling | worked-around |
+| 28 | ISSUE-048 | A shared library's link ignored `:link-args` | minor | bug | fixed in nucleus (see PROGRESS.md) |
+| 29 | ISSUE-010 | There is no `offsetof` | minor | missing-feature | worked-around |
+| 30 | ISSUE-012 | A header's string macros aren't imported | minor | known-limitation | worked-around |
+| 31 | ISSUE-011 | No `sizeof` of an expression, so no array length | minor | missing-feature | worked-around |
+| 32 | ISSUE-015 | Only the entry file can export a strong symbol | minor | design | worked-around |
+| 33 | ISSUE-016 | No byte literal: `\e` is a 32-bit Char and won't convert to `i8` | minor | design | worked-around |
+| 34 | ISSUE-017 | A `CStr` can't be indexed | minor | design | worked-around |
+| 35 | ISSUE-014 | `SIG_DFL` imports as the integer 0 | minor | interop | worked-around |
+| 36 | ISSUE-040 | A later declarator in a field list (`*previous, *next`) imported as a bare `ptr` | minor | bug | fixed in nucleus `a64ac73` |
+| 37 | ISSUE-042 | `=` on two `CStr`s compares contents, so a C pointer test ported as written reads through null | minor | design | worked-around |
+| 38 | ISSUE-041 | `bit-not` of an unsigned value is refused: `-1` doesn't fit it | papercut | bug | worked-around |
+| 39 | ISSUE-044 | A global `i8` array takes no string initializer, so `lua_ident` is spelled out in bytes | papercut | missing-feature | worked-around |
+| 40 | ISSUE-046 | A header's array variable, `extern const char lua_ident[]`, isn't imported | papercut | known-limitation | worked-around |
+| 41 | ISSUE-050 | In a file with no `(ns …)`, a macro can't name the file's own private helpers | papercut | design | worked-around |
+| 42 | ISSUE-024 | A `_`-prefixed macro isn't imported, even ISO C's `_IOFBF` | papercut | design | worked-around |
+| 43 | ISSUE-020 | `set!` won't expand a macro in its place | papercut | missing-feature | worked-around |
+| 44 | ISSUE-025 | `sizeof` is a signed integer, so comparing a size with it is refused | papercut | design | worked-around |
+| 45 | ISSUE-035 | `unsafe/cast` from a function pointer to an integer is refused | papercut | bug | worked-around |
+| 46 | ISSUE-036 | A `defvar`'s array initializer isn't macroexpanded before its shape is checked | papercut | bug | worked-around |
+| 47 | ISSUE-037 | A `defstruct` can't complete a struct its header declares without a body | papercut | missing-feature | worked-around |
+| 48 | ISSUE-038 | A parameter named like a special form is accepted, then misparsed at its use | papercut | design | worked-around |
+| 49 | ISSUE-039 | A `build.edn` makes one program, and a second sharing its sources warns at every build | papercut | tooling | worked-around |
+| 50 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
 
 ## ISSUE-001: A C variadic couldn't be defined in Nucleus
 
@@ -127,7 +131,9 @@ as a Lua function. `pcall(s.raise)` returned nothing at all: the call went to li
 `raise`, because the `.so` exports every public `defn` with default visibility, and
 even the module's own reference binds through the PLT. A C author writes `static`
 by habit; in Nucleus, public is the default spelling. A library build has no
-export list and no `-fvisibility=hidden`/`-Bsymbolic` switch.
+export list and no `-fvisibility=hidden`/`-Bsymbolic` switch. Since ISSUE-048's fix, a version
+script in `:link-args` can make one (`libs/nucdemo/exports.map`); ISSUE-049 is why a
+library using the standard library needs it.
 
 ## ISSUE-006: Calling a C variadic by `declare` passed the tail unpromoted
 
@@ -420,14 +426,112 @@ let the compiler emit C's constant table.
 - **Status:** worked-around
 - **Probe:** `probes/issue-046.nuc` — expected `UTC`; actual `undefined: 'tzname' — its
   C header declaration was skipped (/usr/include/time.h:224: an array variable)`
-- **Port sites:** `capi/src/luacapi.nuc`, for `tests/capi/nuc`
-- **Workaround:** `(extern lua_ident:(array i8 1))` in the binding: the length is a
-  guess, which is harmless while only the address is read.
+- **Port sites:** `tests/capi/nuc/src/capi.nuc`
+- **Workaround:** `(extern lua_ident:(array i8 1))` in the module that reads it: the
+  length is a guess, harmless while only the address is read, and wrong anywhere
+  the definition is also compiled.
 
 Context: `lua.h` declares one variable, `extern const char lua_ident[]`, and the
-importer skips it, saying why (to its credit). The Nucleus test module is the first
+importer skips it, saying why (to its credit). Declaring it in the binding instead,
+as `(extern lua_ident:(array i8 1))`, then broke the port: a program that both
+defines the array (`api.nuc`, 129 bytes) and imports the binding is refused, since
+the two lengths differ, though C accepts `extern const char x[];` beside any
+definition. So only `tests/capi/nuc`, which never defines it, declares it. The Nucleus test module is the first
 code to read it from outside the core. An unsized array could import as an `extern`
 of `(array T 0)`, or as a pointer-valued name, as C's decay treats it.
+
+## ISSUE-047: A `longjmp` over a Nucleus frame skips its `defer` and `with` cleanups, silently
+
+- **Severity:** major
+- **Kind:** design
+- **Status:** open
+- **Probe:** `probes/issue-047.nuc` — expected `cleanups 2`; actual `cleanups 0` (the
+  same code without the jump prints 2)
+- **Port sites:** every Lua C function in the port and in `libs/`; the rule below is
+  `docs/writing-libraries.md`'s
+- **Workaround:** the rule: a function holds no `defer`, no `with`-owned binding and no
+  `Drop` value across a call that can raise or yield. Owning work runs in helpers that
+  never call Lua and return a `Result`; the Lua function raises after they return.
+  What must live while Lua runs is anchored in a userdata whose `__gc` releases it
+  (`nucdemo`'s `words` keeps its `HashMap` so).
+
+Context: `lua_error`, `luaL_error`, every `luaL_check*`, and any API call that can
+allocate, all leave by `longjmp` to the `pcall` that is waiting, in C or in the port's
+`do.nuc`. Nucleus's cleanups are lexical, emitted at each exit the compiler sees, so
+the jump runs none of them: the probe's `defer` and its `Drop` binding are skipped,
+and nothing says so. Lua's own C code has the same rule, kept by habit; in Nucleus,
+`with` and `defer` are the idiomatic spelling and look safe. The port follows the rule
+by construction (it is C's code). In `nucdemo` it shaped the design: `parse-int` owns
+its buffer through a `with` and returns `!i64`; `parse` raises only after it returns.
+
+What would help, cheapest first: (1) an attribute for a declared function that may
+not return normally (`:may-longjmp`, given in the binding to `lua_error` and friends,
+and implied for anything calling `_longjmp`), and a compile-time error when an armed
+`defer` or owned binding is live across a call to one; (2) a cleanup form that also
+runs when the frame is jumped over, which needs an unwinder: Lua can throw C++
+exceptions instead of `longjmp` (`LUAI_THROW`), and Nucleus could emit its cleanups as
+landing pads, though a stock C host would still `longjmp`.
+
+## ISSUE-049: A shared library exports every standard-library instance it uses, data included
+
+- **Severity:** major
+- **Kind:** design
+- **Status:** worked-around
+- **Probe:** none standalone: it takes two libraries and a host. In
+  `libs/nucdemo` without its version script, `nm -D` lists 255 symbols: `luaopen_nucdemo`,
+  253 weak functions (`nuc_conj.pnuc_Vector.f64.f64`, `nuc_heap-allocate`, …) and two
+  data objects, `nuc_heap` and `nuc_g-handler-top`.
+- **Port sites:** `libs/nucdemo/build.edn`
+- **Workaround:** a version script, `libs/nucdemo/exports.map`, exporting
+  `luaopen_nucdemo` only, through `:link-args` (which needed ISSUE-048's fix).
+
+Context: every program or library that imports `nucleus.vector` instantiates the
+methods it uses, as `weak_odr` symbols with default visibility, and the prelude's
+globals come along. `require` opens a module `RTLD_LOCAL`, so two libraries keep their
+own copies; but `package.loadlib(path, "*")` opens one `RTLD_GLOBAL`, and from then on
+the next Nucleus library binds to the first one's instances: with two copies of
+`nucdemo` (as `nd1`, loaded with `"*"`, and `nd2`, required), `LD_DEBUG=bindings`
+shows 140 of `nd2`'s references, the heap allocator and `drop` among them, bound to
+`nd1`. That is harmless only while both were built by the same compiler from the same
+standard library; built by different ones, `nd2` runs `nd1`'s `Vector` code on its own
+layout. The same happens under a Nucleus host linked with `-Wl,-E`. What would help: a
+library build that gives everything but its public `defn`s hidden visibility (an
+`:exports` list in `build.edn`, or hidden by default for `:shared`).
+
+## ISSUE-048: A shared library's link ignored `:link-args`
+
+- **Severity:** minor
+- **Kind:** bug
+- **Status:** fixed in nucleus (see PROGRESS.md)
+- **Probe:** `nucleus` test `bt7-shared-link-args`: a version script given in
+  `:link-args` limits the `.so`'s exports
+- **Port sites:** `libs/nucdemo/build.edn`
+- **Workaround:** none needed after the fix.
+
+Context: `build.md` says `:link-args` are "passed to the link", and they are for a
+program, but the `:shared true` edge of a library built its `clang -shared` line
+without them, silently. So a library had no way to pass a version script, which is
+the only way to stop ISSUE-049. The fix adds them to that line.
+
+## ISSUE-050: In a file with no `(ns …)`, a macro can't name the file's own private helpers
+
+- **Severity:** papercut
+- **Kind:** design
+- **Status:** worked-around
+- **Probe:** `probes/issue-050.nuc` — expected `7`; actual `macro 'twice' names 'helper',
+  which is private to its file`
+- **Port sites:** `libs/nucdemo` (`defn-stat` over `check-stats`), `tests/unit/main.nuc`
+  (`check-format` over `formatted`)
+- **Workaround:** give the file an `(ns …)`, with `(set-ir-prefix "")` where a C name
+  must survive (`luaopen_nucdemo`, `main`).
+
+Context: a template names what its file defines by full name, so that it expands the
+same in another file; a private name in a file without a namespace has no full name,
+so the macro is refused where it is written (`docs/macros.md`, "Public names only").
+The rule is documented and the message says what to do. But both sites are a macro
+used only in its own file, the commonest kind in a library or a test program, and
+neither file needed a namespace for anything else. Refusing only an expansion in
+another file would keep the guarantee without the cost.
 
 ## ISSUE-024: A `_`-prefixed macro isn't imported, even ISO C's `_IOFBF`
 

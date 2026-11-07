@@ -1,0 +1,285 @@
+; Unit tests (PROMPT §7.6), run by `nucleus test`: the arithmetic edge cases,
+; number parsing and formatting, the generated tables against stock's bytes, the
+; token names, and the binding's macros. The suite tests these only through Lua.
+(ns lua.unit)
+(set-ir-prefix "")  ; main keeps its name
+(import-use luacapi)
+(import lua.aux)
+(import lua.baselib)
+(import lua.corolib)
+(import lua.mathlib)
+(import lua.utf8lib)
+(import lua.tablib)
+(import lua.oslib)
+(import lua.dblib)
+(import lua.iolib)
+(import lua.loadlib)
+(import lua.strlib)
+(import-use lua.ctype)
+(import lua.zio)
+(import lua.mem)
+(import-use lua.object)
+(import lua.string)
+(import lua.func)
+(import lua.tm)
+(import lua.table)
+(import lua.state)
+(import lua.debug)
+(import lua.do)
+(import lua.api)
+(import lua.gc)
+(import-use lua.vm)
+(import-use lua.opcodes)
+(import-use lua.lex)
+(import lua.code)
+(import lua.parser)
+(import lua.dump)
+(import lua.undump)
+(import lua.init)
+(import-use lua.util)
+(import-use lua.core)
+(import-use "lobject.h")
+(import-use "llex.h")
+(import-use "lvm.h")
+(import-use "math.h")
+(import-use "string.h")
+(import-use nucleus.error)
+(import-use nucleus.strview)
+(import-use nucleus.string)
+(import-use nucleus.fmt)
+(import-use nucleus.io)
+(import-use nucleus.test)
+
+(defconst MININT -9223372036854775808)
+(defconst MAXINT 9223372036854775807)
+
+(defmacro sv (s) `(strview-from-cstr (as CStr (as ptr ~s))))
+
+; ---- integer and float arithmetic ----
+
+(deftest idiv-floors
+  (try (check-eq-int (luaV_idiv null 7 2) 3 "7 // 2"))
+  (try (check-eq-int (luaV_idiv null -7 2) -4 "-7 // 2"))
+  (try (check-eq-int (luaV_idiv null 7 -2) -4 "7 // -2"))
+  (try (check-eq-int (luaV_idiv null -7 -2) 3 "-7 // -2"))
+  (try (check-eq-int (luaV_idiv null -6 3) -2 "-6 // 3, exact"))
+  (try (check-eq-int (luaV_idiv null MININT -1) MININT "mininteger // -1 wraps"))
+  (try (check-eq-int (luaV_idiv null MININT 1) MININT "mininteger // 1")))
+
+(deftest mod-takes-the-divisors-sign
+  (try (check-eq-int (luaV_mod null -7 3) 2 "-7 % 3"))
+  (try (check-eq-int (luaV_mod null 7 -3) -2 "7 % -3"))
+  (try (check-eq-int (luaV_mod null -7 -3) -1 "-7 % -3"))
+  (try (check-eq-int (luaV_mod null 6 -3) 0 "6 % -3"))
+  (try (check-eq-int (luaV_mod null MININT -1) 0 "mininteger % -1"))
+  (try (check-eq-int (luaV_mod null MAXINT MININT) -1 "maxinteger % mininteger")))
+
+(deftest float-mod
+  (try (check (= (luaV_modf null -4.0 3.0) 2.0) "-4.0 % 3"))
+  (try (check (= (luaV_modf null 4.0 -3.0) -2.0) "4.0 % -3"))
+  (try (check (= (luaV_modf null -4.0 -5.0) -4.0) "-4.0 % -5"))
+  (try (check (= (luaV_modf null 5.5 +inf.0) 5.5) "5.5 % inf"))
+  (try (check (= (luaV_modf null -5.5 +inf.0) +inf.0) "-5.5 % inf is inf"))
+  (try (check (!= (luaV_modf null 1.0 0.0) (luaV_modf null 1.0 0.0)) "1.0 % 0 is nan")))
+
+(deftest shifts-past-the-width
+  (try (check-eq-int (luaV_shiftl 1 63) MININT "1 << 63"))
+  (try (check-eq-int (luaV_shiftl 1 64) 0 "1 << 64"))
+  (try (check-eq-int (luaV_shiftl 1 1000) 0 "1 << 1000"))
+  (try (check-eq-int (luaV_shiftl -1 -1) MAXINT "-1 >> 1 is logical"))
+  (try (check-eq-int (luaV_shiftl -8 -1) 0x7ffffffffffffffc "-8 >> 1"))
+  (try (check-eq-int (luaV_shiftl -1 -64) 0 "-1 >> 64"))
+  (try (check-eq-int (luaV_shiftl 5 MININT) 0 "5 >> mininteger")))
+
+(deftest float-to-integer-modes
+  (let (i:(ptr lua_Integer) (alloca lua_Integer))
+    (try (check (= (luaV_flttointeger 3.0 i F2Ieq) 1) "3.0 exact"))
+    (try (check-eq-int (deref i) 3 "3.0"))
+    (try (check (= (luaV_flttointeger 3.5 i F2Ieq) 0) "3.5 is not exact"))
+    (try (check (= (luaV_flttointeger 3.5 i F2Ifloor) 1) "3.5 floors"))
+    (try (check-eq-int (deref i) 3 "floor 3.5"))
+    (try (check (= (luaV_flttointeger -3.5 i F2Iceil) 1) "-3.5 ceils"))
+    (try (check-eq-int (deref i) -3 "ceil -3.5"))
+    (try (check (= (luaV_flttointeger 9223372036854775808.0 i F2Ifloor) 0) "2^63 doesn't fit"))
+    (try (check (= (luaV_flttointeger -9223372036854775808.0 i F2Ieq) 1) "-2^63 fits"))
+    (try (check-eq-int (deref i) MININT "-2^63"))
+    (try (check (= (luaV_flttointeger (/ 0.0 0.0) i F2Ifloor) 0) "nan doesn't fit"))))
+
+(defn- fval (v:(ptr TValue) x:lua_Number):(ptr TValue)
+  (setfltvalue v x)
+  (return v))
+(defn- ival (v:(ptr TValue) x:lua_Integer):(ptr TValue)
+  (setivalue v x)
+  (return v))
+
+; Integers past 2^53 compare exactly with floats, not through a rounded cast.
+(deftest mixed-comparisons-are-exact
+  (let (a:(ptr TValue) (alloca TValue)
+        b:(ptr TValue) (alloca TValue))
+    (try (check (= (luaV_lessthan null (ival a MAXINT) (fval b 9223372036854775808.0)) 1)
+                "maxinteger < 2^63"))
+    (try (check (= (luaV_lessthan null (fval a 9223372036854775808.0) (ival b MAXINT)) 0)
+                "not 2^63 < maxinteger"))
+    (try (check (= (luaV_lessequal null (ival a MININT) (fval b -9223372036854775808.0)) 1)
+                "mininteger <= -2^63"))
+    (try (check (= (luaV_lessthan null (ival a MININT) (fval b -9223372036854775808.0)) 0)
+                "not mininteger < -2^63"))
+    (try (check (= (luaV_lessthan null (ival a 9007199254740993) (fval b 9007199254740992.0)) 0)
+                "not 2^53+1 < 2^53"))
+    (try (check (= (luaV_lessthan null (ival a 1) (fval b (/ 0.0 0.0))) 0) "not 1 < nan"))
+    (try (check (= (luaV_lessequal null (fval a (/ 0.0 0.0)) (ival b 1)) 0) "not nan <= 1"))
+    (try (check (= (luaV_equalobj null (ival a 3) (fval b 3.0)) 1) "3 == 3.0"))
+    (try (check (= (luaV_equalobj null (ival a 9007199254740993) (fval b 9007199254740992.0)) 0)
+                "2^53+1 ~= 2^53"))))
+
+; ---- parsing and formatting numbers ----
+
+(defn- parsed (s:CStr v:(ptr TValue)):i64
+  (return (as i64 (luaO_str2num s v))))
+
+(deftest str2num
+  (let (v:(ptr TValue) (alloca TValue))
+    (try (check-eq-int (parsed "0x10" v) 5 "0x10: size"))
+    (try (check (and (ttisinteger v) (= (ivalue v) 16)) "0x10 is integer 16"))
+    (try (check-eq-int (parsed " 1e2 " v) 6 "' 1e2 ': size"))
+    (try (check (and (ttisfloat v) (= (fltvalue v) 100.0)) "1e2 is float 100"))
+    (try (check-eq-int (parsed "zz" v) 0 "zz is no numeral"))
+    (try (check-eq-int (parsed "1e" v) 0 "1e is no numeral"))
+    (try (check-eq-int (parsed "" v) 0 "the empty string"))
+    (try (check-eq-int (parsed "9223372036854775807" v) 20 "maxinteger: size"))
+    (try (check (and (ttisinteger v) (= (ivalue v) MAXINT)) "maxinteger is an integer"))
+    (try (check-eq-int (parsed "9223372036854775808" v) 20 "2^63: size"))
+    (try (check (and (ttisfloat v) (= (fltvalue v) 9223372036854775808.0)) "2^63 is a float"))
+    (try (check-eq-int (parsed "0xffffffffffffffffff" v) 21 "a long hex: size"))
+    (try (check (and (ttisinteger v) (= (ivalue v) -1)) "hex integers wrap"))
+    (try (check-eq-int (parsed "0x1p4" v) 6 "0x1p4: size"))
+    (try (check (and (ttisfloat v) (= (fltvalue v) 16.0)) "0x1p4 is 16.0"))
+    (try (check-eq-int (parsed "  -0x.8  " v) 10 "-0x.8: size"))
+    (try (check (and (ttisfloat v) (= (fltvalue v) -0.5)) "-0x.8 is -0.5"))))
+
+(defn- formatted (v:(ptr TValue)):String
+  (let (buff:(ptr i8) (alloca i8 LUA_N2SBUFFSZ)
+        n:ui32 (luaO_tostringbuff v buff))
+    (set! (aref buff n) 0)
+    (return (str (sv buff)))))
+
+(defmacro check-format (setter v x want)
+  (let (s (gensym))
+    `(let ((~s String) (formatted (~setter ~v ~x)))
+       (try (check-eq (string-as-view (ref ~s)) ~want))
+       (drop (ref ~s)))))
+
+(deftest tostring-formats
+  (let (v:(ptr TValue) (alloca TValue))
+    (check-format ival v -7 "-7")
+    (check-format ival v MININT "-9223372036854775808")
+    (check-format fval v 0.1 "0.1")
+    (check-format fval v 3.0 "3.0")
+    (check-format fval v (* -1.0 0.0) "-0.0")
+    (check-format fval v 1e100 "1e+100")
+    (check-format fval v 9223372036854775808.0 "9.2233720368547758e+18")
+    (check-format fval v +inf.0 "inf")
+    (check-format fval v -inf.0 "-inf")))
+
+; ---- generated tables, against stock's bytes ----
+
+; luaP_opmodes and luai_ctype_ as stock lua 5.5.1 holds them (check-tables.sh
+; compares the executables; these pin the values themselves).
+(defvar- stock-opmodes:(array ui8 85)
+  (array ui8 0x08 0x0b 0x0b 0x0a 0x0a 0x08 0x08 0x08 0x08 0x08 0x00 0x08 0x08 0x08 0x08 0x00
+         0x00 0x00 0x00 0x09 0x08 0x08 0x08 0x08 0x08 0x08 0x08 0x08 0x08 0x08 0x08 0x08
+         0x08 0x08 0x08 0x08 0x08 0x08 0x08 0x08 0x08 0x08 0x08 0x08 0x08 0x08 0x80 0x80
+         0x80 0x08 0x08 0x08 0x08 0x08 0x00 0x00 0x05 0x10 0x10 0x10 0x10 0x10 0x10 0x10
+         0x10 0x10 0x10 0x18 0x68 0x68 0x20 0x00 0x00 0x0a 0x0a 0x02 0x00 0x0a 0x21 0x0a
+         0x48 0x08 0x02 0x00 0x04))
+(defvar- stock-ctype:(array ui8 129)  ; the rest, 128 to 255, is 0
+  (array ui8 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x08 0x08 0x08 0x08 0x08 0x00
+         0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00
+         0x00 0x0c 0x04 0x04 0x04 0x04 0x04 0x04 0x04 0x04 0x04 0x04 0x04 0x04 0x04 0x04
+         0x04 0x16 0x16 0x16 0x16 0x16 0x16 0x16 0x16 0x16 0x16 0x04 0x04 0x04 0x04 0x04
+         0x04 0x04 0x15 0x15 0x15 0x15 0x15 0x15 0x05 0x05 0x05 0x05 0x05 0x05 0x05 0x05
+         0x05 0x05 0x05 0x05 0x05 0x05 0x05 0x05 0x05 0x05 0x05 0x05 0x04 0x04 0x04 0x04
+         0x05 0x04 0x15 0x15 0x15 0x15 0x15 0x15 0x05 0x05 0x05 0x05 0x05 0x05 0x05 0x05
+         0x05 0x05 0x05 0x05 0x05 0x05 0x05 0x05 0x05 0x05 0x05 0x05 0x04 0x04 0x04 0x04
+         0x00))
+
+(deftest opmodes-are-stocks
+  (for (i:i32 0) (< i 85) (set! i (+ i 1))
+    (try (check-eq-int (as i64 (aref luaP_opmodes i)) (as i64 (aref stock-opmodes i)) "an opmode"))))
+
+(deftest ctype-is-stocks
+  (for (i:i32 0) (< i 257) (set! i (+ i 1))
+    (let (want:i64 (if (< i 129) (as i64 (aref stock-ctype i)) 0))
+      (try (check-eq-int (as i64 (aref luai_ctype_ i)) want "a ctype entry")))))
+
+; ---- token names ----
+
+(defvar- stock-tokens:(array CStr 38)
+  (array CStr "and" "break" "do" "else" "elseif" "end" "false" "for" "function" "global"
+         "goto" "if" "in" "local" "nil" "not" "or" "repeat" "return" "then" "true" "until"
+         "while" "//" ".." "..." "==" ">=" "<=" "~=" "<<" ">>" "::" "<eof>" "<number>"
+         "<integer>" "<name>" "<string>"))
+
+(deftest token-names
+  (let (L:(ptr lua_State) (luaL_newstate)
+        ls:(ptr LexState) (alloca LexState))
+    (set! (ls 'L) L)
+    (for (i:i32 0) (< i 38) (set! i (+ i 1))
+      (let (t:i32 (+ FIRST_RESERVED i)
+            got:CStr (luaX_token2str ls t)
+            want:String (if (< t TK_EOS) (str "'" (sv (aref stock-tokens i)) "'")
+                            (str (sv (aref stock-tokens i)))))
+        (try (check-eq (sv got) (string-as-view (ref want))))
+        (drop (ref want))))
+    (try (check-eq (sv (luaX_token2str ls 43)) "'+'"))
+    (try (check-eq (sv (luaX_token2str ls 7)) "'<\\7>'"))
+    (lua_close L)))
+
+; ---- the binding's macros ----
+
+(deftest binding-macros-on-the-stack
+  (let (L:(ptr lua_State) (luaL_newstate))
+    (try (check-eq-int (lua_upvalueindex 1) (- LUA_REGISTRYINDEX 1) "upvalueindex"))
+    (try (check (= (as ptr (lua_getextraspace L))
+                   (as ptr (unsafe/ptr+ (unsafe/cast (ptr i8) L) -8))) "extraspace"))
+    (for (i:i64 1) (<= i 4) (set! i (+ i 1))
+      (lua_pushinteger L i))  ; 1 2 3 4
+    (lua_insert L 1)  ; 4 1 2 3
+    (try (check-eq-int (lua_tointeger L 1) 4 "insert"))
+    (lua_remove L 2)  ; 4 2 3
+    (try (check-eq-int (lua_gettop L) 3 "remove: top"))
+    (try (check-eq-int (lua_tointeger L 2) 2 "remove"))
+    (lua_pushinteger L 9)
+    (lua_replace L 1)  ; 9 2 3
+    (try (check-eq-int (lua_tointeger L 1) 9 "replace"))
+    (lua_pop L 2)
+    (try (check-eq-int (lua_gettop L) 1 "pop"))
+    (try (check (lua_isnoneornil L 5) "none is noneornil"))
+    (lua_pushnil L)
+    (try (check (lua_isnoneornil L -1) "nil is noneornil"))
+    (try (check (not (lua_isnoneornil L 1)) "an integer isn't"))
+    (lua_newtable L)
+    (try (check (lua_istable L -1) "newtable"))
+    (try (check-eq-int (luaL_opt L luaL_checkinteger 5 77) 77 "luaL_opt default"))
+    (try (check-eq-int (luaL_intop + MAXINT 1) MININT "luaL_intop wraps"))
+    (lua_pushliteral L "lit")
+    (try (check-eq (sv (lua_tostring L -1)) "lit"))
+    (lua_close L)))
+
+(deftest binding-addchar-grows-the-buffer
+  (let (L:(ptr lua_State) (luaL_newstate)
+        B:(ptr luaL_Buffer) (alloca luaL_Buffer)
+        n:usize 0)
+    (luaL_buffinit L B)
+    (for (i:i32 0) (< i 5000) (set! i (+ i 1))
+      (luaL_addchar B (unsafe/cast i8 (+ 97 (% i 26)))))
+    (luaL_buffsub B 1000)
+    (try (check-eq-int (as i64 (luaL_bufflen B)) 4000 "bufflen"))
+    (luaL_pushresult B)
+    (let (s:CStr (lua_tolstring L -1 (ref n)))
+      (try (check-eq-int (as i64 n) 4000 "pushed length"))
+      (try (check-eq-int (as i64 (aref (as (ptr i8) (as ptr s)) 3999)) (+ 97 (% 3999 26)) "last byte")))
+    (lua_close L)))
+
+(defn main (argc:i32 argv:ptr):i32
+  (return (as i32 (test-main argc argv))))

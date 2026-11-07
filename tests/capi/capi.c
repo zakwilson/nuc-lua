@@ -1021,6 +1021,36 @@ static void t_states(void) {
   lua_close(L);
 }
 
+/* ---- two Nucleus libraries in one state, unloaded at lua_close ---- */
+
+/* Whether a file whose path ends in 'name' is mapped into this process. */
+static int mapped(const char *name) {
+  char line[1024];
+  int found = 0;
+  FILE *f = fopen("/proc/self/maps", "r");
+  if (f == NULL) return -1;
+  while (fgets(line, sizeof line, f) != NULL) {
+    char *nl = strchr(line, '\n');
+    size_t n = strlen(name);
+    if (nl != NULL) *nl = '\0';
+    if (strlen(line) >= n && strcmp(line + strlen(line) - n, name) == 0) found = 1;
+  }
+  fclose(f);
+  return found;
+}
+
+static void t_unload(void) {
+  lua_State *L = luaL_newstate();
+  luaL_openlibs(L);
+  run(L, "package.cpath = 'so/n/?.so'\n"
+         "local d, m = require 'nucdemo', require 'mayi'\n"
+         "capi_keep = d.stats(1, 2)  -- finalized at lua_close, before the unload\n"
+         "print('unload: loaded', tostring(capi_keep), type(m.mayi))");
+  say("mapped before %d %d\n", mapped("/nucdemo.so"), mapped("/mayi.so"));
+  lua_close(L);
+  say("mapped after %d %d\n", mapped("/nucdemo.so"), mapped("/mayi.so"));
+}
+
 static int f_run(lua_State *L) {
   say("ident %d\n", strncmp(lua_ident, "$LuaVersion: ", 13) == 0);
   t_stack(L);
@@ -1041,6 +1071,7 @@ static int f_run(lua_State *L) {
   t_coroutines(L);
   t_gc(L);
   t_states();
+  t_unload();
   say("done\n");
   return 0;
 }

@@ -38,7 +38,7 @@ object model, the compiler, execution state, the collector and the VM (§10).
 | 5 Execution state | done: `lstate`, `ldebug`, `ldo`, `lapi` |
 | 6 The collector | done: `lgc`; the suite passes collecting as often as it can, in both modes |
 | 7 The VM | done: `lvm`, threaded dispatch; no stock object linked; benchmarked; user test request below |
-| 8 Nucleus libraries | in progress: `tests/capi/nuc` (capi.c in Nucleus) passes the matrix in both hosts |
+| 8 Nucleus libraries | done: `libs/nucdemo`, `tests/capi/nuc`, `docs/writing-libraries.md`; the full matrix, two libraries at once, the unload path; user test request below |
 | 9–11 | not started |
 
 ### Nucleus
@@ -58,6 +58,7 @@ Compiler: `.nucleus-work` on `lua-bugfixes` (see CLAUDE.md).
 - `a64ac73` a later declarator keeps the base type (ISSUE-040); the fixed point
   holds from the third round
 - `275b612`, `d2c75f7` a place under a macro call is a place, field or element (ISSUE-043)
+- `b8e711e` a shared library's link takes `:link-args` (ISSUE-048)
 
 ### Still stock
 
@@ -110,10 +111,18 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
 - M7: with `lvm` in Nucleus, every gate passes (suite, both stressed runs, matrix,
   bytecode, tables, probes) and `check-nm.sh` finds no stock object in either program.
   The benchmark below runs at 0.92 to 1.14 times stock.
-- M8 so far: `tests/capi/nuc`, capi.c in Nucleus on the binding alone, prints the C
-  module's 127-line transcript in stock `lua` and the port. It found one line of
-  capi.c that depended on gcc's argument order (three `lua_stringtonumber` pushes as
-  arguments of one `printf`), now sequenced.
+- M8: `tests/capi/nuc`, capi.c in Nucleus on the binding alone, prints the C
+  module's transcript in stock `lua` and the port. It found one line of capi.c that
+  depended on gcc's argument order (three `lua_stringtonumber` pushes as arguments of
+  one `printf`), now sequenced. `libs/nucdemo` (a `Vector`-backed userdata with `__gc`
+  and `__close`, a C closure, a `HashMap` anchored in a userdata, `luaL_Buffer`,
+  registry references and callbacks, `Result`s raised as Lua errors, Lua errors
+  caught as values, yields through `lua_callk` and `lua_pcallk`) prints
+  `tests/capi/nucdemo.expected` in both hosts with `mayi` loaded beside it. Both
+  `capi` modules load `nucdemo` and `mayi` into a fresh state, run a pending `__gc`
+  at `lua_close`, and see both unmapped afterwards. `probes/issue-047.nuc` confirms
+  that a `longjmp` skips `defer` and `with` cleanups; the rule that follows is in
+  `docs/writing-libraries.md`.
 - The spike: a Nucleus `luaopen_` module whose function raises with `luaL_error`
   (a real C variadic call) is caught by `pcall` in stock `lua`.
 
@@ -122,9 +131,15 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
 - `scripts/check-capi.sh` (`--stock` for the stock column only): header diff,
   `check-layout.sh` (144 sizes, offsets and constants against the C compiler), the
   157-symbol table, `capi.c`'s coverage of all 209 functions and macros, the matrix.
-- `scripts/build-libs.sh` builds `libs/*` into `build/so/n/`; `setup.sh` builds the C
-  modules into `build/so/c/`.
+- `scripts/build-libs.sh` builds `libs/*` and `tests/capi/nuc` into `build/so/n/`;
+  `setup.sh` builds the C modules into `build/so/c/`. The matrix's rows: `mayi` (C,
+  Nucleus), `capi` (C, Nucleus; equal to the C module on stock, and ending with the
+  unload check), and `nucdemo` against `tests/capi/nucdemo.expected`.
 - `scripts/check-probes.sh`.
+- `nucleus test` builds and runs `tests/unit/main.nuc` (PROMPT §7.6): integer and float
+  arithmetic at the edges, mixed integer/float comparisons past 2^53, numerals parsed
+  and formatted, `luaP_opmodes` and `luai_ctype_` against stock's bytes, the token
+  names, and the binding's macros on a live state.
 - `scripts/check-bytecode.sh`: the 78 dumps of the suite's files and of
   `tests/bytecode/gen-stress.lua`'s sources (LOADKX, SETLIST's extra argument, absolute
   line info, folding corners, every variable kind), stripped and not, must be
@@ -146,9 +161,9 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
 
 ## Next
 
-M8, the Nucleus libraries complete: `libs/nucdemo`, the Nucleus side of
-`tests/capi/`, and `docs/writing-libraries.md`; the full matrix, with two Nucleus
-libraries loaded at once into each host, and the unload path (PROMPT §10, §6.5). `code.nuc` holds `lcode.h`'s macros and the `expdesc`
+M9, the idiom pass (PROMPT §10): rename internals to Nucleus style now that no C
+shares the layouts, revisit the early modules, redo what the migration held back, and
+rerun the benchmarks. Then M10 (the `T` harness) and M11 (the final report). `code.nuc` holds `lcode.h`'s macros and the `expdesc`
 union accessors (`u`, `set-u`, `ind`, `set-ind`, `uvar`, `set-uvar`) that `parser.nuc`
 uses; `parser.nuc`'s `Block` is C's `BlockCnt` (ISSUE-037). `opcodes.nuc` generates `luaP_opmodes` from one
 opcode row table (`with-opcodes`); `luac`'s `opnames` come from the same rows.
@@ -205,6 +220,29 @@ Known problems:
 - `check-probes.sh` reports 16 probes that reproduce: those are open findings, not
   failures.
 - `bench.sh`'s `calls` and `patterns` run about 1.13 times stock, not yet looked into.
+
+## User test request (M8)
+
+The Nucleus libraries are complete. On top of the M7 build above:
+
+```sh
+scripts/build-libs.sh      # libs/mayi, libs/nucdemo, tests/capi/nuc into build/so/n/
+scripts/check-capi.sh      # the whole matrix, in both hosts
+```
+
+Try:
+
+- `cd build && ../reference/build/src/lua ../tests/capi/nucdemo.lua so/n`, then the
+  same with `./lua`: both print `tests/capi/nucdemo.expected`.
+- `docs/writing-libraries.md`'s skeleton as a library of your own, loaded into both.
+- `nm -D build/so/n/nucdemo.so`: only `luaopen_nucdemo`.
+
+Known problems:
+
+- Build Nucleus at `lua-bugfixes` `b8e711e` (patches 0001-0011), not the M7 request's
+  `d2c75f7`: `libs/nucdemo` needs the fix for `:link-args` (ISSUE-048).
+- A `defer` or `with` in a Lua C function is silently skipped by a Lua error
+  (ISSUE-047); the guide's rule avoids it, the compiler doesn't check it.
 
 ## Benchmarks
 

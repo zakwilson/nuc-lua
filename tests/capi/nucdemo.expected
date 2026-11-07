@@ -1,0 +1,36 @@
+loaded	table	function
+stats	5	3.0	3.0	1.4142	Stats(n=5, mean=3.0)
+empty	false	no samples
+bad arg	false	bad argument #2 to '?' (number expected, got string)
+in scope	Stats(n=2, mean=1.5)
+after close	Stats(closed)	false	stats is closed
+not stats	false	bad argument #1 to '?' (nucdemo.Stats expected, got table)
+counter	10	15	20	1
+words	the=3 cat=2 and=1 hat=1 THE=1 end=1
+join	1, two, 3.5, true, obj
+join empty	[]	ab
+join long	8999
+emit	2	1	h2 failed on 1	h1:12,h3:3
+off	true	false
+emit	2	0	h1:12,h3:3,h1:34,h3:7
+emit none	0	0
+parse	42	-9223372036854775808	7
+parse bad	false	not an integer
+parse big	false	integer overflow
+parse empty	false	not an integer
+each yield	1a
+each resumed	1	x
+each yield	2b
+each resumed	2	y
+each yield	3c
+each resumed	3	z
+each done	3
+each plain	2
+each error	false	stop
+try	paused A
+try	true	A	B
+try error	false	table	7
+try plain	true	1	2	3
+try nested	true	false	x
+resume	true	false	nucdemo.lua:94: not an integer
+done

@@ -1,0 +1,86 @@
+From b8e711e067dd37d2538d6d34033ba527f6e21131 Mon Sep 17 00:00:00 2001
+From: Zak Wilson <zak.wilson@gmail.com>
+Date: Sat, 7 Nov 2026 20:44:29 +0000
+Subject: [PATCH] A shared library's link takes :link-args
+
+The :shared edge built its clang -shared line without the project's
+:link-args, so a library couldn't pass a version script to limit its
+exports. Found by the nuc-lua port (its ISSUE-048).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CsC8i2S7yJAHSpzRaddMj3
+---
+ design/progress.md    |  8 ++++++++
+ docs/build.md         |  2 +-
+ src/build-tool.nuc    |  1 +
+ tests/suite-build.nuc | 13 +++++++++++++
+ 4 files changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/design/progress.md b/design/progress.md
+index 83d7937..14fe14f 100644
+--- a/design/progress.md
++++ b/design/progress.md
+@@ -5798,3 +5798,11 @@ The same held one step on, for an element of an array field under a macro call
+ `emit-untyped-receiver` now expands a macro at the receiver's head and takes the
+ address of any field, `aref` or `deref` form, and `set!`'s last-resort receiver goes
+ through it too.
++
++## Lua-port fixes: a shared library's link takes `:link-args` (lua-bugfixes)
++
++Found by the nuc-lua port (its ISSUE-048): the `:shared true` edge built its
++`clang -shared` line without the project's `:link-args`, silently, so a library had
++no way to pass a version script, and every standard-library instance it used stayed
++exported (its ISSUE-049). The edge now appends them after `:libs`.
++`bt7-shared-link-args` covers it (nuctests 1744 passed, bootstrap holds).
+diff --git a/docs/build.md b/docs/build.md
+index 323cde6..513fec7 100644
+--- a/docs/build.md
++++ b/docs/build.md
+@@ -150,7 +150,7 @@ One EDN map. Every key is optional.
+ | `:default-target` | symbol or string | The target a build without `--target=` builds; the host by default |
+ | `:opt` | 0–3 | The optimization level, as `-O` |
+ | `:cflags` | vector of strings | Passed to clang, for C header imports and for `:c-sources` |
+-| `:link-args` | vector of strings | Passed to the link |
++| `:link-args` | vector of strings | Passed to the link, a `:shared` library's too (for a version script, say) |
+ | `:libs` | vector or set of strings | Libraries to link, as `--link-lib=` |
+ | `:c-sources` | vector of strings | C files compiled to `build/obj/` and linked in |
+ | `:pkg-config` | map | Requirement sets for C headers, below |
+diff --git a/src/build-tool.nuc b/src/build-tool.nuc
+index 824b0fe..68f52e7 100644
+--- a/src/build-tool.nuc
++++ b/src/build-tool.nuc
+@@ -1542,6 +1542,7 @@
+             (drop &pf)
+             (drop &names)))
+         (dotimes (k (count (ref c 'libs))) (conj av (fstr "-l" (invoke (ref c 'libs) k))))
++        (dotimes (k (count (ref c 'link-args))) (conj av (invoke (ref c 'link-args) k)))
+         (conj av "-o") (conj av (fstr so ".tmp"))
+         (dotimes (k (count &objs)) (conj (ref e 'after) (invoke &objs k)))
+         (graph-add g e)))
+diff --git a/tests/suite-build.nuc b/tests/suite-build.nuc
+index 75091ac..f27113d 100644
+--- a/tests/suite-build.nuc
++++ b/tests/suite-build.nuc
+@@ -1170,6 +1170,19 @@
+     (drop &p))
+   (return (ok)))
+ 
++; :link-args reach the shared library's link too, so a version script can
++; limit what it exports.
++(deftest bt7-shared-link-args
++  (let (p:String (try (bt7-library "shlink" "{:kind :library :name \"fz\" :version \"1.0\" :shared true :link-args [\"-Wl,--version-script=fz.map\"]}\n"))
++        pv:StrView (string-as-view &p)
++        tool:String (bt-abs "build/nucleus")
++        tv:StrView (string-as-view &tool))
++    (try (write-into pv "fz.map" "{ global: fz.core__fz-answer; local: *; };\n"))
++    (try (bt4-sh pv (bt-sv (str "XDG_CACHE_HOME=$PWD/cache " tv " build 2>err && nm -D --defined-only build/lib/libfz.so > syms && grep -q 'T fz.core__fz-answer' syms && ! grep -q 'fz-twice' syms"))))
++    (drop &tool)
++    (drop &p))
++  (return (ok)))
++
+ ; ---------------------------------------------------------------------------
+ ; BT-8: dependencies and lookup
+ ; ---------------------------------------------------------------------------
+-- 
+2.47.3
+

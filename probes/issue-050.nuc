@@ -1,0 +1,12 @@
+; ISSUE-050: in a file with no (ns …), a macro used only in that file can't name
+; the file's own private helper.
+; expect: prints `7`; actual: `macro 'twice' names 'helper', which is private to its file`
+; run: $NUCLEUSC $P -o $W/p && $W/p
+; fixed-when-output: 7
+(import-use "stdio.h")
+(defn- helper (x:i32):i32
+  (return (+ x 1)))
+(defmacro twice (x) `(helper (helper ~x)))
+(defn main ():i32
+  (printf "%d\n" (twice 5))
+  (return 0))

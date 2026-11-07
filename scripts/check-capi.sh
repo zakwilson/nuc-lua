@@ -67,6 +67,9 @@ for host in $hosts; do
     [ -f "$ROOT/build/so/$kind/capi.so" ] || { bad "build/so/$kind/capi.so is missing (setup.sh, build-libs.sh)"; continue; }
     sleep 0.2 | cell "capi-$kind" "$host" "$ROOT/tests/capi/driver.lua" "so/$kind"
   done
+  # libs/nucdemo, with libs/mayi in the same process; no C twin, so a recorded transcript
+  [ -f "$ROOT/build/so/n/nucdemo.so" ] || { bad "build/so/n/nucdemo.so is missing (build-libs.sh)"; continue; }
+  : | cell "nucdemo" "$host" "$ROOT/tests/capi/nucdemo.lua" "so/n"
 done
 expect_mayi_idle=$'table\tfunction\nfalse\tfalse\tfalse\tfalse'
 expect_mayi_ready=$'table\tfunction\ntrue'
@@ -90,6 +93,13 @@ for host in $hosts; do
     elif diff "$W/capi-c.stock.out" "$f" > "$W/capi-$kind.$host.diff"; then ok "capi ($kind) on $host"
     else bad "capi ($kind) on $host: see $W/capi-$kind.$host.diff"; fi
   done
+done
+
+for host in $hosts; do
+  f=$W/nucdemo.$host.out
+  [ -f "$f" ] || continue
+  if diff "$ROOT/tests/capi/nucdemo.expected" "$f" > "$W/nucdemo.$host.diff"; then ok "nucdemo on $host"
+  else bad "nucdemo on $host: see $W/nucdemo.$host.diff"; fi
 done
 
 if [ $fails -eq 0 ]; then echo "check-capi: pass"; else echo "check-capi: $fails failed"; exit 1; fi

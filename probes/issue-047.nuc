@@ -1,0 +1,27 @@
+; ISSUE-047: a longjmp, as lua_error does, over a Nucleus frame skips its `defer`
+; and `with` cleanups, silently: no diagnostic, and the malloc'd block leaks.
+; expect: prints `cleanups 2` (a defer and a with ran); actual: `cleanups 0`
+; run: $NUCLEUSC $P -o $W/p && $W/p
+; fixed-when-output: cleanups 2
+(import-use "stdio.h")
+(import-use "stdlib.h")
+(import-use "setjmp.h")
+(defvar env:jmp_buf)
+(defvar cleanups:i32 0)
+(defprotocol Drop
+  (drop (self:&Self):void))
+(defstruct Res n:i32)
+(defn drop (r:&Res):void
+  (set! cleanups (+ cleanups 1)))
+(extend Res Drop)
+(defn raise ():void
+  (_longjmp env 1))  ; lua_error's luaD_throw
+(defn middle ():void
+  (with (r:Res (Res 0))
+    (defer (set! cleanups (+ cleanups 1)))
+    (raise)))
+(defn main ():i32
+  (when (= (_setjmp env) 0)
+    (middle))
+  (printf "cleanups %d\n" cleanups)
+  (return 0))
