@@ -28,7 +28,7 @@ object model, the compiler, execution state, the collector and the VM (§10).
 | 0 Setup | done: env and setup scripts, reference and suite, spike, probes, hybrid build |
 | 1 Binding and first library | done: `capi/` (both layers), layout gate, `libs/mayi`, `tests/capi/capi.c`, stock column |
 | 2 Host and libraries | done: `lua.c`, `lauxlib.c`, `linit` and every standard library in Nucleus |
-| 3 Object model | in progress: `lctype`, `lzio`, `lmem`, `lobject`, `lstring` ported; `lfunc`, `ltm`, `ltable` left |
+| 3 Object model | done: `lctype`, `lzio`, `lmem`, `lobject`, `lstring`, `lfunc`, `ltm`, `ltable` |
 | 4–11 | not started |
 
 ### Nucleus
@@ -44,10 +44,13 @@ Compiler: `.nucleus-work` on `lua-bugfixes` (see CLAUDE.md).
 - `0081d2a` an array field of a nested place decays into the place (ISSUE-023)
 - `f282cfe` an attribute between a function's return type and its name (ISSUE-026);
   `C-MAX-PARAMS` is 64
+- `1ae171b` a field of a union member is a place (ISSUE-032); no 256-macro cap (ISSUE-033)
 
 ### Still stock
 
-The core: every module in `build.edn`'s `:c-sources`. Ported so far: `lua.c`
+The core except the object model: every module in `build.edn`'s `:c-sources`.
+The object model is in `src/lua/` (`ctype`, `zio`, `mem`, `object`, `string`, `func`,
+`tm`, `table`). Ported before it: `lua.c`
 (`src/main.nuc`, namespace `lua.host`), `lauxlib.c` (`src/lua/aux.nuc`, `lua.aux`),
 `linit.c` (`src/lua/init.nuc`) and the libraries in `src/lua/`: `baselib`, `corolib`,
 `dblib`, `iolib`, `loadlib`, `mathlib`, `oslib`, `strlib`, `tablib`, `utf8lib`. A library's `luaL_Reg` table is built on the stack by
@@ -67,6 +70,10 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
 - The port, with Nucleus `lua.c`, `lauxlib.c` and every library over the stock core
   (M2's gate), passes the suite (`scripts/check-suite.sh`) and the whole `check-capi.sh` matrix, both modules
   in both hosts. `lua.c`'s options checked by hand: `-v -e -i -E -`, `LUA_INIT`, usage.
+- M3's gate: the suite passed after each object-model module, as did `check-capi.sh`
+  and the probes. Scripts that stress strings, metamethods, to-be-closed variables,
+  varargs and tables printed the same as stock. A table-heavy loop ran in 0.41 s against
+  stock's 0.38 s.
 - The spike: a Nucleus `luaopen_` module whose function raises with `luaL_error`
   (a real C variadic call) is caught by `pcall` in stock `lua`.
 
@@ -82,12 +89,17 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
 
 ## Next
 
-M3, the object model: `lfunc`, `ltm`, `ltable`, with the suite after each.
+M4, the compiler: `lopcodes`, `llex`, `lcode`, `lparser`, `ldump`, `lundump`, then
+`luac.c`, with the suite and a new `scripts/check-bytecode.sh` (§7.4) after each.
+
 The core modules import the internal headers (`-Ireference/build/src` in `:cflags`) for
-their layouts; `src/lua/core.nuc` holds the `lobject.h`/`lstate.h` macros, with the
-variant tags written out (ISSUE-029); `src/lua/ctype.nuc` holds `lctype.h`'s. These share layouts with the stock core, so each
-struct is declared from the C headers' layout (`check-layout.sh` covers the public ones
-only; the internal ones need their own `offsetof` check first).
+their layouts. `src/lua/core.nuc` holds the internal headers' macros (`lobject.h`,
+`lstate.h`, `lgc.h`, `ltm.h`, `ltable.h`, `lfunc.h`, `ldo.h`), with constants built
+from function-like macros written out (ISSUE-029); `src/lua/ctype.nuc` holds `lctype.h`'s.
+A namespaced module that names `Node` imports `lobject.h` a second time with prefix `c`
+and writes `c/Node` (ISSUE-034). Every ported module is checked with `nm` for mangled
+names (ISSUE-022), since a definition whose type misses the header's prototype links as an
+overload and the C caller then binds to nothing.
 
 ## Open questions
 

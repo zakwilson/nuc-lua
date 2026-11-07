@@ -1,0 +1,11 @@
+; ISSUE-032: a store to a field of a union member was refused as a temporary.
+; expect: prints `5`; actual: `the receiver is a temporary struct value`
+; run: $NUCLEUSC $P -o $W/p && $W/p
+; fixed-when-output: 5
+(import-use "stdio.h")
+(defstruct Up tag:i32 (u (union (open (struct a:i32 next:i64)) value:f64)))
+(defn main ():i32
+  (let (x:&Up (alloca Up))
+    (set! (((x 'u) 'open) 'a) 5)
+    (printf "%d\n" (((x 'u) 'open) 'a))
+    (return 0)))

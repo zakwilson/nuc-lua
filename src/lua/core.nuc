@@ -44,7 +44,7 @@
 (defmacro ttype (o) `(novariant (rawtt ~o)))
 (defmacro checktag (o t) `(= (rawtt ~o) ~t))
 (defmacro checktype (o t) `(= (ttype ~o) ~t))
-(defmacro ctb (t) `(bit-or ~t BIT_ISCOLLECTABLE))  ; the tag of a collectable
+(defmacro ctb (t) `(cast_uchar (bit-or ~t BIT_ISCOLLECTABLE)))  ; the tag of a collectable
 (defmacro iscollectable (o) `(!= (bit-and (rawtt ~o) BIT_ISCOLLECTABLE) 0))
 
 ; A stack slot's value: StackValue is a union over a TValue.
@@ -154,6 +154,110 @@
 ; 's' modulo a power of two.
 (defmacro lmod (s size) `(bit-and (cast_uint ~s) (cast_uint (- ~size 1))))
 
+; ---- tables, userdata and closures ----
+(defmacro ttistable (o) `(checktag ~o (ctb LUA_VTABLE)))
+(defmacro hvalue (o) `(gco2t (gcvalue ~o)))
+(defmacro sethvalue (L obj x)
+  (let (a (gensym) t (gensym))
+    `(let ((~a (ptr TValue)) ~obj
+           (~t (ptr Table)) ~x)
+       (set! ((~a 'value_) 'gc) (obj2gco ~t))
+       (set! (~a 'tt_) (ctb LUA_VTABLE)))))
+(defmacro sethvalue2s (L o h) `(sethvalue ~L (s2v ~o) ~h))
+(defmacro ttisfulluserdata (o) `(checktag ~o (ctb LUA_VUSERDATA)))
+(defmacro uvalue (o) `(gco2u (gcvalue ~o)))
+(defmacro ttisfunction (o) `(checktype ~o LUA_TFUNCTION))
+(defmacro ttisLclosure (o) `(checktag ~o (ctb LUA_VLCL)))
+(defmacro ttislcf (o) `(checktag ~o LUA_VLCF))
+(defmacro ttisCclosure (o) `(checktag ~o (ctb LUA_VCCL)))
+(defmacro clLvalue (o) `(gco2lcl (gcvalue ~o)))
+(defmacro clCvalue (o) `(gco2ccl (gcvalue ~o)))
+(defmacro setnilvalue2s (o) `(setnilvalue (s2v ~o)))
+
+; ---- hash nodes (lobject.h) ----
+; The node type is spelled `c/Node` by its users (ISSUE-034), so no macro here names it.
+(defmacro keytt (n) `((~n 'u) 'key_tt))
+(defmacro keyval (n) `((~n 'u) 'key_val))
+(defmacro keyisnil (n) `(= (keytt ~n) LUA_TNIL))
+(defmacro keyisinteger (n) `(= (keytt ~n) LUA_VNUMINT))
+(defmacro keyival (n) `((keyval ~n) 'i))
+(defmacro keyisshrstr (n) `(= (keytt ~n) (ctb LUA_VSHRSTR)))
+(defmacro keystrval (n) `(gco2ts ((keyval ~n) 'gc)))
+(defmacro setnilkey (n) `(set! ((~n 'u) 'key_tt) LUA_TNIL))
+(defmacro keyiscollectable (n) `(!= (bit-and (keytt ~n) BIT_ISCOLLECTABLE) 0))
+(defmacro gckey (n) `((keyval ~n) 'gc))
+(defmacro gckeyN (n) `(if (keyiscollectable ~n) (gckey ~n) (as (ptr GCObject) null)))
+(defmacro setdeadkey (n) `(set! ((~n 'u) 'key_tt) LUA_TDEADKEY))
+(defmacro keyisdead (n) `(= (keytt ~n) LUA_TDEADKEY))
+(defmacro setnodekey (node obj)
+  (let (n (gensym) o (gensym))
+    `(let (~n ~node
+           (~o (ptr TValue)) ~obj)
+       (set! ((~n 'u) 'key_val) (~o 'value_))
+       (set! ((~n 'u) 'key_tt) (~o 'tt_)))))
+(defmacro getnodekey (L obj node)
+  (let (n (gensym) o (gensym))
+    `(let ((~o (ptr TValue)) ~obj
+           ~n ~node)
+       (set! (~o 'value_) ((~n 'u) 'key_val))
+       (set! (~o 'tt_) ((~n 'u) 'key_tt)))))
+(defmacro twoto (x) `(bit-shl (as ui32 1) (as ui32 ~x)))
+(defmacro sizenode (t) `(twoto (~t 'lsizenode)))
+(defmacro pvalue (o) `((val_ ~o) 'p))
+(defmacro fvalue (o) `((val_ ~o) 'f))
+(defmacro isextstr (o) `(and (ttislngstring ~o) (!= ((tsvalue ~o) 'shrlen) LSTRREG)))
+(defmacro luai_numisnan (a) `(!= ~a ~a))
+
+; ---- ltable.h ----
+(defmacro gnode (t i) `(p+ (~t 'node) ~i))
+(defmacro gval (n) `(ref (~n 'i_val)))
+(defmacro gnext (n) `((~n 'u) 'next))
+(defmacro set-gnext (n v) `(set! ((~n 'u) 'next) ~v))  ; set! won't expand gnext (ISSUE-020)
+(defconst maskflags 0x3F)     ; ~(~0u << (TM_EQ + 1)): a bit per fast-tested metamethod
+(defconst NOTBITDUMMY 0xBF)   ; cast_byte(~BITDUMMY)
+(defmacro invalidateTMcache (t) `(set! (~t 'flags) (bit-and (~t 'flags) (bit-xor maskflags 0xFF))))
+(defmacro isdummy (t) `(!= (bit-and (~t 'flags) BITDUMMY) 0))
+(defmacro setnodummy (t) `(set! (~t 'flags) (bit-and (~t 'flags) NOTBITDUMMY)))
+(defmacro setdummy (t) `(set! (~t 'flags) (bit-or (~t 'flags) BITDUMMY)))
+(defmacro allocsizenode (t) `(if (isdummy ~t) (as ui32 0) (sizenode ~t)))
+; The array part: values at negative indices from 'array', then an unsigned
+; (the length hint), then the tags.
+(defmacro getArrTag (t k) `(p+ (p+ (unsafe/cast (ptr ui8) (~t 'array)) 4) ~k))
+(defmacro getArrVal (t k) `(p+ (~t 'array) (- -1 (as i64 ~k))))
+(defmacro lenhint (t) `(unsafe/cast (ptr ui32) (~t 'array)))
+(defmacro arr2obj (h k val)
+  `(do (set! (~val 'tt_) (deref (getArrTag ~h ~k)))
+       (set! (~val 'value_) (deref (getArrVal ~h ~k)))))
+(defmacro obj2arr (h k val)
+  `(do (set! (deref (getArrTag ~h ~k)) (~val 'tt_))
+       (set! (deref (getArrVal ~h ~k)) (~val 'value_))))
+(defmacro farr2val (h k tag res)
+  `(do (set! (~res 'tt_) ~tag)
+       (set! (~res 'value_) (deref (getArrVal ~h ~k)))))
+(defmacro fval2arr (h k tag val)
+  `(do (set! (deref ~tag) (~val 'tt_))
+       (set! (deref (getArrVal ~h ~k)) (~val 'value_))))
+; 'tag' gets the tag of t[k], and 'res' its value unless it is empty.
+(defmacro luaH_fastgeti (t k res tag)
+  (let (h (gensym) u (gensym))
+    `(let ((~h (ptr Table)) ~t
+           (~u lua_Unsigned) (- (l_castS2U ~k) 1))
+       (if (< ~u (as lua_Unsigned (~h 'asize)))
+         (do (set! ~tag (deref (getArrTag ~h ~u)))
+             (when (not (tagisempty ~tag)) (farr2val ~h ~u ~tag ~res)))
+         (set! ~tag (luaH_getint ~h ~k ~res))))))
+; 'hres' gets HOK when t[k] was set, else where to finish the set.
+(defmacro luaH_fastseti (t k val hres)
+  (let (h (gensym) u (gensym) tg (gensym))
+    `(let ((~h (ptr Table)) ~t
+           (~u lua_Unsigned) (- (l_castS2U ~k) 1))
+       (if (< ~u (as lua_Unsigned (~h 'asize)))
+         (let ((~tg (ptr ui8)) (getArrTag ~h ~u))
+           (if (or (checknoTM (~h 'metatable) TM_NEWINDEX) (not (tagisempty (deref ~tg))))
+             (do (fval2arr ~h ~u ~tg ~val) (set! ~hres HOK))
+             (set! ~hres (bit-xor (unsafe/cast i32 ~u) -1))))
+         (set! ~hres (luaH_psetint ~h ~k ~val))))))
+
 ; ---- lvm.h ----
 ; Float 'n' from a number, without string coercion; false if it isn't one.
 (defmacro tonumberns (o n)
@@ -169,6 +273,22 @@
        (if (ttisinteger ~a)
          (do (set! (deref ~i) (ivalue ~a)) true)
          (!= (luaV_tointegerns ~a ~i F2Ieq) 0)))))
+
+; ---- ltm.h ----
+(defmacro notm (tm) `(ttisnil ~tm))
+(defmacro ttypename (x) `(aref luaT_typenames_ (+ ~x 1)))
+; The metamethod 'e' of 'mt', or null; a miss is cached in the table's flags.
+(defmacro gfasttm (g mt e)
+  (let (m (gensym))
+    `(let ((~m (ptr Table)) ~mt)
+       (if (or (= ~m null) (!= (bit-and (as ui32 (~m 'flags)) (bit-shl (as ui32 1) (as ui32 ~e))) 0))
+         (as (ptr TValue) null)
+         (luaT_gettm ~m ~e (aref (~g 'tmname) ~e))))))
+(defmacro checknoTM (mt e)
+  (let (m (gensym))
+    `(let ((~m (ptr Table)) ~mt)
+       (or (= ~m null) (!= (bit-and (as ui32 (~m 'flags)) (bit-shl (as ui32 1) (as ui32 ~e))) 0)))))
+(defmacro fasttm (L mt e) `(gfasttm (G ~L) ~mt ~e))
 
 ; ---- lstate.h ----
 (defmacro G (L) `(~L 'l_G))
@@ -205,6 +325,25 @@
 ; Row 'i' of the API's string cache. A C 2-D array's row won't decay (ISSUE-031).
 (defmacro strcache-row (g i) `(unsafe/cast (ptr (ptr TString)) (ref (aref (~g 'strcache) ~i))))
 
+; CallInfo's status bits from CIST_FRESH on, built with cast() (ISSUE-029).
+(defconst CIST_FRESH 0x10000)      ; a fresh luaV_execute frame
+(defconst CIST_CLSRET 0x20000)     ; closing tbc variables at a return
+(defconst CIST_TBC 0x40000)        ; has tbc variables
+(defconst CIST_OAH 0x80000)        ; original allowhook
+(defconst CIST_HOOKED 0x100000)    ; running a debug hook
+(defconst CIST_YPCALL 0x200000)    ; a yieldable protected call
+(defconst CIST_TAIL 0x400000)      ; a tail call
+(defconst CIST_HOOKYIELD 0x800000) ; the last hook yielded
+(defconst CIST_FIN 0x1000000)      ; a finalizer
+
+; Whether the call runs Lua code, not C and not a hook.
+(defmacro isLua (ci) `(= (bit-and (~ci 'callstatus) CIST_C) 0))
+(defmacro isLuacode (ci) `(= (bit-and (~ci 'callstatus) (bit-or CIST_C CIST_HOOKED)) 0))
+(defmacro ci_func (ci) `(clLvalue (s2v ((~ci 'func) 'p))))
+
+; ---- lgc.h ----
+(defmacro luaC_checkGC (L) `(when (<= ((G ~L) 'GCdebt) 0) (luaC_step ~L)))
+
 ; ---- lmem.h ----
 (defmacro luaM_error (L) `(luaD_throw ~L LUA_ERRMEM))
 (defmacro luaM_freemem (L b s) `(luaM_free_ ~L ~b ~s))
@@ -227,6 +366,17 @@
 (defmacro savestack (L pt) `(byte-diff ~pt ((~L 'stack) 'p)))
 (defmacro restorestack (L n)
   `(unsafe/cast (ptr StackValue) (p+ (unsafe/cast (ptr i8) ((~L 'stack) 'p)) ~n)))
+; Room for 'n' more slots, growing the stack if need be.
+(defmacro luaD_checkstack (L n)
+  `(when (<= (stack-diff ((~L 'stack_last) 'p) ((~L 'top) 'p)) ~n)
+     (luaD_growstack ~L ~n 1)))
+; The same, keeping 'p', a stack pointer variable, valid across a reallocation.
+(defmacro checkstackp (L n p)
+  (let (t (gensym))
+    `(when (<= (stack-diff ((~L 'stack_last) 'p) ((~L 'top) 'p)) ~n)
+       (let (~t (savestack ~L ~p))
+         (luaD_growstack ~L ~n 1)
+         (set! ~p (restorestack ~L ~t))))))
 ; How many slots 'q' is above 'p' (ISSUE-021).
 (defmacro stack-diff (q p) `(/ (byte-diff ~q ~p) (sizeof StackValue)))
 

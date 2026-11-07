@@ -1,0 +1,11 @@
+; ISSUE-035: unsafe/cast from a function pointer to an integer is refused.
+; expect: prints `1`; actual: `cast: unsupported conversion`
+; run: $NUCLEUSC --cflag=-I$D/../include $P -o $W/p && $W/p
+; fixed-when-output: 1
+(import-use "stdio.h")
+(import-use "lua.h")
+(defn g (L:(ptr lua_State)):i32 (return 0))
+(defn main ():i32
+  (let (f:lua_CFunction g)
+    (printf "%d\n" (if (!= (unsafe/cast usize f) 0) 1 0))
+    (return 0)))

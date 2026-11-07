@@ -1,0 +1,211 @@
+; Prototypes, closures, upvalues and to-be-closed variables.
+;
+; lfunc.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.func)
+(set-ir-prefix "")
+(import-use "lstate.h")
+(import-use "lfunc.h")
+(import-use "lgc.h")
+(import-use "ldo.h")
+(import-use "ldebug.h")
+(import-use "lmem.h")
+(import-use "ltm.h")
+(import-use lua.util)
+(import-use lua.core)
+
+(defconst MAXDELTA 65535)  ; USHRT_MAX, the largest delta in 'tbclist'
+
+(defn luaF_newCclosure (L:(ptr lua_State) nupvals:i32):(ptr CClosure)
+  (let (c:(ptr CClosure) (gco2ccl (luaC_newobj L LUA_VCCL (sizeCclosure nupvals))))
+    (set! (c 'nupvalues) (cast_uchar nupvals))
+    (return c)))
+
+(defn luaF_newLclosure (L:(ptr lua_State) nupvals:i32):(ptr LClosure)
+  (let (c:(ptr LClosure) (gco2lcl (luaC_newobj L LUA_VLCL (sizeLclosure nupvals))))
+    (set! (c 'p) null)
+    (set! (c 'nupvalues) (cast_uchar nupvals))
+    (for (i:i32 0) (< i nupvals) (inc! i)
+      (set! (aref (c 'upvals) i) null))
+    (return c)))
+
+; Fills a closure with new closed upvalues.
+(defn luaF_initupvals (L:(ptr lua_State) cl:(ptr LClosure)):void
+  (for (i:i32 0) (< i (as i32 (cl 'nupvalues))) (inc! i)
+    (let (uv:(ptr UpVal) (gco2upv (luaC_newobj L LUA_VUPVAL (cast_sizet (sizeof UpVal)))))
+      (set! ((uv 'v) 'p) (ref ((uv 'u) 'value)))  ; closed
+      (setnilvalue ((uv 'v) 'p))
+      (set! (aref (cl 'upvals) i) uv)
+      (luaC_objbarrier L cl uv))))
+
+; A new upvalue at 'level', linked into the open upvalues after 'prev'.
+(defn- newupval (L:(ptr lua_State) level:(ptr StackValue) prev:(ptr (ptr UpVal))):(ptr UpVal)
+  (let (uv:(ptr UpVal) (gco2upv (luaC_newobj L LUA_VUPVAL (cast_sizet (sizeof UpVal))))
+        next:(ptr UpVal) (deref prev))
+    (set! ((uv 'v) 'p) (s2v level))  ; the value lives in the stack
+    (set! (((uv 'u) 'open) 'next) next)
+    (set! (((uv 'u) 'open) 'previous) prev)
+    (when (!= next null)
+      (set! (((next 'u) 'open) 'previous) (ref (((uv 'u) 'open) 'next))))
+    (set! (deref prev) uv)
+    (when (not (isintwups L))  ; join the threads with upvalues
+      (set! (L 'twups) ((G L) 'twups))
+      (set! ((G L) 'twups) L))
+    (return uv)))
+
+(defn luaF_findupval (L:(ptr lua_State) level:(ptr StackValue)):(ptr UpVal)
+  (let (pp:(ptr (ptr UpVal)) (ref (L 'openupval))
+        p:(ptr UpVal) (deref pp))
+    (while (and (!= p null) (>= (uplevel p) level))
+      (when (= (uplevel p) level)
+        (return p))
+      (set! pp (ref (((p 'u) 'open) 'next)))
+      (set! p (deref pp)))
+    (return (newupval L level pp))))  ; after 'pp'
+
+; Calls obj's close method with 'err'; 'yy' says whether it may yield. It
+; assumes EXTRA_STACK.
+(defn- callclosemethod (L:(ptr lua_State) obj:(ptr TValue) err:(ptr TValue) yy:i32):void
+  (let (top:(ptr StackValue) ((L 'top) 'p)
+        func:(ptr StackValue) top
+        tm:(ptr TValue) (luaT_gettmbyobj L obj TM_CLOSE))
+    (setobj2s L top tm)
+    (set! top (p+ top 1))
+    (setobj2s L top obj)  ; 'self'
+    (set! top (p+ top 1))
+    (when (!= err null)
+      (setobj2s L top err)
+      (set! top (p+ top 1)))
+    (set! ((L 'top) 'p) top)
+    (if (!= yy 0)
+      (luaD_call L func 0)
+      (luaD_callnoyield L func 0))))
+
+(defn- checkclosemth (L:(ptr lua_State) level:(ptr StackValue)):void
+  (let (tm:(ptr TValue) (luaT_gettmbyobj L (s2v level) TM_CLOSE))
+    (when (ttisnil tm)
+      (let (idx:i32 (cast_int (stack-diff level (((L 'ci) 'func) 'p)))
+            vname:CStr (luaG_findlocal L (L 'ci) idx null))
+        (when (= (as ptr vname) null)
+          (set! vname "?"))
+        (luaG_runerror L "variable '%s' got a non-closable value" vname)))))
+
+; With CLOSEKTOP the call goes on the top; otherwise it can go right after
+; 'level', since nothing above it is used again.
+(defn- prepcallclosemth (L:(ptr lua_State) level:(ptr StackValue) status:TStatus yy:i32):void
+  (let (uv:(ptr TValue) (s2v level)
+        errobj:(ptr TValue) null)
+    (cond (= status LUA_OK) (set! ((L 'top) 'p) (p+ level 1))
+          (= status CLOSEKTOP) (do)
+          true (do (set! errobj (s2v (p+ level 1)))  ; the error goes after 'uv'
+                   (luaD_seterrorobj L status (p+ level 1))))
+    (callclosemethod L uv errobj yy)))
+
+; Inserts a variable in the list of to-be-closed variables.
+(defn luaF_newtbcupval (L:(ptr lua_State) level:(ptr StackValue)):void
+  (when (l_isfalse (s2v level))  ; false needs no closing
+    (return))
+  (checkclosemth L level)
+  (while (> (stack-diff level ((L 'tbclist) 'p)) MAXDELTA)
+    (set! ((L 'tbclist) 'p) (p+ ((L 'tbclist) 'p) MAXDELTA))  ; a dummy node
+    (set! ((((L 'tbclist) 'p) 'tbclist) 'delta) 0))
+  (set! ((level 'tbclist) 'delta) (unsafe/cast ui16 (stack-diff level ((L 'tbclist) 'p))))
+  (set! ((L 'tbclist) 'p) level))
+
+(defn luaF_unlinkupval (uv:(ptr UpVal)):void
+  (let (next:(ptr UpVal) (((uv 'u) 'open) 'next))
+    (set! (deref (((uv 'u) 'open) 'previous)) next)
+    (when (!= next null)
+      (set! (((next 'u) 'open) 'previous) (((uv 'u) 'open) 'previous)))))
+
+; Closes the upvalues down to 'level'.
+(defn luaF_closeupval (L:(ptr lua_State) level:(ptr StackValue)):void
+  (let (uv:(ptr UpVal) (L 'openupval))
+    (while (and (!= uv null) (>= (uplevel uv) level))
+      (let (slot:(ptr TValue) (ref ((uv 'u) 'value)))  ; the value's new place
+        (luaF_unlinkupval uv)
+        (setobj L slot ((uv 'v) 'p))
+        (set! ((uv 'v) 'p) slot)
+        (when (not (iswhite uv))  ; neither white nor dead?
+          (nw2black uv)  ; a closed upvalue can't be gray
+          (luaC_barrier L uv slot)))
+      (set! uv (L 'openupval)))))
+
+; Drops the first of the tbclist and its dummy nodes.
+(defn- poptbclist (L:(ptr lua_State)):void
+  (let (tbc:(ptr StackValue) ((L 'tbclist) 'p))
+    (set! tbc (p+ tbc (- 0 (as i64 ((tbc 'tbclist) 'delta)))))
+    (while (and (> tbc ((L 'stack) 'p)) (= ((tbc 'tbclist) 'delta) 0))
+      (set! tbc (p+ tbc (- 0 MAXDELTA))))
+    (set! ((L 'tbclist) 'p) tbc)))
+
+; Closes the upvalues and to-be-closed variables down to 'level', which it
+; returns restored.
+(defn luaF_close (L:(ptr lua_State) level:(ptr StackValue) status:TStatus yy:i32):(ptr StackValue)
+  (let (levelrel:i64 (savestack L level))
+    (luaF_closeupval L level)
+    (while (>= ((L 'tbclist) 'p) level)
+      (let (tbc:(ptr StackValue) ((L 'tbclist) 'p))
+        (poptbclist L)
+        (prepcallclosemth L tbc status yy)
+        (set! level (restorestack L levelrel))))
+    (return level)))
+
+(defn luaF_newproto (L:(ptr lua_State)):(ptr Proto)
+  (let (f:(ptr Proto) (gco2p (luaC_newobj L LUA_VPROTO (cast_sizet (sizeof Proto)))))
+    (set! (f 'k) null)
+    (set! (f 'sizek) 0)
+    (set! (f 'p) null)
+    (set! (f 'sizep) 0)
+    (set! (f 'code) null)
+    (set! (f 'sizecode) 0)
+    (set! (f 'lineinfo) null)
+    (set! (f 'sizelineinfo) 0)
+    (set! (f 'abslineinfo) null)
+    (set! (f 'sizeabslineinfo) 0)
+    (set! (f 'upvalues) null)
+    (set! (f 'sizeupvalues) 0)
+    (set! (f 'numparams) 0)
+    (set! (f 'flag) 0)
+    (set! (f 'maxstacksize) 0)
+    (set! (f 'locvars) null)
+    (set! (f 'sizelocvars) 0)
+    (set! (f 'linedefined) 0)
+    (set! (f 'lastlinedefined) 0)
+    (set! (f 'source) null)
+    (return f)))
+
+(defmacro size-of-n (n T) `(* (cast_sizet ~n) (cast_sizet (sizeof ~T))))
+
+(defn luaF_protosize (p:(ptr Proto)):lu_mem
+  (let (sz:lu_mem (+ (cast_sizet (sizeof Proto))
+                     (size-of-n (p 'sizep) (ptr Proto))
+                     (size-of-n (p 'sizek) TValue)
+                     (size-of-n (p 'sizelocvars) LocVar)
+                     (size-of-n (p 'sizeupvalues) Upvaldesc)))
+    (when (= (bit-and (p 'flag) PF_FIXED) 0)  ; code in fixed memory isn't counted
+      (set! sz (+ sz (size-of-n (p 'sizecode) Instruction)
+                  (size-of-n (p 'sizelineinfo) ls_byte)
+                  (size-of-n (p 'sizeabslineinfo) AbsLineInfo))))
+    (return sz)))
+
+(defn luaF_freeproto (L:(ptr lua_State) f:(ptr Proto)):void
+  (when (= (bit-and (f 'flag) PF_FIXED) 0)
+    (luaM_freearray L (f 'code) (f 'sizecode) Instruction)
+    (luaM_freearray L (f 'lineinfo) (f 'sizelineinfo) ls_byte)
+    (luaM_freearray L (f 'abslineinfo) (f 'sizeabslineinfo) AbsLineInfo))
+  (luaM_freearray L (f 'p) (f 'sizep) (ptr Proto))
+  (luaM_freearray L (f 'k) (f 'sizek) TValue)
+  (luaM_freearray L (f 'locvars) (f 'sizelocvars) LocVar)
+  (luaM_freearray L (f 'upvalues) (f 'sizeupvalues) Upvaldesc)
+  (luaM_free L f Proto))
+
+; The name of the 'local_number'th local active at 'pc', or NULL.
+(defn luaF_getlocalname (f:(ptr Proto) local_number:i32 pc:i32):CStr
+  (let (i:i32 0)
+    (while (and (< i (f 'sizelocvars)) (<= ((aref (f 'locvars) i) 'startpc) pc))
+      (when (< pc ((aref (f 'locvars) i) 'endpc))  ; active?
+        (set! local_number (- local_number 1))
+        (when (= local_number 0)
+          (return (cstr (getstr ((aref (f 'locvars) i) 'varname))))))
+      (inc! i))
+    (return (as CStr null))))

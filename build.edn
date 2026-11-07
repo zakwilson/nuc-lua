@@ -9,10 +9,9 @@
  :c-sources ["reference/build/src/lapi.c" "reference/build/src/lcode.c"
              "reference/build/src/ldebug.c"
              "reference/build/src/ldo.c" "reference/build/src/ldump.c"
-             "reference/build/src/lfunc.c" "reference/build/src/lgc.c"
+             "reference/build/src/lgc.c"
              "reference/build/src/llex.c"
              "reference/build/src/lopcodes.c"
              "reference/build/src/lparser.c" "reference/build/src/lstate.c"
-             "reference/build/src/ltable.c"
-             "reference/build/src/ltm.c" "reference/build/src/lundump.c"
+             "reference/build/src/lundump.c"
              "reference/build/src/lvm.c"]}

@@ -1,0 +1,133 @@
+From 1ae171b48bb2109603a138e5059a6ade5ffbc2d7 Mon Sep 17 00:00:00 2001
+From: Zak Wilson <zak.wilson@gmail.com>
+Date: Sat, 7 Nov 2026 14:37:41 +0000
+Subject: [PATCH] A field of a union member is a place; no cap on the number of
+ macros
+
+Two fixes found by the nuc-lua port.
+
+`(set! (((uv 'u) 'open) 'next) n)`, Lua's `uv->u.open.next = n` with `u` a
+union, was refused as a store into a temporary: place-value-type followed a
+field only through a struct, so a union member's field had no type and was
+emitted as a value. It follows a union too now (nuc-lua ISSUE-032;
+s21-field-of-union-member-place).
+
+The 257th defmacro of a compilation died with "macro table full". The cap
+guarded the original C implementation's fixed array; g-macros is a growable
+Vector, so the check is gone (nuc-lua ISSUE-033; s21-many-macros).
+
+Gate: nuctests 1742 passed, 0 failed, 0 skipped; bootstrap fixed point holds.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CsC8i2S7yJAHSpzRaddMj3
+---
+ design/progress.md     | 15 +++++++++++++++
+ docs/structs-unions.md |  2 +-
+ src/nucleusc.nuc       |  4 +---
+ tests/suite-s21.nuc    | 32 ++++++++++++++++++++++++++++++++
+ 4 files changed, 49 insertions(+), 4 deletions(-)
+
+diff --git a/design/progress.md b/design/progress.md
+index f1121f3..21b9705 100644
+--- a/design/progress.md
++++ b/design/progress.md
+@@ -5752,3 +5752,18 @@ did before the declaration and after the parameters. `lua-header-shapes` covers
+ That makes clang's intrinsics readable where `__DEFAULT_FN_ATTRS` sat between the type
+ and the name, and `_mm512_set_epi8` takes 64 parameters: `C-MAX-PARAMS` is now 64, so
+ `w3b-sdl` stays silent.
++
++## Lua-port fixes: a field of a union member is a place (lua-bugfixes)
++
++Found by the nuc-lua port (its ISSUE-032): `(set! (((uv 'u) 'open) 'next) n)`, Lua's
++`uv->u.open.next = n` with `u` a union, was refused as a store into a temporary.
++`place-value-type` followed a field only through a struct, so a union member's field
++had no type and the receiver was emitted as a value. It follows a union as well now.
++`s21-field-of-union-member-place` covers it.
++
++## Lua-port fixes: no cap on the number of macros (lua-bugfixes)
++
++Found by the nuc-lua port (its ISSUE-033): a compilation with more than 256 `defmacro`s
++died with "defmacro: macro table full". The cap guarded the fixed array of the C
++implementation; `g-macros` has been a growable `Vector` since, so the check is gone.
++`s21-many-macros` defines 300.
+diff --git a/docs/structs-unions.md b/docs/structs-unions.md
+index f006235..9aa8a65 100644
+--- a/docs/structs-unions.md
++++ b/docs/structs-unions.md
+@@ -215,7 +215,7 @@ rules, including where it is refused.
+ 
+ ## Passing and returning structs by value
+ 
+-A struct used directly (not behind `ptr`) as a `defn`/`declare` parameter or return type is passed/returned per the **platform C ABI**, so it interoperates correctly with C functions compiled by the system `cc`. On x86_64 System V this means small structs are coerced into registers (e.g. `{i32,i32}` → one `i64`; a struct with a `float` field whose eightbyte also holds an integer → `i64`), and structs larger than 16 bytes are passed `byval` / returned via a hidden `sret` pointer. aarch64, `avr`, and `riscv64` instead pass every `ABI-MEMORY`-classified struct as a plain pointer (no `byval` — none of those targets' ABIs has that attribute); on `avr` this applies to **every** struct/union regardless of size, not just those over 16 bytes, because the SysV eightbyte classifier's register-sized-chunk model has no counterpart on an 8-bit target — `abi-classify` bypasses eightbyte classification for `avr` entirely rather than adapting it. On `riscv64` (lp64d), struct-by-value follows the psABI's **hard-float** rules. An aggregate is first *flattened*: nested structs and arrays expand recursively into their scalar members, and a union never flattens. If the flattened list is exactly one FP real, two FP reals, or one FP real plus one integer ≤ XLEN **in either order**, the value travels in FP registers with its members' own IR types and offsets — `struct {float f;}` → `float`, `struct {double a,b;}` → `{double,double}`, `struct {float v[2];}` → `{float,float}` (two separate FPRs, where x86_64 SysV packs the same struct into one `<2 x float>` eightbyte), `struct {i32 i; f32 f;}` → `{i32,float}`, `struct {f32 f; i32 i;}` → `{float,i32}`. This applies only while the registers the rule needs are still free at that argument position: the budget is fa0-fa7 and a0-a7, an `ABI-MEMORY` return spends one of the latter on its hidden `sret` pointer, and every argument in a call or parameter list is charged in declaration order. Anything that does not qualify — three or more flattened members, a union, an over-wide member, a **variadic** argument (the `...` tail always uses the integer convention, with no flattening and no FP registers), or exhausted registers — falls back to the integer convention, coercing a struct ≤ 16 bytes into integer registers (`i64` / `{i64,i64}`). Returns are classified against a0/a1/fa0/fa1, which are always available, so a return never falls back for want of registers. A struct value is produced by dereferencing a pointer (`@p`) and consumed by storing the call result (`(set! (deref q) (mk ...))`). Reading a field needs no pointer: `(field p 'f)` and `(p 'f)` both accept a struct **value** — a by-value parameter, a `let`-bound struct local, or a call result read in place (`(field (mk 3) 'f)`). Writing one does: a member place and the 2-argument `ref` need the receiver's storage, so they take the same receivers `&x` does — a binding, not a temporary (`(set! ((mk 3) 'f) 1)` is an error; bind it first). A receiver with storage counts as one, as C's lvalue does: an array element or a field of a binding or a pointee, so `(set! ((aref mobjs i) 'hp) 50)` and `(set! ((m 'pos) 'x) 7)` need no `&`. A function may take or return a struct defined anywhere in the same compilation unit or an import — struct definitions are registered before function signatures are resolved. The same holds for fields: a `defstruct` (or a `defunion` arm, or a `(struct …)` field) may hold a struct defined *later* in the unit by value, directly or as an array element.
++A struct used directly (not behind `ptr`) as a `defn`/`declare` parameter or return type is passed/returned per the **platform C ABI**, so it interoperates correctly with C functions compiled by the system `cc`. On x86_64 System V this means small structs are coerced into registers (e.g. `{i32,i32}` → one `i64`; a struct with a `float` field whose eightbyte also holds an integer → `i64`), and structs larger than 16 bytes are passed `byval` / returned via a hidden `sret` pointer. aarch64, `avr`, and `riscv64` instead pass every `ABI-MEMORY`-classified struct as a plain pointer (no `byval` — none of those targets' ABIs has that attribute); on `avr` this applies to **every** struct/union regardless of size, not just those over 16 bytes, because the SysV eightbyte classifier's register-sized-chunk model has no counterpart on an 8-bit target — `abi-classify` bypasses eightbyte classification for `avr` entirely rather than adapting it. On `riscv64` (lp64d), struct-by-value follows the psABI's **hard-float** rules. An aggregate is first *flattened*: nested structs and arrays expand recursively into their scalar members, and a union never flattens. If the flattened list is exactly one FP real, two FP reals, or one FP real plus one integer ≤ XLEN **in either order**, the value travels in FP registers with its members' own IR types and offsets — `struct {float f;}` → `float`, `struct {double a,b;}` → `{double,double}`, `struct {float v[2];}` → `{float,float}` (two separate FPRs, where x86_64 SysV packs the same struct into one `<2 x float>` eightbyte), `struct {i32 i; f32 f;}` → `{i32,float}`, `struct {f32 f; i32 i;}` → `{float,i32}`. This applies only while the registers the rule needs are still free at that argument position: the budget is fa0-fa7 and a0-a7, an `ABI-MEMORY` return spends one of the latter on its hidden `sret` pointer, and every argument in a call or parameter list is charged in declaration order. Anything that does not qualify — three or more flattened members, a union, an over-wide member, a **variadic** argument (the `...` tail always uses the integer convention, with no flattening and no FP registers), or exhausted registers — falls back to the integer convention, coercing a struct ≤ 16 bytes into integer registers (`i64` / `{i64,i64}`). Returns are classified against a0/a1/fa0/fa1, which are always available, so a return never falls back for want of registers. A struct value is produced by dereferencing a pointer (`@p`) and consumed by storing the call result (`(set! (deref q) (mk ...))`). Reading a field needs no pointer: `(field p 'f)` and `(p 'f)` both accept a struct **value** — a by-value parameter, a `let`-bound struct local, or a call result read in place (`(field (mk 3) 'f)`). Writing one does: a member place and the 2-argument `ref` need the receiver's storage, so they take the same receivers `&x` does — a binding, not a temporary (`(set! ((mk 3) 'f) 1)` is an error; bind it first). A receiver with storage counts as one, as C's lvalue does: an array element or a field (of a struct or a union) of a binding or a pointee, so `(set! ((aref mobjs i) 'hp) 50)`, `(set! ((m 'pos) 'x) 7)` and `(set! (((uv 'u) 'open) 'next) n)` need no `&`. A function may take or return a struct defined anywhere in the same compilation unit or an import — struct definitions are registered before function signatures are resolved. The same holds for fields: a `defstruct` (or a `defunion` arm, or a `(struct …)` field) may hold a struct defined *later* in the unit by value, directly or as an array element.
+ 
+ ### Compound literals in by-value struct positions
+ 
+diff --git a/src/nucleusc.nuc b/src/nucleusc.nuc
+index c2ae613..e67ad64 100644
+--- a/src/nucleusc.nuc
++++ b/src/nucleusc.nuc
+@@ -7350,7 +7350,7 @@
+     (when-some (bt (place-value-type base scope))
+       (let (st:&Type bt)
+         (when (and (= (st 'kind) TY-PTR) (!= (st 'elem) null)) (set! st (unsafe/cast &Type (st 'elem))))
+-        (when (and (= (st 'kind) TY-STRUCT) (!= (st 'sdef) null))
++        (when (and (or (= (st 'kind) TY-STRUCT) (= (st 'kind) TY-UNION)) (!= (st 'sdef) null))
+           (let (sd:&StructDef (unsafe/cast &StructDef (st 'sdef))
+                 fi:i32 (struct-field-idx sd ((unsafe/cast &Node (node-at sel 1)) 's)))
+             (when (>= fi 0) (return ((field-at (sd 'fields) fi) 'type)))))))
+@@ -19470,8 +19470,6 @@
+           (dotimes (pi pcount)
+             (refuse-qualified-binder (aref (unsafe/cast &Symbol pnames) pi) (ff 'line)))
+           ; Register in macro table
+-          (when (>= (unsafe/cast i32 (count g-macros)) 256)
+-            (die-at (ff 'line) "defmacro: macro table full"))
+           (let (mdef:&MacroDef (new MacroDef g-arena))
+             (when (!= g-resolve 0) (resolve-note-link form (symbol-as-view jit-name)))
+             (set-fields! mdef
+diff --git a/tests/suite-s21.nuc b/tests/suite-s21.nuc
+index 80f289c..1490471 100644
+--- a/tests/suite-s21.nuc
++++ b/tests/suite-s21.nuc
+@@ -4074,6 +4074,38 @@ int main(void) {
+     (drop &out))
+   (return (ok)))
+ 
++; Past 256 macros a program still compiles (nuc-lua ISSUE-033): the cap
++; outlived the fixed array it guarded.
++(deftest s21-many-macros
++  (let (h:String (str "(import-use \"stdio.h\")\n") i:i64 0)
++    (while (< i 300)
++      (str-into &h "(defmacro m" i " (x) `(+ ~x " i "))\n")
++      (set! i (+ i 1)))
++    (str-into &h "(defn main ():i32 (printf \"%d\\n\" (as i32 (m299 (m0 1)))) 0)\n")
++    (let (out:String (try (build-run-source (string-as-view &h)))
++          ov:StrView (string-as-view &out))
++      (try (check-eq (strview-trim-end &ov) "300"))
++      (drop &out))
++    (drop &h)))
++
++; A field of a union member is a place, as Lua's `uv->u.open.next` is (nuc-lua ISSUE-032).
++(deftest s21-field-of-union-member-place
++  (let (out:String (try (build-run-source "(import-use \"stdio.h\")
++(defstruct Up tag:i32 (u (union (open (struct a:i32 next:i64)) value:f64)))
++(defn main ():i32
++  (let (x:&Up (alloca Up)
++        arr:&Up (alloca Up 2))
++    (set! (((x 'u) 'open) 'a) 5)
++    (set! (((x 'u) 'open) 'next) 6)
++    (set! ((field ((aref arr 1) 'u) 'open) 'a) 7)
++    (printf \"%d %ld %d\\n\" (((x 'u) 'open) 'a) (((x 'u) 'open) 'next)
++            ((((aref arr 1) 'u) 'open) 'a)))
++  0)
++")))
++    (try (check-golden (string-as-view &out) "5 6 7\n"))
++    (drop &out))
++  (return (ok)))
++
+ ; With nucleus.error loaded only by `import-ct`, an `err` site called
+ ; `err-find-handler`, which the program never defined (nuc-doom ISSUE-039).
+ ; Imported for real as well, the handler chain must still be consulted.
+-- 
+2.47.3
+

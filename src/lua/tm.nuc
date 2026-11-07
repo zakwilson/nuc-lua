@@ -1,0 +1,239 @@
+; Metamethods ("tag methods"), and a vararg function's extra arguments.
+;
+; ltm.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.tm)
+(set-ir-prefix "")
+(import-use "lstate.h")
+(import-use "ltm.h")
+(import-use "ltable.h")
+(import-use "lstring.h")
+(import-use "lgc.h")
+(import-use "ldo.h")
+(import-use "ldebug.h")
+(import-use "lvm.h")
+(import-use lua.util)
+(import-use lua.core)
+
+(defconst INT_MAX_HALF 1073741823)  ; INT_MAX / 2
+
+; The C modules index it through ttypename. "upvalue" and "proto" are for tests.
+(defvar luaT_typenames_:(array CStr 12)
+  (array CStr "no value" "nil" "boolean" "userdata" "number" "string" "table"
+         "function" "userdata" "thread" "upvalue" "proto"))
+
+(defvar- luaT_eventname:(array CStr 25)  ; ORDER TM
+  (array CStr "__index" "__newindex" "__gc" "__mode" "__len" "__eq"
+         "__add" "__sub" "__mul" "__mod" "__pow" "__div" "__idiv"
+         "__band" "__bor" "__bxor" "__shl" "__shr" "__unm" "__bnot" "__lt" "__le"
+         "__concat" "__call" "__close"))
+
+(defn luaT_init (L:(ptr lua_State)):void
+  (for (i:i32 0) (< i TM_N) (inc! i)
+    (set! (aref ((G L) 'tmname) i) (luaS_new L (aref luaT_eventname i)))
+    (luaC_fix L (obj2gco (aref ((G L) 'tmname) i)))))  ; never collected
+
+; For fasttm: quick when there is no metamethod, the usual case.
+(defn luaT_gettm (events:(ptr Table) event:TMS ename:(ptr TString)):(ptr TValue)
+  (let (tm:(ptr TValue) (luaH_Hgetshortstr events ename))
+    (when (notm tm)
+      (set! (events 'flags) (bit-or (events 'flags) (cast_uchar (bit-shl 1 event))))  ; cache it
+      (return null))
+    (return tm)))
+
+(defn luaT_gettmbyobj (L:(ptr lua_State) o:(ptr TValue) event:TMS):(ptr TValue)
+  (let (mt:(ptr Table) null)
+    (cond (= (ttype o) LUA_TTABLE) (set! mt ((hvalue o) 'metatable))
+          (= (ttype o) LUA_TUSERDATA) (set! mt ((uvalue o) 'metatable))
+          true (set! mt (aref ((G L) 'mt) (ttype o))))
+    (if (!= mt null)
+      (return (luaH_Hgetshortstr mt (aref ((G L) 'tmname) event)))
+      (return (ref ((G L) 'nilvalue))))))
+
+; A table's or userdata's '__name' metafield, if it is a string, else the type's name.
+(defn luaT_objtypename (L:(ptr lua_State) o:(ptr TValue)):CStr
+  (let (mt:(ptr Table) null)
+    (cond (ttistable o) (set! mt ((hvalue o) 'metatable))
+          (ttisfulluserdata o) (set! mt ((uvalue o) 'metatable)))
+    (when (!= mt null)
+      (let (name:(ptr TValue) (luaH_Hgetshortstr mt (luaS_new L "__name")))
+        (when (ttisstring name)
+          (return (cstr (getstr (tsvalue name)))))))
+    (return (ttypename (ttype o)))))
+
+; A metamethod may yield only when called from Lua code. Both assume EXTRA_STACK.
+(defn luaT_callTM (L:(ptr lua_State) f:(ptr TValue) p1:(ptr TValue) p2:(ptr TValue)
+                   p3:(ptr TValue)):void
+  (let (func:(ptr StackValue) ((L 'top) 'p))
+    (setobj2s L func f)
+    (setobj2s L (p+ func 1) p1)
+    (setobj2s L (p+ func 2) p2)
+    (setobj2s L (p+ func 3) p3)
+    (set! ((L 'top) 'p) (p+ func 4))
+    (if (isLuacode (L 'ci))
+      (luaD_call L func 0)
+      (luaD_callnoyield L func 0))))
+
+(defn luaT_callTMres (L:(ptr lua_State) f:(ptr TValue) p1:(ptr TValue) p2:(ptr TValue)
+                      res:(ptr StackValue)):lu_byte
+  (let (result:i64 (savestack L res)
+        func:(ptr StackValue) ((L 'top) 'p))
+    (setobj2s L func f)
+    (setobj2s L (p+ func 1) p1)
+    (setobj2s L (p+ func 2) p2)
+    (set! ((L 'top) 'p) (p+ ((L 'top) 'p) 3))
+    (if (isLuacode (L 'ci))
+      (luaD_call L func 1)
+      (luaD_callnoyield L func 1))
+    (set! res (restorestack L result))
+    (set! ((L 'top) 'p) (p+ ((L 'top) 'p) -1))
+    (setobjs2s L res ((L 'top) 'p))  ; the result to its place
+    (return (ttypetag (s2v res)))))
+
+; The result's tag, or -1 when neither operand has the metamethod.
+(defn- callbinTM (L:(ptr lua_State) p1:(ptr TValue) p2:(ptr TValue) res:(ptr StackValue)
+                  event:TMS):i32
+  (let (tm:(ptr TValue) (luaT_gettmbyobj L p1 event))
+    (when (notm tm)
+      (set! tm (luaT_gettmbyobj L p2 event)))
+    (if (notm tm)
+      (return -1)
+      (return (as i32 (luaT_callTMres L tm p1 p2 res))))))
+
+(defn luaT_trybinTM (L:(ptr lua_State) p1:(ptr TValue) p2:(ptr TValue) res:(ptr StackValue)
+                     event:TMS):void
+  (when (< (callbinTM L p1 p2 res event) 0)
+    (when (or (= event TM_BAND) (= event TM_BOR) (= event TM_BXOR)
+              (= event TM_SHL) (= event TM_SHR) (= event TM_BNOT))
+      (if (and (ttisnumber p1) (ttisnumber p2))
+        (luaG_tointerror L p1 p2)
+        (luaG_opinterror L p1 p2 "perform bitwise operation on")))
+    (luaG_opinterror L p1 p2 "perform arithmetic on")))
+
+; Using 'p1' after callbinTM is safe: with no metamethod, the stack is unchanged.
+(defn luaT_tryconcatTM (L:(ptr lua_State)):void
+  (let (p1:(ptr StackValue) (p+ ((L 'top) 'p) -2))
+    (when (< (callbinTM L (s2v p1) (s2v (p+ p1 1)) p1 TM_CONCAT) 0)
+      (luaG_concaterror L (s2v p1) (s2v (p+ p1 1))))))
+
+(defn luaT_trybinassocTM (L:(ptr lua_State) p1:(ptr TValue) p2:(ptr TValue) flip:i32
+                          res:(ptr StackValue) event:TMS):void
+  (if (!= flip 0)
+    (luaT_trybinTM L p2 p1 res event)
+    (luaT_trybinTM L p1 p2 res event)))
+
+(defn luaT_trybiniTM (L:(ptr lua_State) p1:(ptr TValue) i2:lua_Integer flip:i32
+                      res:(ptr StackValue) event:TMS):void
+  (let (aux:(ptr TValue) (alloca TValue))
+    (setivalue aux i2)
+    (luaT_trybinassocTM L p1 aux flip res event)))
+
+(defn luaT_callorderTM (L:(ptr lua_State) p1:(ptr TValue) p2:(ptr TValue) event:TMS):i32
+  (let (tag:i32 (callbinTM L p1 p2 ((L 'top) 'p) event))
+    (when (>= tag 0)
+      (return (if (tagisfalse tag) 0 1)))
+    (luaG_ordererror L p1 p2)  ; no metamethod
+    (return 0)))
+
+(defn luaT_callorderiTM (L:(ptr lua_State) p1:(ptr TValue) v2:i32 flip:i32 isfloat:i32
+                         event:TMS):i32
+  (let (aux:(ptr TValue) (alloca TValue))
+    (if (!= isfloat 0)
+      (setfltvalue aux (cast_num v2))
+      (setivalue aux (as lua_Integer v2)))
+    (if (!= flip 0)  ; were the arguments exchanged?
+      (return (luaT_callorderTM L aux p1 event))
+      (return (luaT_callorderTM L p1 aux event)))))
+
+; A vararg table on the top of the stack, with the 'n' values from 'f'.
+(defn- createvarargtab (L:(ptr lua_State) f:(ptr StackValue) n:i32):void
+  (let (key:(ptr TValue) (alloca TValue)
+        value:(ptr TValue) (alloca TValue)
+        t:(ptr Table) (luaH_new L))
+    (sethvalue L (s2v ((L 'top) 'p)) t)
+    (set! ((L 'top) 'p) (p+ ((L 'top) 'p) 1))
+    (luaH_resize L t (cast_uint n) 1)
+    (setsvalue L key (luaS_new L "n"))
+    (setivalue value (as lua_Integer n))
+    ; after the resize, this can't collect, so 'key' needs no anchor
+    (luaH_set L t key value)
+    (for (i:i32 0) (< i n) (inc! i)
+      (luaH_setint L t (as lua_Integer (+ i 1)) (s2v (p+ f i))))
+    (luaC_checkGC L)))
+
+; From  func arg1 … argn extra1 …  (ci->func at func) to
+;       func nil … nil extra1 … func arg1 … argn  (ci->func at the second func).
+(defn- buildhiddenargs (L:(ptr lua_State) ci:(ptr CallInfo) p:(ptr Proto) totalargs:i32
+                        nfixparams:i32 nextra:i32):void
+  (set! (((ci 'u) 'l) 'nextraargs) nextra)
+  (luaD_checkstack L (+ (as i32 (p 'maxstacksize)) 1))
+  (setobjs2s L ((L 'top) 'p) ((ci 'func) 'p))  ; the function, after the extras
+  (set! ((L 'top) 'p) (p+ ((L 'top) 'p) 1))
+  (for (i:i32 1) (<= i nfixparams) (inc! i)  ; the fixed parameters after it
+    (setobjs2s L ((L 'top) 'p) (p+ ((ci 'func) 'p) i))
+    (set! ((L 'top) 'p) (p+ ((L 'top) 'p) 1))
+    (setnilvalue2s (p+ ((ci 'func) 'p) i)))  ; erased, for the collector
+  (set! ((ci 'func) 'p) (p+ ((ci 'func) 'p) (+ totalargs 1)))
+  (set! ((ci 'top) 'p) (p+ ((ci 'top) 'p) (+ totalargs 1))))
+
+(defn luaT_adjustvarargs (L:(ptr lua_State) ci:(ptr CallInfo) p:(ptr Proto)):void
+  (let (totalargs:i32 (- (cast_int (stack-diff ((L 'top) 'p) ((ci 'func) 'p))) 1)
+        nfixparams:i32 (as i32 (p 'numparams))
+        nextra:i32 (- totalargs nfixparams))
+    (if (!= (bit-and (p 'flag) PF_VATAB) 0)  ; a vararg table, as the last parameter
+      (do (createvarargtab L (p+ ((ci 'func) 'p) (+ nfixparams 1)) nextra)
+          (setobjs2s L (p+ ((ci 'func) 'p) (+ nfixparams 1)) (p+ ((L 'top) 'p) -1)))
+      (do (buildhiddenargs L ci p totalargs nfixparams nextra)
+          (setnilvalue2s (p+ ((ci 'func) 'p) (+ nfixparams 1)))))))  ; the vararg parameter
+
+(defn luaT_getvararg (ci:(ptr CallInfo) ra:(ptr StackValue) rc:(ptr TValue)):void
+  (let (nextra:i32 (((ci 'u) 'l) 'nextraargs)
+        n:lua_Integer 0)
+    (if (tointegerns rc &n)
+      (when (< (- (l_castS2U n) 1) (as lua_Unsigned (cast_uint nextra)))
+        (let (slot:(ptr StackValue) (p+ ((ci 'func) 'p) (- (+ (- 0 nextra) (cast_int n)) 1)))
+          (setobjs2s null ra slot)
+          (return)))
+      (when (ttisstring rc)
+        (let (ts:(ptr TString) (tsvalue rc))
+          (when (and (= (tsslen ts) 1) (= (deref (getstr ts)) (ch \n)))  ; "n"
+            (setivalue (s2v ra) (as lua_Integer nextra))
+            (return)))))
+    (setnilvalue2s ra)))
+
+; The number of extra arguments: in the call info if the vararg table was
+; optimized away, else the table's 'n', which must be a sane integer.
+(defn- getnumargs (L:(ptr lua_State) ci:(ptr CallInfo) h:(ptr Table)):i32
+  (when (= h null)
+    (return (((ci 'u) 'l) 'nextraargs)))
+  (let (res:(ptr TValue) (alloca TValue))
+    (when (or (!= (luaH_getshortstr h (luaS_new L "n") res) LUA_VNUMINT)
+              (> (l_castS2U (ivalue res)) (as lua_Unsigned INT_MAX_HALF)))
+      (luaG_runerror L "vararg table has no proper 'n'"))
+    (return (cast_int (ivalue res)))))
+
+; 'wanted' varargs into 'where'; 'vatab' is the vararg table's register, or -1.
+(defn luaT_getvarargs (L:(ptr lua_State) ci:(ptr CallInfo) where:(ptr StackValue) wanted:i32
+                       vatab:i32):void
+  (let (h:(ptr Table) (if (< vatab 0) (as (ptr Table) null)
+                        (hvalue (s2v (p+ ((ci 'func) 'p) (+ vatab 1)))))
+        nargs:i32 (getnumargs L ci h)
+        touse:i32 0
+        i:i32 0)
+    (if (< wanted 0)  ; all of them
+      (do (set! wanted nargs)
+          (set! touse nargs)
+          (checkstackp L nargs where)
+          (set! ((L 'top) 'p) (p+ where nargs)))  ; the next instruction needs top
+      (set! touse (if (> nargs wanted) wanted nargs)))
+    (if (= h null)  ; from the stack
+      (while (< i touse)
+        (setobjs2s L (p+ where i) (p+ ((ci 'func) 'p) (+ (- 0 nargs) i)))
+        (inc! i))
+      (while (< i touse)  ; from the table
+        (let (tag:lu_byte (luaH_getint h (as lua_Integer (+ i 1)) (s2v (p+ where i))))
+          (when (tagisempty tag)
+            (setnilvalue2s (p+ where i))))
+        (inc! i)))
+    (while (< i wanted)  ; nils for the rest
+      (setnilvalue2s (p+ where i))
+      (inc! i))))
