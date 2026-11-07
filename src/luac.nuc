@@ -17,6 +17,7 @@
 (import lua.state)  ; execution state
 (import lua.debug)
 (import lua.do)
+(import lua.api)
 (import-use lua.opcodes)  ; the compiler; its macros list the code
 (import lua.lex)
 (import-use lua.code)  ; isvararg

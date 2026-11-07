@@ -1,0 +1,9 @@
+; ISSUE-044: a global i8 array, C's `const char x[] = "..."`, takes no string initializer.
+; expect: prints `abc`; actual: `an (array i8 4) slot must be initialized with an (array T ...) literal`
+; run: $NUCLEUSC $P -o $W/p && $W/p
+; fixed-when-output: abc
+(import-use "stdio.h")
+(defvar ident:(array i8 4) "abc")
+(defn main ():i32
+  (printf "%s\n" (as ptr ident))
+  (return 0))

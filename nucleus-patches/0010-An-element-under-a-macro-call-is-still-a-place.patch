@@ -1,0 +1,133 @@
+From d2c75f7c8d251b06a7356fea4efafcf3c9c2daaa Mon Sep 17 00:00:00 2001
+From: Zak Wilson <zak.wilson@gmail.com>
+Date: Sat, 7 Nov 2026 19:48:59 +0000
+Subject: [PATCH] An element under a macro call is still a place
+
+(ref ((aref ((uvalue o) 'uv) i) 'uv)) still copied: the receiver was an
+aref, not a field form. emit-untyped-receiver expands a macro at the
+receiver's head and takes the address of any field, aref or deref
+form; set!'s last-resort receiver uses it too. Found by the nuc-lua
+port (its ISSUE-043, lua_setiuservalue).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CsC8i2S7yJAHSpzRaddMj3
+---
+ design/progress.md     |  5 +++++
+ docs/structs-unions.md |  2 +-
+ src/nucleusc.nuc       | 25 ++++++++++++++++++++-----
+ tests/suite-s21.nuc    | 22 ++++++++++++++++++++++
+ 4 files changed, 48 insertions(+), 6 deletions(-)
+
+diff --git a/design/progress.md b/design/progress.md
+index 66d956c..83d7937 100644
+--- a/design/progress.md
++++ b/design/progress.md
+@@ -5793,3 +5793,8 @@ recognised the main thread. node-type leaves a macro call untyped, so the receiv
+ 1-argument `ref`, the field `ref` and `set!`'s receiver use it, so a `set!` one level
+ deeper is no longer refused either. `s21-place-under-macro-call` covers it (nuctests
+ 1743 passed, bootstrap holds).
++The same held one step on, for an element of an array field under a macro call
++(`&uvalue(o)->uv[n-1].uv`, found by the port's `lua_setiuservalue`):
++`emit-untyped-receiver` now expands a macro at the receiver's head and takes the
++address of any field, `aref` or `deref` form, and `set!`'s last-resort receiver goes
++through it too.
+diff --git a/docs/structs-unions.md b/docs/structs-unions.md
+index ca1cb4f..ba6bedb 100644
+--- a/docs/structs-unions.md
++++ b/docs/structs-unions.md
+@@ -215,7 +215,7 @@ rules, including where it is refused.
+ 
+ ## Passing and returning structs by value
+ 
+-A struct used directly (not behind `ptr`) as a `defn`/`declare` parameter or return type is passed/returned per the **platform C ABI**, so it interoperates correctly with C functions compiled by the system `cc`. On x86_64 System V this means small structs are coerced into registers (e.g. `{i32,i32}` → one `i64`; a struct with a `float` field whose eightbyte also holds an integer → `i64`), and structs larger than 16 bytes are passed `byval` / returned via a hidden `sret` pointer. aarch64, `avr`, and `riscv64` instead pass every `ABI-MEMORY`-classified struct as a plain pointer (no `byval` — none of those targets' ABIs has that attribute); on `avr` this applies to **every** struct/union regardless of size, not just those over 16 bytes, because the SysV eightbyte classifier's register-sized-chunk model has no counterpart on an 8-bit target — `abi-classify` bypasses eightbyte classification for `avr` entirely rather than adapting it. On `riscv64` (lp64d), struct-by-value follows the psABI's **hard-float** rules. An aggregate is first *flattened*: nested structs and arrays expand recursively into their scalar members, and a union never flattens. If the flattened list is exactly one FP real, two FP reals, or one FP real plus one integer ≤ XLEN **in either order**, the value travels in FP registers with its members' own IR types and offsets — `struct {float f;}` → `float`, `struct {double a,b;}` → `{double,double}`, `struct {float v[2];}` → `{float,float}` (two separate FPRs, where x86_64 SysV packs the same struct into one `<2 x float>` eightbyte), `struct {i32 i; f32 f;}` → `{i32,float}`, `struct {f32 f; i32 i;}` → `{float,i32}`. This applies only while the registers the rule needs are still free at that argument position: the budget is fa0-fa7 and a0-a7, an `ABI-MEMORY` return spends one of the latter on its hidden `sret` pointer, and every argument in a call or parameter list is charged in declaration order. Anything that does not qualify — three or more flattened members, a union, an over-wide member, a **variadic** argument (the `...` tail always uses the integer convention, with no flattening and no FP registers), or exhausted registers — falls back to the integer convention, coercing a struct ≤ 16 bytes into integer registers (`i64` / `{i64,i64}`). Returns are classified against a0/a1/fa0/fa1, which are always available, so a return never falls back for want of registers. A struct value is produced by dereferencing a pointer (`@p`) and consumed by storing the call result (`(set! (deref q) (mk ...))`). Reading a field needs no pointer: `(field p 'f)` and `(p 'f)` both accept a struct **value** — a by-value parameter, a `let`-bound struct local, or a call result read in place (`(field (mk 3) 'f)`). Writing one does: a member place and the 2-argument `ref` need the receiver's storage, so they take the same receivers `&x` does — a binding, not a temporary (`(set! ((mk 3) 'f) 1)` is an error; bind it first). A receiver with storage counts as one, as C's lvalue does: an array element or a field (of a struct or a union) of a binding or a pointee, so `(set! ((aref mobjs i) 'hp) 50)`, `(set! ((m 'pos) 'x) 7)` and `(set! (((uv 'u) 'open) 'next) n)` need no `&`. A field under a macro call's result is a place too: with `(defmacro G (L) `(~L 'l_G))`, `(set! ((((G L) 'mainth) 'l) 'n) 4)` writes through the pointer. A function may take or return a struct defined anywhere in the same compilation unit or an import — struct definitions are registered before function signatures are resolved. The same holds for fields: a `defstruct` (or a `defunion` arm, or a `(struct …)` field) may hold a struct defined *later* in the unit by value, directly or as an array element.
++A struct used directly (not behind `ptr`) as a `defn`/`declare` parameter or return type is passed/returned per the **platform C ABI**, so it interoperates correctly with C functions compiled by the system `cc`. On x86_64 System V this means small structs are coerced into registers (e.g. `{i32,i32}` → one `i64`; a struct with a `float` field whose eightbyte also holds an integer → `i64`), and structs larger than 16 bytes are passed `byval` / returned via a hidden `sret` pointer. aarch64, `avr`, and `riscv64` instead pass every `ABI-MEMORY`-classified struct as a plain pointer (no `byval` — none of those targets' ABIs has that attribute); on `avr` this applies to **every** struct/union regardless of size, not just those over 16 bytes, because the SysV eightbyte classifier's register-sized-chunk model has no counterpart on an 8-bit target — `abi-classify` bypasses eightbyte classification for `avr` entirely rather than adapting it. On `riscv64` (lp64d), struct-by-value follows the psABI's **hard-float** rules. An aggregate is first *flattened*: nested structs and arrays expand recursively into their scalar members, and a union never flattens. If the flattened list is exactly one FP real, two FP reals, or one FP real plus one integer ≤ XLEN **in either order**, the value travels in FP registers with its members' own IR types and offsets — `struct {float f;}` → `float`, `struct {double a,b;}` → `{double,double}`, `struct {float v[2];}` → `{float,float}` (two separate FPRs, where x86_64 SysV packs the same struct into one `<2 x float>` eightbyte), `struct {i32 i; f32 f;}` → `{i32,float}`, `struct {f32 f; i32 i;}` → `{float,i32}`. This applies only while the registers the rule needs are still free at that argument position: the budget is fa0-fa7 and a0-a7, an `ABI-MEMORY` return spends one of the latter on its hidden `sret` pointer, and every argument in a call or parameter list is charged in declaration order. Anything that does not qualify — three or more flattened members, a union, an over-wide member, a **variadic** argument (the `...` tail always uses the integer convention, with no flattening and no FP registers), or exhausted registers — falls back to the integer convention, coercing a struct ≤ 16 bytes into integer registers (`i64` / `{i64,i64}`). Returns are classified against a0/a1/fa0/fa1, which are always available, so a return never falls back for want of registers. A struct value is produced by dereferencing a pointer (`@p`) and consumed by storing the call result (`(set! (deref q) (mk ...))`). Reading a field needs no pointer: `(field p 'f)` and `(p 'f)` both accept a struct **value** — a by-value parameter, a `let`-bound struct local, or a call result read in place (`(field (mk 3) 'f)`). Writing one does: a member place and the 2-argument `ref` need the receiver's storage, so they take the same receivers `&x` does — a binding, not a temporary (`(set! ((mk 3) 'f) 1)` is an error; bind it first). A receiver with storage counts as one, as C's lvalue does: an array element or a field (of a struct or a union) of a binding or a pointee, so `(set! ((aref mobjs i) 'hp) 50)`, `(set! ((m 'pos) 'x) 7)` and `(set! (((uv 'u) 'open) 'next) n)` need no `&`. A field or element under a macro call's result is a place too: with `(defmacro G (L) `(~L 'l_G))`, `(set! ((((G L) 'mainth) 'l) 'n) 4)` writes through the pointer, as does `(set! ((aref ((G L) 'arr) i) 'n) 4)`. A function may take or return a struct defined anywhere in the same compilation unit or an import — struct definitions are registered before function signatures are resolved. The same holds for fields: a `defstruct` (or a `defunion` arm, or a `(struct …)` field) may hold a struct defined *later* in the unit by value, directly or as an array element.
+ 
+ ### Compound literals in by-value struct positions
+ 
+diff --git a/src/nucleusc.nuc b/src/nucleusc.nuc
+index d919aa4..e7c02f3 100644
+--- a/src/nucleusc.nuc
++++ b/src/nucleusc.nuc
+@@ -7396,7 +7396,7 @@
+             (let (t:StrView (new-tmp))
+               (emit-load t (type-to-ir ft) (fa 'val) ft)
+               (return (alloc-val ft t))))))))
+-  (let (p:&Val (emit-node rnode scope)
++  (let (p:&Val (emit-untyped-receiver rnode scope line)
+         pk:i32 (-> p (as &Val _) (_ 'type) (unsafe/cast &Type _) (_ 'kind)))
+     (when (or (= pk TY-STRUCT) (= pk TY-UNION))
+       (die-at line
+@@ -8158,10 +8158,25 @@
+       (return null))))
+ 
+ ; A receiver node-type can't type, such as a field of a macro call's result: a
+-; struct field's own address rather than a copy of the struct, else its value.
++; struct place's own address rather than a copy of the struct, else its value.
+ (defn emit-untyped-receiver (recv:ptr scope:&Scope line:i32):&Val
+-  (when (!= (field-place-parts recv) null)
+-    (when-some (pa (emit-place-address (unsafe/cast &Node recv) scope line))
++  (when (= g-resolve 0) (return (emit-untyped-receiver-in recv scope line)))
++  (let (d:usize (resolve-depth)
++        v:&Val (emit-untyped-receiver-in recv scope line))
++    (resolve-pop-to d)
++    (return v)))
++
++; A field, `aref` or `deref` form: the forms whose address is never a call's.
++(defn place-form? (n:ptr):bool
++  (when (!= (field-place-parts n) null) (return true))
++  (when (or (!= (node-kind n) NODE-LIST) (= (node-len n) 0)) (return false))
++  (let (h:?&Node (node-at n 0))
++    (return (or (and (= h 'aref) (= (node-len n) 3)) (and (= h 'deref) (= (node-len n) 2))))))
++
++(defn emit-untyped-receiver-in (recv0:ptr scope:&Scope line:i32):&Val
++  (let (recv:ptr (ref-operand-expand recv0))
++    (when (place-form? recv)
++      (when-some (pa (emit-place-address (unsafe/cast &Node recv) scope line))
+       (let (ft:&Type (-> pa (_ 'type) (unsafe/cast &Type _) (_ 'elem) (unsafe/cast &Type _)))
+         (when (or (= (ft 'kind) TY-STRUCT) (= (ft 'kind) TY-UNION)) (return pa))
+         (when (= (ft 'kind) TY-ARRAY)
+@@ -8169,7 +8184,7 @@
+         (let (t:StrView (new-tmp))
+           (emit-load t (type-to-ir ft) (pa 'val) ft)
+           (return (alloc-val ft t))))))
+-  (return (emit-node recv scope)))
++    (return (emit-node recv scope))))
+ 
+ ; Store a VALUE in a fresh entry-block slot owned by a hidden binding of the
+ ; current scope, so `binding-address-val` stays the one owner of its escape taint.
+diff --git a/tests/suite-s21.nuc b/tests/suite-s21.nuc
+index 89c612f..e0c10c9 100644
+--- a/tests/suite-s21.nuc
++++ b/tests/suite-s21.nuc
+@@ -4132,6 +4132,28 @@ int main(void) {
+ ")))
+     (try (check-golden (string-as-view &out) "5 1 1 1\n"))
+     (drop &out))
++  ; An element of an array field under a macro call, as `&uvalue(o)->uv[n-1].uv` is.
++  (let (out:String (try (build-run-source "(import-use \"stdio.h\")
++(defstruct UV n:i32)
++(defstruct U pad:i64 uv:(array UV 2))
++(defstruct H u:&U)
++(defmacro uval (h) `(~h 'u))
++(defmacro elem (h i) `(aref ((uval ~h) 'uv) ~i))
++(defn main ():i32
++  (let (u:&U (alloca U)
++        h:&H (alloca H))
++    (set! (h 'u) u)
++    (set! ((aref ((uval h) 'uv) 1) 'n) 7)
++    (let (p:&i32 (ref ((aref ((uval h) 'uv) 1) 'n))
++          q:&i32 (ref ((elem h 0) 'n)))
++      (set! @p (+ @p 1))
++      (set! @q 3)
++      (set! ((elem h 0) 'n) (+ ((elem h 0) 'n) 1)))
++    (printf \"%d %d\\n\" ((aref (u 'uv) 0) 'n) ((aref (u 'uv) 1) 'n)))
++  0)
++")))
++    (try (check-golden (string-as-view &out) "4 8\n"))
++    (drop &out))
+   (return (ok)))
+ 
+ ; With nucleus.error loaded only by `import-ct`, an `err` site called
+-- 
+2.47.3
+

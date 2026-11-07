@@ -7,7 +7,7 @@ Ranked by porter pain removed per unit of language work.
 | 1 | ISSUE-005 | A library's public `defn` is preempted by any same-named symbol in the process | major | design | open |
 | 2 | ISSUE-023 | An array field of a nested place decayed to a copy's address, losing every store | major | bug | fixed in nucleus `0081d2a` |
 | 3 | ISSUE-032 | A store to a field of a union member was refused as a temporary | major | bug | fixed in nucleus `1ae171b` |
-| 4 | ISSUE-043 | A place under a macro call, `&G(L)->mainth.l`, gave the address of a copy | major | bug | fixed in nucleus `275b612` |
+| 4 | ISSUE-043 | A place under a macro call, `&G(L)->mainth.l`, gave the address of a copy | major | bug | fixed in nucleus `275b612`, `d2c75f7` |
 | 5 | ISSUE-033 | A compilation could hold at most 256 macros | blocker | bug | fixed in nucleus `1ae171b` |
 | 6 | ISSUE-026 | A declaration with an attribute between its return type and its name was skipped | blocker | bug | fixed in nucleus `f282cfe` |
 | 7 | ISSUE-022 | A definition that misses its header's prototype silently becomes a mangled overload | major | design | worked-around |
@@ -38,15 +38,16 @@ Ranked by porter pain removed per unit of language work.
 | 32 | ISSUE-040 | A later declarator in a field list (`*previous, *next`) imported as a bare `ptr` | minor | bug | fixed in nucleus `a64ac73` |
 | 33 | ISSUE-042 | `=` on two `CStr`s compares contents, so a C pointer test ported as written reads through null | minor | design | worked-around |
 | 34 | ISSUE-041 | `bit-not` of an unsigned value is refused: `-1` doesn't fit it | papercut | bug | worked-around |
-| 35 | ISSUE-024 | A `_`-prefixed macro isn't imported, even ISO C's `_IOFBF` | papercut | design | worked-around |
-| 36 | ISSUE-020 | `set!` won't expand a macro in its place | papercut | missing-feature | worked-around |
-| 37 | ISSUE-025 | `sizeof` is a signed integer, so comparing a size with it is refused | papercut | design | worked-around |
-| 38 | ISSUE-035 | `unsafe/cast` from a function pointer to an integer is refused | papercut | bug | worked-around |
-| 39 | ISSUE-036 | A `defvar`'s array initializer isn't macroexpanded before its shape is checked | papercut | bug | worked-around |
-| 40 | ISSUE-037 | A `defstruct` can't complete a struct its header declares without a body | papercut | missing-feature | worked-around |
-| 41 | ISSUE-038 | A parameter named like a special form is accepted, then misparsed at its use | papercut | design | worked-around |
-| 42 | ISSUE-039 | A `build.edn` makes one program, and a second sharing its sources warns at every build | papercut | tooling | worked-around |
-| 43 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
+| 35 | ISSUE-044 | A global `i8` array takes no string initializer, so `lua_ident` is spelled out in bytes | papercut | missing-feature | worked-around |
+| 36 | ISSUE-024 | A `_`-prefixed macro isn't imported, even ISO C's `_IOFBF` | papercut | design | worked-around |
+| 37 | ISSUE-020 | `set!` won't expand a macro in its place | papercut | missing-feature | worked-around |
+| 38 | ISSUE-025 | `sizeof` is a signed integer, so comparing a size with it is refused | papercut | design | worked-around |
+| 39 | ISSUE-035 | `unsafe/cast` from a function pointer to an integer is refused | papercut | bug | worked-around |
+| 40 | ISSUE-036 | A `defvar`'s array initializer isn't macroexpanded before its shape is checked | papercut | bug | worked-around |
+| 41 | ISSUE-037 | A `defstruct` can't complete a struct its header declares without a body | papercut | missing-feature | worked-around |
+| 42 | ISSUE-038 | A parameter named like a special form is accepted, then misparsed at its use | papercut | design | worked-around |
+| 43 | ISSUE-039 | A `build.edn` makes one program, and a second sharing its sources warns at every build | papercut | tooling | worked-around |
+| 44 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
 
 ## ISSUE-001: A C variadic couldn't be defined in Nucleus
 
@@ -689,7 +690,7 @@ a comparison of two variables. A null operand could at least compare unequal.
 
 - **Severity:** major
 - **Kind:** bug
-- **Status:** fixed in nucleus `275b612`
+- **Status:** fixed in nucleus `275b612`, `d2c75f7`
 - **Probe:** `probes/issue-043.nuc` — expected `same`; actual `different`
 - **Port sites:** `mainthread` in `state.nuc` and `do.nuc`: `lua_yieldk`, `luaD_throw`,
   `lua_close`
@@ -704,6 +705,26 @@ With a named `g`, as in `lua_newstate`, it was right, so the port ran until
 `errors.lua` asked `coroutine.yield()` outside a coroutine and got "attempt to yield
 across a C-call boundary": `lua_yieldk` never saw the main thread. A `set!` one level
 deeper was refused as a temporary receiver, which at least was loud.
+`d2c75f7` covers the next step, an element of an array field under a macro call:
+`lua_setiuservalue`'s `&uvalue(o)->uv[n-1].uv` stored into a copy, and the C API
+matrix caught it.
+
+## ISSUE-044: A global `i8` array takes no string initializer
+
+- **Severity:** papercut
+- **Kind:** missing-feature
+- **Status:** worked-around
+- **Probe:** `probes/issue-044.nuc` — expected `abc`; actual `an (array i8 4) slot must
+  be initialized with an (array T ...) literal`
+- **Port sites:** `lua_ident` in `api.nuc`
+- **Workaround:** the `defident` macro reads the string literal's bytes and writes the
+  `defvar` with an `(array i8 ...)` of them.
+
+Context: `lapi.c` exports `const char lua_ident[]`, a C string whose size is part of
+its type. A `CStr` global would be a pointer, which a C caller's `extern const char
+lua_ident[]` would read as bytes of an address. The macro works, but a string literal
+filling an `i8` array, sized from it when the length is left out, is what C programs
+expect of a byte array.
 
 ## ISSUE-039: A `build.edn` makes one program, and a second sharing its sources warns at every build
 

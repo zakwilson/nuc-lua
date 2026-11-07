@@ -34,7 +34,7 @@ object model, the compiler, execution state, the collector and the VM (§10).
 | 2 Host and libraries | done: `lua.c`, `lauxlib.c`, `linit` and every standard library in Nucleus |
 | 3 Object model | done: `lctype`, `lzio`, `lmem`, `lobject`, `lstring`, `lfunc`, `ltm`, `ltable` |
 | 4 Compiler | done: `lopcodes`, `llex`, `lcode`, `lparser`, `ldump`, `lundump`, `luac.c` |
-| 5 Execution state | in progress: `lstate`, `ldebug`, `ldo` ported; `lapi` left |
+| 5 Execution state | done: `lstate`, `ldebug`, `ldo`, `lapi` |
 | 6–11 | not started |
 
 ### Nucleus
@@ -53,13 +53,14 @@ Compiler: `.nucleus-work` on `lua-bugfixes` (see CLAUDE.md).
 - `1ae171b` a field of a union member is a place (ISSUE-032); no 256-macro cap (ISSUE-033)
 - `a64ac73` a later declarator keeps the base type (ISSUE-040); the fixed point
   holds from the third round
-- `275b612` a place under a macro call is a place (ISSUE-043)
+- `275b612`, `d2c75f7` a place under a macro call is a place, field or element (ISSUE-043)
 
 ### Still stock
 
 Part of execution state, the collector and the VM: every module in `build.edn`'s
-`:c-sources` (`lapi`, `lgc`, `lvm`). `lstate`, `ldebug` and `ldo` are `state.nuc`,
-`debug.nuc` and `do.nuc`; `do.nuc`'s `LongJmp` is C's `lua_longjmp` (ISSUE-037), its
+`:c-sources` (`lgc`, `lvm`). `lstate`, `ldebug`, `ldo` and `lapi` are `state.nuc`,
+`debug.nuc`, `do.nuc` and `api.nuc`; `api.nuc`'s `lua_ident` is spelled out in bytes
+(ISSUE-044); `do.nuc`'s `LongJmp` is C's `lua_longjmp` (ISSUE-037), its
 `jmp_buf` a struct field, `_setjmp`/`_longjmp` by name. The object model is in `src/lua/`
 (`ctype`, `zio`, `mem`, `object`, `string`, `func`, `tm`, `table`), and so is the
 compiler (`opcodes`, `lex`, `code`, `parser`, `dump`, `undump`); `luac.c` is
@@ -122,9 +123,10 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
 
 ## Next
 
-M5, execution state: `lapi` (the rest of the variadics), with the suite,
-`check-bytecode.sh` and the `check-capi.sh` matrix after it. Delete it from both
-`build.edn` and `luac/build.edn`. `code.nuc` holds `lcode.h`'s macros and the `expdesc`
+M6, the collector: `lgc`, incremental and generational, deleted from both
+`build.edn` files. Then a stress driver for the suite that sets
+`collectgarbage("param", …)` to collect as often as it can, in both modes, as a gate
+beside the suite, bytecode and matrix (PROMPT §10). `code.nuc` holds `lcode.h`'s macros and the `expdesc`
 union accessors (`u`, `set-u`, `ind`, `set-ind`, `uvar`, `set-uvar`) that `parser.nuc`
 uses; `parser.nuc`'s `Block` is C's `BlockCnt` (ISSUE-037). `opcodes.nuc` generates `luaP_opmodes` from one
 opcode row table (`with-opcodes`); `luac`'s `opnames` come from the same rows.

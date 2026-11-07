@@ -8,6 +8,5 @@
  :cflags ["-I../include" "-I../reference/build/src" "-DLUA_USE_LINUX"]
  :libs ["m"]
  :deps {luacapi {:path "../capi"}}
- :c-sources ["../reference/build/src/lapi.c"
-             "../reference/build/src/lgc.c"
+ :c-sources ["../reference/build/src/lgc.c"
              "../reference/build/src/lvm.c"]}

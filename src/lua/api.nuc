@@ -1,0 +1,872 @@
+; The C API: indices into the stack, pushing and reading values, tables and
+; metatables, calls and loads, the collector's controls, and upvalues.
+;
+; lapi.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.api)
+(set-ir-prefix "")
+(import-use "lstate.h")
+(import-use "lapi.h")
+(import-use "ldebug.h")
+(import-use "ldo.h")
+(import-use "lfunc.h")
+(import-use "lgc.h")
+(import-use "lmem.h")
+(import-use "lobject.h")
+(import-use "lstring.h")
+(import-use "ltable.h")
+(import-use "ltm.h")
+(import-use "lundump.h")
+(import-use "lvm.h")
+(import-use "string.h")
+(import-use lua.util)
+(import-use lua.core)
+(import-use lua.tm)  ; luaT_typenames_
+(import-ct nucleus.node)
+(import-ct nucleus.intern)
+
+(defconst MAXUPVAL 255)
+(defconst GCSTPUSR 1)
+(defconst GCSTPGC 2)
+(defconst GCSTPCLS 4)
+(defconst GCSpause 8)
+(defconst KGC_INC 0)
+(defconst KGC_GENMINOR 1)
+(defconst HOK 0)
+(defconst HNOTATABLE 2)
+
+; C's 'const char lua_ident[] = "..."': an i8 array takes no string initializer
+; (ISSUE-044), so the macro spells the string out as bytes.
+(defmacro defident (s)
+  (let (vals (node-list-new (s 'line))
+        p ((s 's) 'p)
+        i 0)
+    (while (!= (aref p i) 0)
+      (node-push vals (node-int (as i64 (aref p i))))
+      (set! i (+ i 1)))
+    (node-push vals (node-int 0))
+    `(defvar lua_ident:(array i8 ~(node-int (as i64 (+ i 1)))) (array i8 ~@vals))))
+(defident "$LuaVersion: Lua 5.5.1  Copyright (C) 1994-2026 Lua.org, PUC-Rio $$LuaAuthors: R. Ierusalimschy, L. H. de Figueiredo, W. Celes $")
+
+(defmacro isvalid (L o) `(!= (as ptr ~o) (as ptr (ref ((G ~L) 'nilvalue)))))
+(defmacro ispseudo (i) `(<= ~i LUA_REGISTRYINDEX))
+(defmacro isupvalue (i) `(< ~i LUA_REGISTRYINDEX))
+(defmacro api_incr_top (L) `(set! ((~L 'top) 'p) (p+ ((~L 'top) 'p) 1)))
+(defmacro top-at (L n) `(p+ ((~L 'top) 'p) ~n))
+(defmacro adjustresults (L nres)
+  `(when (and (<= ~nres LUA_MULTRET) (< (as ptr (((~L 'ci) 'top) 'p)) (as ptr ((~L 'top) 'p))))
+     (set! (((~L 'ci) 'top) 'p) ((~L 'top) 'p))))
+(defmacro yieldable (L) `(= (bit-and (~L 'nCcalls) 0xffff0000) 0))
+(defmacro mainthread (g) `(ref ((~g 'mainth) 'l)))
+(defmacro gettotalbytes (g) `(- (~g 'GCtotalbytes) (~g 'GCdebt)))
+(defmacro setoah (ci v)
+  `(set! (~ci 'callstatus) (if (!= ~v 0)
+                             (bit-or (~ci 'callstatus) CIST_OAH)
+                             (clearbits (~ci 'callstatus) CIST_OAH))))
+(defmacro ttisthread (o) `(checktag ~o (ctb LUA_VTHREAD)))
+(defmacro thvalue (o) `(gco2th (gcvalue ~o)))
+(defmacro ttislightuserdata (o) `(checktag ~o LUA_VLIGHTUSERDATA))
+(defmacro getudatamem (u)
+  (let (a (gensym))
+    `(let ((~a (ptr Udata)) ~u)
+       (as ptr (p+ (bytes ~a) (udatamemoffset (~a 'nuvalue)))))))
+(defmacro setpvalue (obj x)
+  `(let (a:(ptr TValue) ~obj)
+     (set! ((a 'value_) 'p) ~x)
+     (set! (a 'tt_) LUA_VLIGHTUSERDATA)))
+(defmacro setfvalue (obj x)
+  `(let (a:(ptr TValue) ~obj)
+     (set! ((a 'value_) 'f) ~x)
+     (set! (a 'tt_) LUA_VLCF)))
+(defmacro setgcvalue (obj x tag)
+  `(let (a:(ptr TValue) ~obj)
+     (set! ((a 'value_) 'gc) (obj2gco ~x))
+     (set! (a 'tt_) (ctb ~tag))))
+(defmacro setthvalue (L obj x) `(setgcvalue ~obj ~x LUA_VTHREAD))
+(defmacro setclCvalue (L obj x) `(setgcvalue ~obj ~x LUA_VCCL))
+(defmacro setuvalue (L obj x) `(setgcvalue ~obj ~x LUA_VUSERDATA))
+; '*n' from a number or a numeric string.
+(defmacro tonumber (o n)
+  (let (a (gensym))
+    `(let ((~a (ptr TValue)) ~o)
+       (if (ttisfloat ~a) (do (set! (deref ~n) (fltvalue ~a)) 1) (luaV_tonumber_ ~a ~n)))))
+(defmacro tointeger (o i)
+  (let (a (gensym))
+    `(let ((~a (ptr TValue)) ~o)
+       (if (ttisinteger ~a) (do (set! (deref ~i) (ivalue ~a)) 1) (luaV_tointeger ~a ~i F2Ieq)))))
+(defmacro fastget (t k res f tag)
+  `(set! ~tag (if (not (ttistable ~t)) LUA_VNOTABLE (~f (hvalue ~t) ~k ~res))))
+(defmacro fastset (t k val hres f)
+  `(set! ~hres (if (not (ttistable ~t)) HNOTATABLE (~f (hvalue ~t) ~k ~val))))
+(defmacro finishfastset (L t v) `(luaC_barrierback ~L (gcvalue ~t) ~v))
+
+; ---- indices ----
+
+; The value at an acceptable index; an absent one is G(L)->nilvalue.
+(defn- index2value (L:(ptr lua_State) idx0:i32):(ptr TValue)
+  (let (ci:(ptr CallInfo) (L 'ci)
+        idx:i32 idx0)
+    (cond (> idx 0)
+            (let (o:StkId (p+ ((ci 'func) 'p) idx))
+              (if (>= (as ptr o) (as ptr ((L 'top) 'p)))
+                (return (ref ((G L) 'nilvalue)))
+                (return (s2v o))))
+          (not (ispseudo idx))  ; negative
+            (return (s2v (top-at L idx)))
+          (= idx LUA_REGISTRYINDEX)
+            (return (ref ((G L) 'l_registry)))
+          true  ; upvalues
+            (do (set! idx (- LUA_REGISTRYINDEX idx))
+                (if (ttisCclosure (s2v ((ci 'func) 'p)))
+                  (let (func:(ptr CClosure) (clCvalue (s2v ((ci 'func) 'p))))
+                    (if (<= idx (as i32 (func 'nupvalues)))
+                      (return (ref (aref (func 'upvalue) (- idx 1))))
+                      (return (ref ((G L) 'nilvalue)))))
+                  (return (ref ((G L) 'nilvalue))))))))  ; a light C function has none
+
+; The stack slot of an actual index (not a pseudo-index).
+(defn- index2stack (L:(ptr lua_State) idx:i32):StkId
+  (if (> idx 0)
+    (return (p+ (((L 'ci) 'func) 'p) idx))
+    (return (top-at L idx))))
+
+(defn lua_checkstack (L:(ptr lua_State) n:i32):i32
+  (let (ci:(ptr CallInfo) (L 'ci)
+        res:i32 (if (> (stack-diff ((L 'stack_last) 'p) ((L 'top) 'p)) n)
+                  1
+                  (luaD_growstack L n 0)))
+    (when (and (!= res 0) (< (as ptr ((ci 'top) 'p)) (as ptr (top-at L n))))
+      (set! ((ci 'top) 'p) (top-at L n)))  ; the frame's top
+    (return res)))
+
+(defn lua_xmove (from:(ptr lua_State) to:(ptr lua_State) n:i32):void
+  (when (= from to) (return))
+  (set! ((from 'top) 'p) (top-at from (- n)))
+  (for (i:i32 0) (< i n) (set! i (+ i 1))
+    (setobjs2s to ((to 'top) 'p) (top-at from i))
+    (api_incr_top to)))
+
+(defn lua_atpanic (L:(ptr lua_State) panicf:lua_CFunction):lua_CFunction
+  (let (old:lua_CFunction ((G L) 'panic))
+    (set! ((G L) 'panic) panicf)
+    (return old)))
+
+(defn lua_version (L:(ptr lua_State)):lua_Number
+  (return (cast_num LUA_VERSION_NUM)))
+
+; ---- the stack ----
+
+(defn lua_absindex (L:(ptr lua_State) idx:i32):i32
+  (if (or (> idx 0) (ispseudo idx))
+    (return idx)
+    (return (+ (cast_int (stack-diff ((L 'top) 'p) (((L 'ci) 'func) 'p))) idx))))
+
+(defn lua_gettop (L:(ptr lua_State)):i32
+  (return (- (cast_int (stack-diff ((L 'top) 'p) (((L 'ci) 'func) 'p))) 1)))
+
+(defn lua_settop (L:(ptr lua_State) idx:i32):void
+  (let (ci:(ptr CallInfo) (L 'ci)
+        func:StkId ((ci 'func) 'p)
+        diff:i64 0)
+    (if (>= idx 0)
+      (do (set! diff (stack-diff (p+ func (+ idx 1)) ((L 'top) 'p)))
+          (while (> diff 0)  ; clear the new slots
+            (setnilvalue2s ((L 'top) 'p))
+            (api_incr_top L)
+            (set! diff (- diff 1))))
+      (set! diff (as i64 (+ idx 1))))  ; "subtracts" the negative index
+    (let (newtop:StkId (top-at L diff))
+      (when (and (< diff 0) (>= (as ptr ((L 'tbclist) 'p)) (as ptr newtop)))
+        (set! newtop (luaF_close L newtop CLOSEKTOP 0)))
+      (set! ((L 'top) 'p) newtop))))  ; only after closing any upvalue
+
+(defn lua_closeslot (L:(ptr lua_State) idx:i32):void
+  (let (level:StkId (luaF_close L (index2stack L idx) CLOSEKTOP 0))
+    (setnilvalue2s level)))
+
+; Reverses the slots from 'from' to 'to', for lua_rotate.
+(defn- reverse (L:(ptr lua_State) from0:StkId to0:StkId):void
+  (let (from:StkId from0
+        to:StkId to0
+        temp:(ptr TValue) (alloca TValue))
+    (while (< (as ptr from) (as ptr to))
+      (setobj L temp (s2v from))
+      (setobjs2s L from to)
+      (setobj L (s2v to) temp)
+      (set! from (p+ from 1))
+      (set! to (p+ to -1)))))
+
+; With x = AB, A of length 'n', rotating gives BA == (A^r . B^r)^r.
+(defn lua_rotate (L:(ptr lua_State) idx:i32 n:i32):void
+  (let (t:StkId (top-at L -1)  ; the segment's end
+        p:StkId (index2stack L idx)  ; its start
+        m:StkId (if (>= n 0) (p+ t (- n)) (p+ p (- (- n) 1))))  ; the prefix's end
+    (reverse L p m)
+    (reverse L (p+ m 1) t)
+    (reverse L p t)))
+
+(defn lua_copy (L:(ptr lua_State) fromidx:i32 toidx:i32):void
+  (let (fr:(ptr TValue) (index2value L fromidx)
+        to:(ptr TValue) (index2value L toidx))
+    (setobj L to fr)
+    (when (isupvalue toidx)  ; the registry needs no barrier
+      (luaC_barrier L (clCvalue (s2v (((L 'ci) 'func) 'p))) fr))))
+
+(defn lua_pushvalue (L:(ptr lua_State) idx:i32):void
+  (setobj2s L ((L 'top) 'p) (index2value L idx))
+  (api_incr_top L))
+
+; ---- access (stack -> C) ----
+
+(defn lua_type (L:(ptr lua_State) idx:i32):i32
+  (let (o:(ptr TValue) (index2value L idx))
+    (return (if (isvalid L o) (as i32 (ttype o)) LUA_TNONE))))
+
+(defn lua_typename (L:(ptr lua_State) t:i32):CStr
+  (return (ttypename t)))
+
+(defn lua_iscfunction (L:(ptr lua_State) idx:i32):i32
+  (let (o:(ptr TValue) (index2value L idx))
+    (return (if (or (ttislcf o) (ttisCclosure o)) 1 0))))
+
+(defn lua_isinteger (L:(ptr lua_State) idx:i32):i32
+  (return (if (ttisinteger (index2value L idx)) 1 0)))
+
+(defn lua_isnumber (L:(ptr lua_State) idx:i32):i32
+  (let (n:(ptr lua_Number) (alloca lua_Number))
+    (return (tonumber (index2value L idx) n))))
+
+(defn lua_isstring (L:(ptr lua_State) idx:i32):i32
+  (let (o:(ptr TValue) (index2value L idx))
+    (return (if (or (ttisstring o) (ttisnumber o)) 1 0))))  ; cvt2str
+
+(defn lua_isuserdata (L:(ptr lua_State) idx:i32):i32
+  (let (o:(ptr TValue) (index2value L idx))
+    (return (if (or (ttisfulluserdata o) (ttislightuserdata o)) 1 0))))
+
+(defn lua_rawequal (L:(ptr lua_State) index1:i32 index2:i32):i32
+  (let (o1:(ptr TValue) (index2value L index1)
+        o2:(ptr TValue) (index2value L index2))
+    (if (and (isvalid L o1) (isvalid L o2))
+      (return (luaV_equalobj null o1 o2))
+      (return 0))))
+
+(defn lua_arith (L:(ptr lua_State) op:i32):void
+  (when (or (= op LUA_OPUNM) (= op LUA_OPBNOT))  ; a fake second operand
+    (setobjs2s L ((L 'top) 'p) (top-at L -1))
+    (api_incr_top L))
+  (luaO_arith L op (s2v (top-at L -2)) (s2v (top-at L -1)) (top-at L -2))
+  (set! ((L 'top) 'p) (top-at L -1)))  ; pop the second operand
+
+(defn lua_compare (L:(ptr lua_State) index1:i32 index2:i32 op:i32):i32
+  (let (o1:(ptr TValue) (index2value L index1)  ; may call a metamethod
+        o2:(ptr TValue) (index2value L index2))
+    (if (and (isvalid L o1) (isvalid L o2))
+      (case op
+        LUA_OPEQ (return (luaV_equalobj L o1 o2))
+        LUA_OPLT (return (luaV_lessthan L o1 o2))
+        LUA_OPLE (return (luaV_lessequal L o1 o2))
+        (return 0))
+      (return 0))))
+
+(defn lua_numbertocstring (L:(ptr lua_State) idx:i32 buff:(ptr i8)):ui32
+  (let (o:(ptr TValue) (index2value L idx))
+    (if (ttisnumber o)
+      (let (len:ui32 (luaO_tostringbuff o buff))
+        (set! (aref buff len) 0)  ; the final zero
+        (return (+ len 1)))
+      (return 0))))
+
+(defn lua_stringtonumber (L:(ptr lua_State) s:CStr):usize
+  (let (sz:usize (luaO_str2num s (s2v ((L 'top) 'p))))
+    (when (!= sz 0)
+      (api_incr_top L))
+    (return sz)))
+
+(defn lua_tonumberx (L:(ptr lua_State) idx:i32 pisnum:(ptr i32)):lua_Number
+  (let (n:(ptr lua_Number) (alloca lua_Number))
+    (set! (deref n) 0.0)
+    (let (isnum:i32 (tonumber (index2value L idx) n))
+      (when (!= (as ptr pisnum) null)
+        (set! (deref pisnum) isnum))
+      (return (deref n)))))
+
+(defn lua_tointegerx (L:(ptr lua_State) idx:i32 pisnum:(ptr i32)):lua_Integer
+  (let (res:(ptr lua_Integer) (alloca lua_Integer))
+    (set! (deref res) 0)
+    (let (isnum:i32 (tointeger (index2value L idx) res))
+      (when (!= (as ptr pisnum) null)
+        (set! (deref pisnum) isnum))
+      (return (deref res)))))
+
+(defn lua_toboolean (L:(ptr lua_State) idx:i32):i32
+  (return (if (l_isfalse (index2value L idx)) 0 1)))
+
+(defn lua_tolstring (L:(ptr lua_State) idx:i32 len:(ptr usize)):CStr
+  (let (o:(ptr TValue) (index2value L idx))
+    (when (not (ttisstring o))
+      (when (not (ttisnumber o))  ; not convertible
+        (when (!= (as ptr len) null) (set! (deref len) 0))
+        (return (as CStr null)))
+      (luaO_tostring L o)
+      (luaC_checkGC L)
+      (set! o (index2value L idx)))  ; the stack may have moved
+    (let (ts:(ptr TString) (tsvalue o))
+      (when (!= (as ptr len) null)
+        (set! (deref len) (if (strisshr ts) (cast_sizet (ts 'shrlen)) ((ts 'u) 'lnglen))))
+      (return (cstr (getstr ts))))))
+
+(defn lua_rawlen (L:(ptr lua_State) idx:i32):lua_Unsigned
+  (let (o:(ptr TValue) (index2value L idx))
+    (case (as i32 (ttypetag o))
+      LUA_VSHRSTR (return (as lua_Unsigned ((tsvalue o) 'shrlen)))
+      LUA_VLNGSTR (return (as lua_Unsigned (((tsvalue o) 'u) 'lnglen)))
+      LUA_VUSERDATA (return (as lua_Unsigned ((uvalue o) 'len)))
+      LUA_VTABLE (return (luaH_getn L (hvalue o)))
+      (return 0))))
+
+(defn lua_tocfunction (L:(ptr lua_State) idx:i32):lua_CFunction
+  (let (o:(ptr TValue) (index2value L idx))
+    (cond (ttislcf o) (return (fvalue o))
+          (ttisCclosure o) (return ((clCvalue o) 'f))
+          true (return (unsafe/cast lua_CFunction null)))))  ; not a C function
+
+(defn- touserdata (o:(ptr TValue)):ptr
+  (case (as i32 (ttype o))
+    LUA_TUSERDATA (return (getudatamem (uvalue o)))
+    LUA_TLIGHTUSERDATA (return (pvalue o))
+    (return null)))
+
+(defn lua_touserdata (L:(ptr lua_State) idx:i32):ptr
+  (return (touserdata (index2value L idx))))
+
+(defn lua_tothread (L:(ptr lua_State) idx:i32):(ptr lua_State)
+  (let (o:(ptr TValue) (index2value L idx))
+    (if (ttisthread o) (return (thvalue o)) (return null))))
+
+; An object's internal address, for information only.
+(defn lua_topointer (L:(ptr lua_State) idx:i32):ptr
+  (let (o:(ptr TValue) (index2value L idx))
+    (case (as i32 (ttypetag o))
+      LUA_VLCF (return (unsafe/cast ptr (fvalue o)))
+      (:or LUA_VUSERDATA LUA_VLIGHTUSERDATA) (return (touserdata o))
+      (if (iscollectable o) (return (as ptr (gcvalue o))) (return null)))))
+
+; ---- push (C -> stack) ----
+
+(defn lua_pushnil (L:(ptr lua_State)):void
+  (setnilvalue2s ((L 'top) 'p))
+  (api_incr_top L))
+
+(defn lua_pushnumber (L:(ptr lua_State) n:lua_Number):void
+  (setfltvalue (s2v ((L 'top) 'p)) n)
+  (api_incr_top L))
+
+(defn lua_pushinteger (L:(ptr lua_State) n:lua_Integer):void
+  (setivalue (s2v ((L 'top) 'p)) n)
+  (api_incr_top L))
+
+; 's' may be null when 'len' is 0, so it isn't read then.
+(defn lua_pushlstring (L:(ptr lua_State) s:CStr len:usize):CStr
+  (let (ts:(ptr TString) (if (= len 0) (luaS_new L "") (luaS_newlstr L s len)))
+    (setsvalue2s L ((L 'top) 'p) ts)
+    (api_incr_top L)
+    (luaC_checkGC L)
+    (return (cstr (getstr ts)))))
+
+(defn lua_pushexternalstring (L:(ptr lua_State) s:CStr len:usize falloc:lua_Alloc ud:ptr):CStr
+  (let (ts:(ptr TString) (luaS_newextlstr L s len falloc ud))
+    (setsvalue2s L ((L 'top) 'p) ts)
+    (api_incr_top L)
+    (luaC_checkGC L)
+    (return (cstr (getstr ts)))))
+
+(defn lua_pushstring (L:(ptr lua_State) s0:CStr):CStr
+  (let (s:CStr s0)
+    (if (= (as ptr s) null)
+      (setnilvalue2s ((L 'top) 'p))
+      (let (ts:(ptr TString) (luaS_new L s))
+        (setsvalue2s L ((L 'top) 'p) ts)
+        (set! s (cstr (getstr ts)))))  ; the internal copy
+    (api_incr_top L)
+    (luaC_checkGC L)
+    (return s)))
+
+(defn lua_pushvfstring (L:(ptr lua_State) fmt:CStr argp:VaList):CStr
+  (let (ret:CStr (luaO_pushvfstring L fmt argp))
+    (luaC_checkGC L)
+    (return ret)))
+
+(defn lua_pushfstring (L:(ptr lua_State) fmt:CStr :varargs argp):CStr
+  (let (ret:CStr (luaO_pushvfstring L fmt argp))
+    (when (= (as ptr ret) null)
+      (luaD_throw L LUA_ERRMEM))
+    (luaC_checkGC L)
+    (return ret)))
+
+(defn lua_pushcclosure (L:(ptr lua_State) fn:lua_CFunction n:i32):void
+  (if (= n 0)
+    (do (setfvalue (s2v ((L 'top) 'p)) fn)
+        (api_incr_top L))
+    (let (cl:(ptr CClosure) (luaF_newCclosure L n))
+      (set! (cl 'f) fn)
+      (for (i:i32 0) (< i n) (set! i (+ i 1))  ; no barrier: the closure is white
+        (setobj L (ref (aref (cl 'upvalue) i)) (s2v (top-at L (+ (- n) i)))))
+      (set! ((L 'top) 'p) (top-at L (- n)))
+      (setclCvalue L (s2v ((L 'top) 'p)) cl)
+      (api_incr_top L)
+      (luaC_checkGC L))))
+
+(defn lua_pushboolean (L:(ptr lua_State) b:i32):void
+  (if (!= b 0)
+    (setbtvalue (s2v ((L 'top) 'p)))
+    (setbfvalue (s2v ((L 'top) 'p))))
+  (api_incr_top L))
+
+(defn lua_pushlightuserdata (L:(ptr lua_State) p:ptr):void
+  (setpvalue (s2v ((L 'top) 'p)) p)
+  (api_incr_top L))
+
+(defn lua_pushthread (L:(ptr lua_State)):i32
+  (setthvalue L (s2v ((L 'top) 'p)) L)
+  (api_incr_top L)
+  (return (if (= (mainthread (G L)) L) 1 0)))
+
+; ---- get (Lua -> stack) ----
+
+(defn- auxgetstr (L:(ptr lua_State) t:(ptr TValue) k:CStr):i32
+  (let (tag:lu_byte 0
+        str:(ptr TString) (luaS_new L k))
+    (fastget t str (s2v ((L 'top) 'p)) luaH_getstr tag)
+    (if (not (tagisempty tag))
+      (api_incr_top L)
+      (do (setsvalue2s L ((L 'top) 'p) str)
+          (api_incr_top L)
+          (set! tag (luaV_finishget L t (s2v (top-at L -1)) (top-at L -1) tag))))
+    (return (novariant tag))))
+
+; The registry is never weak, so an emergency collection can't take the global table.
+(defn- getGlobalTable (L:(ptr lua_State) gt:(ptr TValue)):void
+  (luaH_getint (hvalue (ref ((G L) 'l_registry))) LUA_RIDX_GLOBALS gt))
+
+(defn lua_getglobal (L:(ptr lua_State) name:CStr):i32
+  (let (gt:(ptr TValue) (alloca TValue))
+    (getGlobalTable L gt)
+    (return (auxgetstr L gt name))))
+
+(defn lua_gettable (L:(ptr lua_State) idx:i32):i32
+  (let (tag:lu_byte 0
+        t:(ptr TValue) (index2value L idx))
+    (fastget t (s2v (top-at L -1)) (s2v (top-at L -1)) luaH_get tag)
+    (when (tagisempty tag)
+      (set! tag (luaV_finishget L t (s2v (top-at L -1)) (top-at L -1) tag)))
+    (return (novariant tag))))
+
+(defn lua_getfield (L:(ptr lua_State) idx:i32 k:CStr):i32
+  (return (auxgetstr L (index2value L idx) k)))
+
+(defn lua_geti (L:(ptr lua_State) idx:i32 n:lua_Integer):i32
+  (let (t:(ptr TValue) (index2value L idx)
+        tag:lu_byte 0)
+    (if (not (ttistable t))
+      (set! tag LUA_VNOTABLE)
+      (luaH_fastgeti (hvalue t) n (s2v ((L 'top) 'p)) tag))
+    (when (tagisempty tag)
+      (let (key:(ptr TValue) (alloca TValue))
+        (setivalue key n)
+        (set! tag (luaV_finishget L t key ((L 'top) 'p) tag))))
+    (api_incr_top L)
+    (return (novariant tag))))
+
+(defn- finishrawget (L:(ptr lua_State) tag:lu_byte):i32
+  (when (tagisempty tag)  ; an empty item isn't copied to the stack
+    (setnilvalue2s ((L 'top) 'p)))
+  (api_incr_top L)
+  (return (novariant tag)))
+
+(defn- gettable (L:(ptr lua_State) idx:i32):(ptr Table)
+  (return (hvalue (index2value L idx))))
+
+(defn lua_rawget (L:(ptr lua_State) idx:i32):i32
+  (let (t:(ptr Table) (gettable L idx)
+        tag:lu_byte (luaH_get t (s2v (top-at L -1)) (s2v (top-at L -1))))
+    (set! ((L 'top) 'p) (top-at L -1))  ; pop the key
+    (return (finishrawget L tag))))
+
+(defn lua_rawgeti (L:(ptr lua_State) idx:i32 n:lua_Integer):i32
+  (let (t:(ptr Table) (gettable L idx)
+        tag:lu_byte 0)
+    (luaH_fastgeti t n (s2v ((L 'top) 'p)) tag)
+    (return (finishrawget L tag))))
+
+(defn lua_rawgetp (L:(ptr lua_State) idx:i32 p:ptr):i32
+  (let (t:(ptr Table) (gettable L idx)
+        k:(ptr TValue) (alloca TValue))
+    (setpvalue k p)
+    (return (finishrawget L (luaH_get t k (s2v ((L 'top) 'p)))))))
+
+(defn lua_createtable (L:(ptr lua_State) narray:i32 nrec:i32):void
+  (let (t:(ptr Table) (luaH_new L))
+    (sethvalue2s L ((L 'top) 'p) t)
+    (api_incr_top L)
+    (when (or (> narray 0) (> nrec 0))
+      (luaH_resize L t (cast_uint narray) (cast_uint nrec)))
+    (luaC_checkGC L)))
+
+(defn lua_getmetatable (L:(ptr lua_State) objindex:i32):i32
+  (let (obj:(ptr TValue) (index2value L objindex)
+        mt:(ptr Table) (case (as i32 (ttype obj))
+                         LUA_TTABLE ((hvalue obj) 'metatable)
+                         LUA_TUSERDATA ((uvalue obj) 'metatable)
+                         (aref ((G L) 'mt) (ttype obj))))
+    (when (= (as ptr mt) null)
+      (return 0))
+    (sethvalue2s L ((L 'top) 'p) mt)
+    (api_incr_top L)
+    (return 1)))
+
+(defn lua_getiuservalue (L:(ptr lua_State) idx:i32 n:i32):i32
+  (let (o:(ptr TValue) (index2value L idx)
+        t:i32 LUA_TNONE)
+    (if (or (<= n 0) (> n (as i32 ((uvalue o) 'nuvalue))))
+      (setnilvalue2s ((L 'top) 'p))
+      (do (setobj2s L ((L 'top) 'p) (ref ((aref ((uvalue o) 'uv) (- n 1)) 'uv)))
+          (set! t (as i32 (ttype (s2v ((L 'top) 'p)))))))
+    (api_incr_top L)
+    (return t)))
+
+; ---- set (stack -> Lua) ----
+
+; t[k] = the value on top, for a string 'k'.
+(defn- auxsetstr (L:(ptr lua_State) t:(ptr TValue) k:CStr):void
+  (let (hres:i32 0
+        str:(ptr TString) (luaS_new L k))
+    (fastset t str (s2v (top-at L -1)) hres luaH_psetstr)
+    (if (= hres HOK)
+      (do (finishfastset L t (s2v (top-at L -1)))
+          (set! ((L 'top) 'p) (top-at L -1)))  ; pop the value
+      (do (setsvalue2s L ((L 'top) 'p) str)  ; 'str' as a TValue
+          (api_incr_top L)
+          (luaV_finishset L t (s2v (top-at L -1)) (s2v (top-at L -2)) hres)
+          (set! ((L 'top) 'p) (top-at L -2))))))  ; pop the value and the key
+
+(defn lua_setglobal (L:(ptr lua_State) name:CStr):void
+  (let (gt:(ptr TValue) (alloca TValue))
+    (getGlobalTable L gt)
+    (auxsetstr L gt name)))
+
+(defn lua_settable (L:(ptr lua_State) idx:i32):void
+  (let (t:(ptr TValue) (index2value L idx)
+        hres:i32 0)
+    (fastset t (s2v (top-at L -2)) (s2v (top-at L -1)) hres luaH_pset)
+    (if (= hres HOK)
+      (finishfastset L t (s2v (top-at L -1)))
+      (luaV_finishset L t (s2v (top-at L -2)) (s2v (top-at L -1)) hres))
+    (set! ((L 'top) 'p) (top-at L -2))))  ; pop the index and the value
+
+(defn lua_setfield (L:(ptr lua_State) idx:i32 k:CStr):void
+  (auxsetstr L (index2value L idx) k))
+
+(defn lua_seti (L:(ptr lua_State) idx:i32 n:lua_Integer):void
+  (let (t:(ptr TValue) (index2value L idx)
+        hres:i32 0)
+    (if (not (ttistable t))
+      (set! hres HNOTATABLE)
+      (luaH_fastseti (hvalue t) n (s2v (top-at L -1)) hres))
+    (if (= hres HOK)
+      (finishfastset L t (s2v (top-at L -1)))
+      (let (temp:(ptr TValue) (alloca TValue))
+        (setivalue temp n)
+        (luaV_finishset L t temp (s2v (top-at L -1)) hres)))
+    (set! ((L 'top) 'p) (top-at L -1))))  ; pop the value
+
+(defn- aux_rawset (L:(ptr lua_State) idx:i32 key:(ptr TValue) n:i32):void
+  (let (t:(ptr Table) (gettable L idx))
+    (luaH_set L t key (s2v (top-at L -1)))
+    (invalidateTMcache t)
+    (luaC_barrierback L (obj2gco t) (s2v (top-at L -1)))
+    (set! ((L 'top) 'p) (top-at L (- n)))))
+
+(defn lua_rawset (L:(ptr lua_State) idx:i32):void
+  (aux_rawset L idx (s2v (top-at L -2)) 2))
+
+(defn lua_rawsetp (L:(ptr lua_State) idx:i32 p:ptr):void
+  (let (k:(ptr TValue) (alloca TValue))
+    (setpvalue k p)
+    (aux_rawset L idx k 1)))
+
+(defn lua_rawseti (L:(ptr lua_State) idx:i32 n:lua_Integer):void
+  (let (t:(ptr Table) (gettable L idx))
+    (luaH_setint L t n (s2v (top-at L -1)))
+    (luaC_barrierback L (obj2gco t) (s2v (top-at L -1)))
+    (set! ((L 'top) 'p) (top-at L -1))))
+
+(defn lua_setmetatable (L:(ptr lua_State) objindex:i32):i32
+  (let (obj:(ptr TValue) (index2value L objindex)
+        mt:(ptr Table) (if (ttisnil (s2v (top-at L -1))) (as (ptr Table) null) (hvalue (s2v (top-at L -1)))))
+    (case (as i32 (ttype obj))
+      LUA_TTABLE
+        (do (set! ((hvalue obj) 'metatable) mt)
+            (when (!= (as ptr mt) null)
+              (luaC_objbarrier L (gcvalue obj) mt)
+              (luaC_checkfinalizer L (gcvalue obj) mt)))
+      LUA_TUSERDATA
+        (do (set! ((uvalue obj) 'metatable) mt)
+            (when (!= (as ptr mt) null)
+              (luaC_objbarrier L (uvalue obj) mt)
+              (luaC_checkfinalizer L (gcvalue obj) mt)))
+      (set! (aref ((G L) 'mt) (ttype obj)) mt))
+    (set! ((L 'top) 'p) (top-at L -1))
+    (return 1)))
+
+(defn lua_setiuservalue (L:(ptr lua_State) idx:i32 n:i32):i32
+  (let (o:(ptr TValue) (index2value L idx)
+        res:i32 0)
+    (when (and (>= n 1) (<= n (as i32 ((uvalue o) 'nuvalue))))
+      (setobj L (ref ((aref ((uvalue o) 'uv) (- n 1)) 'uv)) (s2v (top-at L -1)))
+      (luaC_barrierback L (gcvalue o) (s2v (top-at L -1)))
+      (set! res 1))
+    (set! ((L 'top) 'p) (top-at L -1))
+    (return res)))
+
+; ---- load and call ----
+
+(defn lua_callk (L:(ptr lua_State) nargs:i32 nresults:i32 ctx:lua_KContext k:lua_KFunction):void
+  (let (func:StkId (top-at L (- (+ nargs 1))))
+    (if (and (!= (unsafe/cast ptr k) null) (yieldable L))  ; a continuation to prepare?
+      (do (set! ((((L 'ci) 'u) 'c) 'k) k)
+          (set! ((((L 'ci) 'u) 'c) 'ctx) ctx)
+          (luaD_call L func nresults))
+      (luaD_callnoyield L func nresults))
+    (adjustresults L nresults)))
+
+(defstruct CallS func:StkId nresults:i32)  ; for f_call
+
+(defn- f_call (L:(ptr lua_State) ud:ptr):void
+  (let (c:(ptr CallS) (unsafe/cast (ptr CallS) ud))
+    (luaD_callnoyield L (c 'func) (c 'nresults))))
+
+(defn lua_pcallk (L:(ptr lua_State) nargs:i32 nresults:i32 errfunc:i32 ctx:lua_KContext k:lua_KFunction):i32
+  (let (c:(ptr CallS) (alloca CallS)
+        status:TStatus LUA_OK
+        func:i64 (if (= errfunc 0) 0 (savestack L (index2stack L errfunc))))
+    (set! (c 'func) (top-at L (- (+ nargs 1))))  ; the function to call
+    (if (or (= (unsafe/cast ptr k) null) (not (yieldable L)))
+      (do (set! (c 'nresults) nresults)  ; a conventional protected call
+          (set! status (luaD_pcall L f_call (as ptr c) (savestack L (c 'func)) func)))
+      ; with a continuation: 'resume' already protects the call
+      (let (ci:(ptr CallInfo) (L 'ci))
+        (set! (((ci 'u) 'c) 'k) k)
+        (set! (((ci 'u) 'c) 'ctx) ctx)
+        (set! ((ci 'u2) 'funcidx) (cast_int (savestack L (c 'func))))  ; for recovery
+        (set! (((ci 'u) 'c) 'old_errfunc) (L 'errfunc))
+        (set! (L 'errfunc) func)
+        (setoah ci (L 'allowhook))
+        (set! (ci 'callstatus) (bit-or (ci 'callstatus) CIST_YPCALL))  ; it can recover
+        (luaD_call L (c 'func) nresults)
+        (set! (ci 'callstatus) (clearbits (ci 'callstatus) CIST_YPCALL))
+        (set! (L 'errfunc) (((ci 'u) 'c) 'old_errfunc))))  ; no error if here
+    (adjustresults L nresults)
+    (return (cast_int status))))
+
+(defn lua_load (L:(ptr lua_State) reader:lua_Reader data:ptr chunkname0:CStr mode:CStr):i32
+  (let (z:(ptr ZIO) (alloca ZIO)
+        chunkname:CStr (if (= (as ptr chunkname0) null) (as CStr "?") chunkname0))
+    (luaC_checkGC L)
+    (luaZ_init L z reader data)
+    (let (status:TStatus (luaD_protectedparser L z chunkname mode))
+      (when (= status LUA_OK)
+        (let (f:(ptr LClosure) (clLvalue (s2v (top-at L -1))))
+          (when (>= (f 'nupvalues) 1)  ; the global table is its first upvalue
+            (let (gt:(ptr TValue) (alloca TValue))
+              (getGlobalTable L gt)
+              (setobj L (((aref (f 'upvals) 0) 'v) 'p) gt)
+              (luaC_barrier L (aref (f 'upvals) 0) gt)))))
+      (return (cast_int status)))))
+
+; Dumps a function through 'writer'; the stack keeps its size.
+(defn lua_dump (L:(ptr lua_State) writer:lua_Writer data:ptr strip:i32):i32
+  (let (otop:i64 (savestack L ((L 'top) 'p))
+        f:(ptr TValue) (s2v (top-at L -1))
+        status:i32 (luaU_dump L ((clLvalue f) 'p) writer data strip))
+    (set! ((L 'top) 'p) (restorestack L otop))
+    (return status)))
+
+(defn lua_status (L:(ptr lua_State)):i32
+  (return (cast_int (L 'status))))
+
+; ---- the collector ----
+
+(defn lua_gc (L:(ptr lua_State) what:i32 :varargs argp):i32
+  (let (res:i32 0
+        g:(ptr global_State) (G L))
+    (when (!= (bit-and (g 'gcstp) (bit-or GCSTPGC GCSTPCLS)) 0)  ; stopped inside?
+      (return -1))  ; then every option is invalid
+    (case what
+      LUA_GCSTOP (set! (g 'gcstp) GCSTPUSR)  ; stopped by the user
+      LUA_GCRESTART
+        (do (luaE_setdebt g 0)
+            (set! (g 'gcstp) 0))  ; the other bits are zero here
+      LUA_GCCOLLECT (luaC_fullgc L 0)
+      LUA_GCCOUNT (set! res (cast_int (bit-shr (gettotalbytes g) 10)))  ; in Kbytes
+      LUA_GCCOUNTB (set! res (cast_int (bit-and (gettotalbytes g) 0x3ff)))
+      LUA_GCSTEP
+        (let (oldstp:lu_byte (g 'gcstp)
+              n:l_mem (unsafe/cast l_mem (unsafe/va-arg argp usize))
+              newdebt:l_mem 0
+              work:i32 0)
+          (set! (g 'gcstp) 0)  ; let it run
+          (cond (<= n 0) (set! newdebt 0)  ; one basic step
+                (>= (g 'GCdebt) (- n MAX_LMEM)) (set! newdebt (- (g 'GCdebt) n))
+                true (set! newdebt (- MAX_LMEM)))  ; it would overflow
+          (luaE_setdebt g newdebt)
+          (when (<= (g 'GCdebt) 0)  ; luaC_condGC
+            (luaC_step L)
+            (set! work 1))
+          (when (and (!= work 0) (= (g 'gcstate) GCSpause))  ; the cycle's end
+            (set! res 1))
+          (set! (g 'gcstp) oldstp))
+      LUA_GCISRUNNING (set! res (if (= (g 'gcstp) 0) 1 0))
+      LUA_GCGEN
+        (do (set! res (if (= (g 'gckind) KGC_INC) LUA_GCINC LUA_GCGEN))
+            (luaC_changemode L KGC_GENMINOR))
+      LUA_GCINC
+        (do (set! res (if (= (g 'gckind) KGC_INC) LUA_GCINC LUA_GCGEN))
+            (luaC_changemode L KGC_INC))
+      LUA_GCPARAM
+        (let (param:i32 (unsafe/va-arg argp i32)
+              value:i32 (unsafe/va-arg argp i32))
+          (set! res (cast_int (luaO_applyparam (aref (g 'gcparams) param) 100)))
+          (when (>= value 0)
+            (set! (aref (g 'gcparams) param) (luaO_codeparam (cast_uint value)))))
+      (set! res -1))  ; an invalid option
+    (return res)))
+
+; ---- the rest ----
+
+(defn lua_error (L:(ptr lua_State)):i32
+  (let (errobj:(ptr TValue) (s2v (top-at L -1)))
+    (if (and (ttisshrstring errobj) (= (as ptr (tsvalue errobj)) (as ptr ((G L) 'memerrmsg))))
+      (luaM_error L)  ; the memory error's message: raise that
+      (luaG_errormsg L))
+    (return 0)))
+
+(defn lua_next (L:(ptr lua_State) idx:i32):i32
+  (let (t:(ptr Table) (gettable L idx)
+        more:i32 (luaH_next L t (top-at L -1)))
+    (if (!= more 0)
+      (api_incr_top L)
+      (set! ((L 'top) 'p) (top-at L -1)))  ; no more: pop the key
+    (return more)))
+
+(defn lua_toclose (L:(ptr lua_State) idx:i32):void
+  (luaF_newtbcupval L (index2stack L idx))
+  (set! ((L 'ci) 'callstatus) (bit-or ((L 'ci) 'callstatus) CIST_TBC)))
+
+(defn lua_concat (L:(ptr lua_State) n:i32):void
+  (if (> n 0)
+    (do (luaV_concat L n)
+        (luaC_checkGC L))
+    (do (setsvalue2s L ((L 'top) 'p) (luaS_newlstr L "" 0))  ; nothing: the empty string
+        (api_incr_top L))))
+
+(defn lua_len (L:(ptr lua_State) idx:i32):void
+  (luaV_objlen L ((L 'top) 'p) (index2value L idx))
+  (api_incr_top L))
+
+(defn lua_getallocf (L:(ptr lua_State) ud:(ptr ptr)):lua_Alloc
+  (when (!= (as ptr ud) null)
+    (set! (deref ud) ((G L) 'ud)))
+  (return ((G L) 'frealloc)))
+
+(defn lua_setallocf (L:(ptr lua_State) f:lua_Alloc ud:ptr):void
+  (set! ((G L) 'ud) ud)
+  (set! ((G L) 'frealloc) f))
+
+(defn lua_setwarnf (L:(ptr lua_State) f:lua_WarnFunction ud:ptr):void
+  (set! ((G L) 'ud_warn) ud)
+  (set! ((G L) 'warnf) f))
+
+(defn lua_warning (L:(ptr lua_State) msg:CStr tocont:i32):void
+  (luaE_warning L msg tocont))
+
+(defn lua_newuserdatauv (L:(ptr lua_State) size:usize nuvalue:i32):ptr
+  (let (u:(ptr Udata) (luaS_newudata L size (unsafe/cast ui16 nuvalue)))
+    (setuvalue L (s2v ((L 'top) 'p)) u)
+    (api_incr_top L)
+    (luaC_checkGC L)
+    (return (getudatamem u))))
+
+; ---- upvalues ----
+
+; Upvalue 'n' of closure 'fi': its name, or null when there is none; '*val'
+; and '*owner' are where it lives.
+(defn- aux_upvalue (fi:(ptr TValue) n:i32 val:(ptr (ptr TValue)) owner:(ptr (ptr GCObject))):CStr
+  (case (as i32 (ttypetag fi))
+    LUA_VCCL
+      (let (f:(ptr CClosure) (clCvalue fi))
+        (when (or (< n 1) (> n (as i32 (f 'nupvalues))))
+          (return (as CStr null)))
+        (set! (deref val) (ref (aref (f 'upvalue) (- n 1))))
+        (when (!= (as ptr owner) null)
+          (set! (deref owner) (obj2gco f)))
+        (return ""))
+    LUA_VLCL
+      (let (f:(ptr LClosure) (clLvalue fi)
+            p:(ptr Proto) (f 'p))
+        (when (or (< n 1) (> n (p 'sizeupvalues)))
+          (return (as CStr null)))
+        (set! (deref val) (((aref (f 'upvals) (- n 1)) 'v) 'p))
+        (when (!= (as ptr owner) null)
+          (set! (deref owner) (obj2gco (aref (f 'upvals) (- n 1)))))
+        (let (name:(ptr TString) ((p+ (p 'upvalues) (- n 1)) 'name))
+          (if (= (as ptr name) null)
+            (return "(no name)")
+            (return (cstr (getstr name))))))
+    (return (as CStr null))))  ; not a closure
+
+(defn lua_getupvalue (L:(ptr lua_State) funcindex:i32 n:i32):CStr
+  (let (val:(ptr (ptr TValue)) (alloca (ptr TValue))
+        name:CStr (aux_upvalue (index2value L funcindex) n val null))
+    (when (!= (as ptr name) null)
+      (setobj2s L ((L 'top) 'p) (deref val))
+      (api_incr_top L))
+    (return name)))
+
+(defn lua_setupvalue (L:(ptr lua_State) funcindex:i32 n:i32):CStr
+  (let (val:(ptr (ptr TValue)) (alloca (ptr TValue))
+        owner:(ptr (ptr GCObject)) (alloca (ptr GCObject))
+        name:CStr (aux_upvalue (index2value L funcindex) n val owner))
+    (when (!= (as ptr name) null)
+      (set! ((L 'top) 'p) (top-at L -1))
+      (setobj L (deref val) (s2v ((L 'top) 'p)))
+      (luaC_barrier L (deref owner) (deref val)))
+    (return name)))
+
+; An out-of-range 'n' points here, at a null upvalue.
+(defvar- nullup:(ptr UpVal) null)
+
+(defn- getupvalref (L:(ptr lua_State) fidx:i32 n:i32 pf:(ptr (ptr LClosure))):(ptr (ptr UpVal))
+  (let (f:(ptr LClosure) (clLvalue (index2value L fidx)))
+    (when (!= (as ptr pf) null)
+      (set! (deref pf) f))
+    (if (and (<= 1 n) (<= n ((f 'p) 'sizeupvalues)))
+      (return (ref (aref (f 'upvals) (- n 1))))
+      (return (ref nullup)))))
+
+(defn lua_upvalueid (L:(ptr lua_State) fidx:i32 n:i32):ptr
+  (let (fi:(ptr TValue) (index2value L fidx))
+    (case (as i32 (ttypetag fi))
+      LUA_VLCL (return (as ptr (deref (getupvalref L fidx n null))))
+      LUA_VCCL
+        (let (f:(ptr CClosure) (clCvalue fi))
+          (if (and (<= 1 n) (<= n (as i32 (f 'nupvalues))))
+            (return (as ptr (ref (aref (f 'upvalue) (- n 1)))))
+            (return null)))
+      (return null))))  ; a light C function has none
+
+(defn lua_upvaluejoin (L:(ptr lua_State) fidx1:i32 n1:i32 fidx2:i32 n2:i32):void
+  (let (f1:(ptr (ptr LClosure)) (alloca (ptr LClosure))
+        up1:(ptr (ptr UpVal)) (getupvalref L fidx1 n1 f1)
+        up2:(ptr (ptr UpVal)) (getupvalref L fidx2 n2 null))
+    (set! (deref up1) (deref up2))
+    (luaC_objbarrier L (deref f1) (deref up1))))

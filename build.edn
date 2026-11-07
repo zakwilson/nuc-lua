@@ -6,6 +6,5 @@
  :link-args ["-Wl,--dynamic-list=src/lua.dynlist"]
  :libs ["m" "dl"]
  :deps {luacapi {:path "capi"}}
- :c-sources ["reference/build/src/lapi.c"
-             "reference/build/src/lgc.c"
+ :c-sources ["reference/build/src/lgc.c"
              "reference/build/src/lvm.c"]}
