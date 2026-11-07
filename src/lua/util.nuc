@@ -34,6 +34,10 @@
 (defmacro cast_uchar (x) `(unsafe/cast ui8 ~x))
 (defmacro l_castS2U (x) `(unsafe/cast lua_Unsigned ~x))
 (defmacro l_castU2S (x) `(unsafe/cast lua_Integer ~x))
+(defmacro cast_st2S (x) `(unsafe/cast lua_Integer ~x))
+
+; luaconf.h's radix character of the current locale; needs "locale.h".
+(defmacro lua_getlocaledecpoint () `(deref ((localeconv) 'decimal_point)))
 
 ; errno is a macro over __errno_location(), which the header import can't read.
 (defmacro errno () `(deref (__errno_location)))

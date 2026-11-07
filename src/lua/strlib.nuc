@@ -1,0 +1,1204 @@
+; The string library: basic functions, pattern matching, format, pack/unpack.
+;
+; lstrlib.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.strlib)
+(set-ir-prefix "")
+(import-use luacapi)
+(import-use lua.util)
+(import-use "ctype.h")
+(import-use "limits.h")
+(import-use "locale.h")
+(import-use "stdio.h")
+(import-use "string.h")
+
+(defconst LUA_MAXCAPTURES 32)  ; it must fit in an unsigned char
+(defconst MAXCCALLS 200)       ; the deepest 'match' may recurse
+(defconst CAP_UNFINISHED -1)
+(defconst CAP_POSITION -2)
+(defconst SPECIALS "^$*+?.([%-")
+
+; The largest size that fits both size_t and lua_Integer.
+(defmacro MAX_SIZE () `(cast_sizet LUA_MAXINTEGER))
+
+; 'p' moved by 'n' bytes, whatever integer type 'n' is.
+(defmacro p+ (p n) `(unsafe/ptr+ ~p (unsafe/cast i64 ~n)))
+
+; A byte as C's ctype functions want it: unsigned, promoted to int.
+(defmacro uc (c) `(as i32 (cast_uchar ~c)))
+
+(defn- str_len (L:(ptr lua_State)):i32
+  (let (l:usize 0)
+    (luaL_checklstring L 1 &l)
+    (lua_pushinteger L (cast_st2S l))
+    (return 1)))
+
+; A relative initial position (negative counts back from the end), clipped to
+; [1, inf). The inverted comparison keeps '-pos' from overflowing.
+(defn- posrelatI (pos:lua_Integer len:usize):usize
+  (return (cond
+            (> pos 0) (cast_sizet pos)
+            (= pos 0) 1
+            (< pos (- 0 (cast_st2S len))) 1
+            true (+ len (cast_sizet pos) 1))))
+
+; An optional end position from 'arg', clipped to [0, len].
+(defn- getendpos (L:(ptr lua_State) arg:i32 def:lua_Integer len:usize):usize
+  (let (pos:lua_Integer (luaL_optinteger L arg def))
+    (return (cond
+              (> pos (cast_st2S len)) len
+              (>= pos 0) (cast_sizet pos)
+              (< pos (- 0 (cast_st2S len))) 0
+              true (+ len (cast_sizet pos) 1)))))
+
+(defn- str_sub (L:(ptr lua_State)):i32
+  (let (l:usize 0
+        s:(ptr i8) (bytes (luaL_checklstring L 1 &l))
+        start:usize (posrelatI (luaL_checkinteger L 2) l)
+        e:usize (getendpos L 3 -1 l))
+    (if (<= start e)
+      (lua_pushlstring L (cstr (p+ s (- start 1))) (+ (- e start) 1))
+      (lua_pushliteral L ""))
+    (return 1)))
+
+(defn- str_reverse (L:(ptr lua_State)):i32
+  (let (l:usize 0
+        b:&luaL_Buffer (alloca luaL_Buffer)
+        s:(ptr i8) (bytes (luaL_checklstring L 1 &l))
+        p:(ptr i8) (luaL_buffinitsize L b l))
+    (for (i:usize 0) (< i l) (inc! i)
+      (set! (aref p i) (aref s (- (- l i) 1))))
+    (luaL_pushresultsize b l)
+    (return 1)))
+
+(defn- str_lower (L:(ptr lua_State)):i32
+  (let (l:usize 0
+        b:&luaL_Buffer (alloca luaL_Buffer)
+        s:(ptr i8) (bytes (luaL_checklstring L 1 &l))
+        p:(ptr i8) (luaL_buffinitsize L b l))
+    (for (i:usize 0) (< i l) (inc! i)
+      (set! (aref p i) (cast_char (tolower (uc (aref s i))))))
+    (luaL_pushresultsize b l)
+    (return 1)))
+
+(defn- str_upper (L:(ptr lua_State)):i32
+  (let (l:usize 0
+        b:&luaL_Buffer (alloca luaL_Buffer)
+        s:(ptr i8) (bytes (luaL_checklstring L 1 &l))
+        p:(ptr i8) (luaL_buffinitsize L b l))
+    (for (i:usize 0) (< i l) (inc! i)
+      (set! (aref p i) (cast_char (toupper (uc (aref s i))))))
+    (luaL_pushresultsize b l)
+    (return 1)))
+
+(defn- str_rep (L:(ptr lua_State)):i32
+  (let (len:usize 0
+        lsep:usize 0
+        s:(ptr i8) (bytes (luaL_checklstring L 1 &len))
+        n:lua_Integer (luaL_checkinteger L 2)
+        sep:(ptr i8) (bytes (luaL_optlstring L 3 "" &lsep)))
+    (cond
+      (or (<= n 0) (= (bit-or len lsep) 0))
+        (lua_pushliteral L "")  ; no repetitions, or both strings empty
+      (or (> len (- (MAX_SIZE) lsep))
+          (> (cast_st2S (+ len lsep)) (/ (cast_st2S (MAX_SIZE)) n)))
+        (return (luaL_error L "resulting string too large"))
+      true
+        (let (totallen:usize (- (* (cast_sizet n) (+ len lsep)) lsep)
+              b:&luaL_Buffer (alloca luaL_Buffer)
+              p:(ptr i8) (luaL_buffinitsize L b totallen))
+          (while (> n 1)  ; the first n-1 copies, each followed by the separator
+            (dec! n)
+            (memcpy p s len)
+            (set! p (p+ p len))
+            (when (> lsep 0)  ; an empty memcpy isn't that cheap
+              (memcpy p sep lsep)
+              (set! p (p+ p lsep))))
+          (memcpy p s len)  ; the last copy, without a separator
+          (luaL_pushresultsize b totallen)))
+    (return 1)))
+
+(defn- str_byte (L:(ptr lua_State)):i32
+  (let (l:usize 0
+        s:(ptr i8) (bytes (luaL_checklstring L 1 &l))
+        pi0:lua_Integer (luaL_optinteger L 2 1)
+        posi:usize (posrelatI pi0 l)
+        pose:usize (getendpos L 3 pi0 l))
+    (when (> posi pose) (return 0))  ; an empty interval: no values
+    (when (>= (- pose posi) (cast_sizet INT_MAX))  ; arithmetic overflow?
+      (return (luaL_error L "string slice too long")))
+    (let (n:i32 (+ (cast_int (- pose posi)) 1))
+      (luaL_checkstack L n "string slice too long")
+      (for (i:i32 0) (< i n) (inc! i)
+        (lua_pushinteger L (as lua_Integer (cast_uchar (aref s (- (+ posi (cast_sizet i)) 1))))))
+      (return n))))
+
+(defn- str_char (L:(ptr lua_State)):i32
+  (let (n:i32 (lua_gettop L)
+        b:&luaL_Buffer (alloca luaL_Buffer)
+        p:(ptr i8) (luaL_buffinitsize L b (cast_sizet n)))
+    (for (i:i32 1) (<= i n) (inc! i)
+      (let (c:lua_Unsigned (l_castS2U (luaL_checkinteger L i)))
+        (luaL_argcheck L (<= c (l_castS2U UCHAR_MAX)) i "value out of range")
+        (set! (aref p (- i 1)) (cast_char c))))
+    (luaL_pushresultsize b (cast_sizet n))
+    (return 1)))
+
+; string.dump's buffer. It's started on the first write, so that the function
+; is on the top when lua_dump begins (luaL_buffinit may push).
+(defstruct str_Writer init:i32 B:luaL_Buffer)
+
+(defn- writer (L:(ptr lua_State) b:ptr size:usize ud:ptr):i32
+  (let (state:&str_Writer (unsafe/cast &str_Writer ud))
+    (when (= (state 'init) 0)
+      (set! (state 'init) 1)
+      (luaL_buffinit L &(state 'B)))
+    (if (= b null)  ; the dump is finished?
+      (do (luaL_pushresult &(state 'B))
+          (lua_replace L 1))  ; into the reserved slot
+      (luaL_addlstring &(state 'B) (cstr b) size))
+    (return 0)))
+
+(defn- str_dump (L:(ptr lua_State)):i32
+  (let (state:&str_Writer (alloca str_Writer)
+        strip:i32 (lua_toboolean L 2))
+    (luaL_argcheck L (and (= (lua_type L 1) LUA_TFUNCTION) (= (lua_iscfunction L 1) 0))
+                   1 "Lua function expected")
+    (lua_pushvalue L 1)  ; the function on the top, and slot 1 free
+    (set! (state 'init) 0)
+    (lua_dump L writer (as ptr state) strip)
+    (lua_settop L 1)  ; the result on the top
+    (return 1)))
+
+; ---- Metamethods: arithmetic on strings that convert to numbers ----
+
+(defn- tonum (L:(ptr lua_State) arg:i32):bool
+  (if (= (lua_type L arg) LUA_TNUMBER)  ; already a number?
+    (do (lua_pushvalue L arg)
+        (return true))
+    (let (len:usize 0
+          s:CStr (lua_tolstring L arg &len))
+      (return (and (!= (as ptr s) null) (= (lua_stringtonumber L s) (+ len 1)))))))
+
+; The first operand was a string or had no metamethod for this, so the second
+; operand's metamethod is the one chance left.
+(defn- trymt (L:(ptr lua_State) mtkey:CStr opname:CStr):void
+  (lua_settop L 2)  ; back to the original arguments
+  (when (or (= (lua_type L 2) LUA_TSTRING) (= (luaL_getmetafield L 2 mtkey) LUA_TNIL))
+    (luaL_error L "attempt to %s a '%s' with a '%s'" opname
+                (luaL_typename L -2) (luaL_typename L -1)))
+  (lua_insert L -3)  ; the metamethod before the arguments
+  (lua_call L 2 1))
+
+(defn- arith (L:(ptr lua_State) op:i32 mtname:CStr):i32
+  (if (and (tonum L 1) (tonum L 2))
+    (lua_arith L op)  ; the result on the top
+    (trymt L mtname (cstr (p+ (bytes mtname) 2))))
+  (return 1))
+
+(defn- arith_add (L:(ptr lua_State)):i32 (return (arith L LUA_OPADD "__add")))
+(defn- arith_sub (L:(ptr lua_State)):i32 (return (arith L LUA_OPSUB "__sub")))
+(defn- arith_mul (L:(ptr lua_State)):i32 (return (arith L LUA_OPMUL "__mul")))
+(defn- arith_mod (L:(ptr lua_State)):i32 (return (arith L LUA_OPMOD "__mod")))
+(defn- arith_pow (L:(ptr lua_State)):i32 (return (arith L LUA_OPPOW "__pow")))
+(defn- arith_div (L:(ptr lua_State)):i32 (return (arith L LUA_OPDIV "__div")))
+(defn- arith_idiv (L:(ptr lua_State)):i32 (return (arith L LUA_OPIDIV "__idiv")))
+(defn- arith_unm (L:(ptr lua_State)):i32 (return (arith L LUA_OPUNM "__unm")))
+
+; ---- Pattern matching ----
+
+; A capture's start, and its length or a CAP_* value.
+(defstruct Capture init:(ptr i8) len:i64)
+
+(defstruct MatchState
+  src_init:(ptr i8)  ; the source string
+  src_end:(ptr i8)   ; its end ('\0')
+  p_end:(ptr i8)     ; the pattern's end ('\0')
+  L:(ptr lua_State)
+  matchdepth:i32     ; the recursion left before "pattern too complex"
+  level:i32          ; the number of captures, finished or not
+  capture:(array Capture 32))
+
+(defn- check_capture (ms:&MatchState l0:i32):i32
+  (let (l:i32 (- l0 (ch \1)))
+    (when (or (< l 0) (>= l (ms 'level))
+              (= ((aref (ms 'capture) l) 'len) CAP_UNFINISHED))
+      (return (luaL_error (ms 'L) "invalid capture index %%%d" (+ l 1))))
+    (return l)))
+
+(defn- capture_to_close (ms:&MatchState):i32
+  (let (level:i32 (- (ms 'level) 1))
+    (while (>= level 0)
+      (when (= ((aref (ms 'capture) level) 'len) CAP_UNFINISHED)
+        (return level))
+      (dec! level))
+    (return (luaL_error (ms 'L) "invalid pattern capture"))))
+
+; Where the single-character class at 'p0' ends.
+(defn- classend (ms:&MatchState p0:(ptr i8)):(ptr i8)
+  (let (c:i8 (deref p0)
+        p:(ptr i8) (p+ p0 1))
+    (case c
+      (ch \%)
+        (do (when (= p (ms 'p_end))
+              (luaL_error (ms 'L) "malformed pattern (ends with '%%')"))
+            (return (p+ p 1)))
+      (ch \[)
+        (do (when (= (deref p) (ch \^)) (set! p (p+ p 1)))
+            (while true  ; look for a ']'
+              (when (= p (ms 'p_end))
+                (luaL_error (ms 'L) "malformed pattern (missing ']')"))
+              (let (cc:i8 (deref p))
+                (set! p (p+ p 1))
+                (when (and (= cc (ch \%)) (< p (ms 'p_end)))
+                  (set! p (p+ p 1))))  ; skip escapes, such as '%]'
+              (when (= (deref p) (ch \])) (break)))
+            (return (p+ p 1)))
+      (return p))))
+
+(defn- match_class (c:i32 cl:i32):i32
+  (let (res:i32 0)
+    (case (tolower cl)
+      (ch \a) (set! res (isalpha c))
+      (ch \c) (set! res (iscntrl c))
+      (ch \d) (set! res (isdigit c))
+      (ch \g) (set! res (isgraph c))
+      (ch \l) (set! res (islower c))
+      (ch \p) (set! res (ispunct c))
+      (ch \s) (set! res (isspace c))
+      (ch \u) (set! res (isupper c))
+      (ch \w) (set! res (isalnum c))
+      (ch \x) (set! res (isxdigit c))
+      (ch \z) (set! res (if (= c 0) 1 0))  ; deprecated
+      (return (if (= cl c) 1 0)))
+    (return (cond (!= (islower cl) 0) res
+                  (= res 0) 1
+                  true 0))))
+
+(defn- matchbracketclass (c:i32 p0:(ptr i8) ec:(ptr i8)):i32
+  (let (sig:i32 1
+        p:(ptr i8) p0)
+    (when (= (aref p 1) (ch \^))
+      (set! sig 0)
+      (set! p (p+ p 1)))  ; skip the '^'
+    (while true
+      (set! p (p+ p 1))
+      (when (>= p ec) (break))
+      (cond
+        (= (deref p) (ch \%))
+          (do (set! p (p+ p 1))
+              (when (!= (match_class c (uc (deref p))) 0)
+                (return sig)))
+        (and (= (aref p 1) (ch \-)) (< (p+ p 2) ec))
+          (do (set! p (p+ p 2))
+              (when (and (<= (uc (deref (p+ p -2))) c) (<= c (uc (deref p))))
+                (return sig)))
+        (= (uc (deref p)) c)
+          (return sig)))
+    (return (if (= sig 0) 1 0))))
+
+(defn- singlematch (ms:&MatchState s:(ptr i8) p:(ptr i8) ep:(ptr i8)):bool
+  (when (>= s (ms 'src_end)) (return false))
+  (let (c:i32 (uc (deref s)))
+    (return (case (deref p)
+              (ch \.) true  ; any character
+              (ch \%) (!= (match_class c (uc (aref p 1))) 0)
+              (ch \[) (!= (matchbracketclass c p (p+ ep -1)) 0)
+              (= (uc (deref p)) c)))))
+
+(defn- matchbalance (ms:&MatchState s0:(ptr i8) p:(ptr i8)):(ptr i8)
+  (when (>= p (p+ (ms 'p_end) -1))
+    (luaL_error (ms 'L) "malformed pattern (missing arguments to '%%b')"))
+  (when (!= (deref s0) (deref p)) (return null))
+  (let (b:i8 (deref p)
+        e:i8 (aref p 1)
+        cont:i32 1
+        s:(ptr i8) s0)
+    (while true
+      (set! s (p+ s 1))
+      (when (>= s (ms 'src_end)) (break))
+      (cond
+        (= (deref s) e) (when (= (dec! cont) 0) (return (p+ s 1)))
+        (= (deref s) b) (inc! cont)))
+    (return null)))  ; the string ends out of balance
+
+(defn- max_expand (ms:&MatchState s:(ptr i8) p:(ptr i8) ep:(ptr i8)):(ptr i8)
+  (let (i:i64 0)  ; the most repetitions of the item
+    (while (singlematch ms (p+ s i) p ep) (inc! i))
+    (while (>= i 0)  ; try the rest of the pattern from the longest
+      (let (res:(ptr i8) (do_match ms (p+ s i) (p+ ep 1)))
+        (when (!= res null) (return res))
+        (dec! i)))
+    (return null)))
+
+(defn- min_expand (ms:&MatchState s0:(ptr i8) p:(ptr i8) ep:(ptr i8)):(ptr i8)
+  (let (s:(ptr i8) s0)
+    (while true
+      (let (res:(ptr i8) (do_match ms s (p+ ep 1)))
+        (cond
+          (!= res null) (return res)
+          (singlematch ms s p ep) (set! s (p+ s 1))  ; one more repetition
+          true (return null))))
+    (return null)))
+
+(defn- start_capture (ms:&MatchState s:(ptr i8) p:(ptr i8) what:i64):(ptr i8)
+  (let (level:i32 (ms 'level))
+    (when (>= level LUA_MAXCAPTURES) (luaL_error (ms 'L) "too many captures"))
+    (set! ((aref (ms 'capture) level) 'init) s)
+    (set! ((aref (ms 'capture) level) 'len) what)
+    (set! (ms 'level) (+ level 1))
+    (let (res:(ptr i8) (do_match ms s p))
+      (when (= res null)  ; undo the capture
+        (set! (ms 'level) (- (ms 'level) 1)))
+      (return res))))
+
+(defn- end_capture (ms:&MatchState s:(ptr i8) p:(ptr i8)):(ptr i8)
+  (let (l:i32 (capture_to_close ms))
+    (set! ((aref (ms 'capture) l) 'len) (byte-diff s ((aref (ms 'capture) l) 'init)))
+    (let (res:(ptr i8) (do_match ms s p))
+      (when (= res null)  ; undo the capture
+        (set! ((aref (ms 'capture) l) 'len) CAP_UNFINISHED))
+      (return res))))
+
+(defn- match_capture (ms:&MatchState s:(ptr i8) l0:i32):(ptr i8)
+  (let (l:i32 (check_capture ms l0)
+        len:usize (cast_sizet ((aref (ms 'capture) l) 'len)))
+    (if (and (>= (cast_sizet (byte-diff (ms 'src_end) s)) len)
+             (= (memcmp ((aref (ms 'capture) l) 'init) s len) 0))
+      (return (p+ s len))
+      (return null))))
+
+; C's 'match'. Its 'goto init' is the loop's `continue`, a tail call made a jump;
+; 'goto dflt' sets 'dflt'.
+(defn- do_match (ms:&MatchState s0:(ptr i8) p0:(ptr i8)):(ptr i8)
+  (let (s:(ptr i8) s0
+        p:(ptr i8) p0
+        depth:i32 (ms 'matchdepth))
+    (set! (ms 'matchdepth) (- depth 1))
+    (when (= depth 0) (luaL_error (ms 'L) "pattern too complex"))
+    (while (!= p (ms 'p_end))  ; not the end of the pattern?
+      (let (dflt:bool false)
+        (case (deref p)
+          (ch \()  ; a capture starts
+            (set! s (if (= (aref p 1) (ch \)))  ; a position capture?
+                      (start_capture ms s (p+ p 2) CAP_POSITION)
+                      (start_capture ms s (p+ p 1) CAP_UNFINISHED)))
+          (ch \))  ; a capture ends
+            (set! s (end_capture ms s (p+ p 1)))
+          (ch \$)
+            (if (!= (p+ p 1) (ms 'p_end))  ; not the pattern's last character?
+              (set! dflt true)
+              (set! s (if (= s (ms 'src_end)) s null)))  ; the string's end?
+          (ch \%)  ; an escape that isn't a class with a suffix
+            (let (c1:i8 (aref p 1))
+              (cond
+                (= c1 (ch \b))  ; a balanced string?
+                  (do (set! s (matchbalance ms s (p+ p 2)))
+                      (when (!= s null)
+                        (set! p (p+ p 4))
+                        (continue)))
+                (= c1 (ch \f))  ; a frontier?
+                  (do (set! p (p+ p 2))
+                      (when (!= (deref p) (ch \[))
+                        (luaL_error (ms 'L) "missing '[' after '%%f' in pattern"))
+                      (let (ep:(ptr i8) (classend ms p)  ; what follows
+                            previous:i8 (if (= s (ms 'src_init)) 0 (deref (p+ s -1))))
+                        (when (and (= (matchbracketclass (uc previous) p (p+ ep -1)) 0)
+                                   (!= (matchbracketclass (uc (deref s)) p (p+ ep -1)) 0))
+                          (set! p ep)
+                          (continue))
+                        (set! s null)))  ; no match
+                (!= (isdigit (uc c1)) 0)  ; a back reference, %0-%9?
+                  (do (set! s (match_capture ms s (uc c1)))
+                      (when (!= s null)
+                        (set! p (p+ p 2))
+                        (continue)))
+                true (set! dflt true)))
+          (set! dflt true))
+        (when dflt  ; a class and an optional suffix
+          (let (ep:(ptr i8) (classend ms p))  ; the suffix
+            (if (not (singlematch ms s p ep))  ; not even one match?
+              (if (or (= (deref ep) (ch \*)) (= (deref ep) (ch \?)) (= (deref ep) (ch \-)))
+                (do (set! p (p+ ep 1))  ; the empty match is accepted
+                    (continue))
+                (set! s null))  ; '+' or no suffix: fail
+              (case (deref ep)  ; one match: the suffix decides
+                (ch \?)
+                  (let (res:(ptr i8) (do_match ms (p+ s 1) (p+ ep 1)))
+                    (if (!= res null)
+                      (set! s res)
+                      (do (set! p (p+ ep 1))
+                          (continue))))
+                (ch \+) (set! s (max_expand ms (p+ s 1) p ep))  ; one match done
+                (ch \*) (set! s (max_expand ms s p ep))
+                (ch \-) (set! s (min_expand ms s p ep))
+                (do (set! s (p+ s 1))  ; no suffix
+                    (set! p ep)
+                    (continue))))))
+        (break)))
+    (set! (ms 'matchdepth) (+ (ms 'matchdepth) 1))
+    (return s)))
+
+(defn- lmemfind (s1_:(ptr i8) l1_:usize s2:(ptr i8) l2_:usize):(ptr i8)
+  (when (= l2_ 0) (return s1_))  ; the empty string is everywhere
+  (when (> l2_ l1_) (return null))  ; keeps 'l1' from going negative
+  (let (s1:(ptr i8) s1_
+        l2:usize (- l2_ 1)  ; memchr checks the first byte
+        l1:usize (- l1_ (- l2_ 1))  ; 's2' can't start after that
+        init:(ptr i8) null)
+    (while (> l1 0)
+      (set! init (as (ptr i8) (memchr s1 (as i32 (deref s2)) l1)))
+      (when (= init null) (break))
+      (set! init (p+ init 1))  ; the first byte is already checked
+      (if (= (memcmp init (p+ s2 1) l2) 0)
+        (return (p+ init -1))
+        (do (set! l1 (- l1 (cast_sizet (byte-diff init s1))))
+            (set! s1 init))))
+    (return null)))
+
+; The i-th capture: a string's length, with its start in 'cap', or CAP_POSITION
+; with the position pushed. With no captures, capture 0 is the whole match.
+(defn- get_onecapture (ms:&MatchState i:i32 s:(ptr i8) e:(ptr i8) cap:(ptr (ptr i8))):i64
+  (if (>= i (ms 'level))
+    (do (when (!= i 0)
+          (luaL_error (ms 'L) "invalid capture index %%%d" (+ i 1)))
+        (set! (deref cap) s)
+        (return (byte-diff e s)))
+    (let (capl:i64 ((aref (ms 'capture) i) 'len))
+      (set! (deref cap) ((aref (ms 'capture) i) 'init))
+      (cond
+        (= capl CAP_UNFINISHED) (luaL_error (ms 'L) "unfinished capture")
+        (= capl CAP_POSITION)
+          (lua_pushinteger (ms 'L)
+            (+ (byte-diff ((aref (ms 'capture) i) 'init) (ms 'src_init)) 1)))
+      (return capl))))
+
+(defn- push_onecapture (ms:&MatchState i:i32 s:(ptr i8) e:(ptr i8)):void
+  (let (cap:(ptr i8) null
+        l:i64 (get_onecapture ms i s e &cap))
+    (when (!= l CAP_POSITION)  ; else the position is already pushed
+      (lua_pushlstring (ms 'L) (cstr cap) (cast_sizet l)))))
+
+(defn- push_captures (ms:&MatchState s:(ptr i8) e:(ptr i8)):i32
+  (let (nlevels:i32 (if (and (= (ms 'level) 0) (!= s null)) 1 (ms 'level)))
+    (luaL_checkstack (ms 'L) nlevels "too many captures")
+    (for (i:i32 0) (< i nlevels) (inc! i)
+      (push_onecapture ms i s e))
+    (return nlevels)))
+
+; Whether the pattern has no special characters, past any '\0' in it too.
+(defn- nospecials (p:(ptr i8) l:usize):bool
+  (let (upto:usize 0)
+    (while true
+      (when (!= (strpbrk (cstr (p+ p upto)) SPECIALS) null)
+        (return false))
+      (set! upto (+ upto (strlen (cstr (p+ p upto))) 1))
+      (when (> upto l) (break)))
+    (return true)))
+
+; The fields that stay the same across matches.
+(defn- prepstate (ms:&MatchState L:(ptr lua_State) s:(ptr i8) ls:usize p:(ptr i8) lp:usize):void
+  (set! (ms 'L) L)
+  (set! (ms 'src_init) s)
+  (set! (ms 'src_end) (p+ s ls))
+  (set! (ms 'p_end) (p+ p lp)))
+
+; The fields each match changes.
+(defn- reprepstate (ms:&MatchState):void
+  (set! (ms 'matchdepth) MAXCCALLS)
+  (set! (ms 'level) 0))
+
+(defn- str_find_aux (L:(ptr lua_State) find:bool):i32
+  (let (ls:usize 0
+        lp:usize 0
+        s:(ptr i8) (bytes (luaL_checklstring L 1 &ls))
+        p:(ptr i8) (bytes (luaL_checklstring L 2 &lp))
+        init:usize (- (posrelatI (luaL_optinteger L 3 1) ls) 1))
+    (when (> init ls)  ; it starts after the string's end?
+      (luaL_pushfail L)
+      (return 1))
+    (if (and find (or (!= (lua_toboolean L 4) 0) (nospecials p lp)))
+      (let (s2:(ptr i8) (lmemfind (p+ s init) (- ls init) p lp))  ; a plain search
+        (when (!= s2 null)
+          (lua_pushinteger L (+ (byte-diff s2 s) 1))
+          (lua_pushinteger L (cast_st2S (+ (cast_sizet (byte-diff s2 s)) lp)))
+          (return 2)))
+      (let (ms:&MatchState (alloca MatchState)
+            s1:(ptr i8) (p+ s init)
+            anchor:bool (= (deref p) (ch \^)))
+        (when anchor  ; skip the anchor
+          (set! p (p+ p 1))
+          (set! lp (- lp 1)))
+        (prepstate ms L s ls p lp)
+        (while true
+          (reprepstate ms)
+          (let (res:(ptr i8) (do_match ms s1 p))
+            (when (!= res null)
+              (if find
+                (do (lua_pushinteger L (+ (byte-diff s1 s) 1))  ; the start
+                    (lua_pushinteger L (byte-diff res s))  ; the end
+                    (return (+ (push_captures ms null null) 2)))
+                (return (push_captures ms s1 res)))))
+          (let (prev:(ptr i8) s1)
+            (set! s1 (p+ s1 1))
+            (when (or (>= prev (ms 'src_end)) anchor) (break))))))
+    (luaL_pushfail L)  ; not found
+    (return 1)))
+
+(defn- str_find (L:(ptr lua_State)):i32 (return (str_find_aux L true)))
+(defn- str_match (L:(ptr lua_State)):i32 (return (str_find_aux L false)))
+
+; gmatch's state, in the closure's third upvalue.
+(defstruct GMatchState
+  src:(ptr i8)        ; the current position
+  p:(ptr i8)          ; the pattern
+  lastmatch:(ptr i8)  ; the end of the last match
+  ms:MatchState)
+
+(defn- gmatch_aux (L:(ptr lua_State)):i32
+  (let (gm:&GMatchState (unsafe/cast &GMatchState (lua_touserdata L (lua_upvalueindex 3)))
+        ms:&MatchState &(gm 'ms)
+        src:(ptr i8) (gm 'src))
+    (set! (ms 'L) L)
+    (while (<= src (ms 'src_end))
+      (reprepstate ms)
+      (let (e:(ptr i8) (do_match ms src (gm 'p)))
+        (when (and (!= e null) (!= e (gm 'lastmatch)))
+          (set! (gm 'src) e)
+          (set! (gm 'lastmatch) e)
+          (return (push_captures ms src e))))
+      (set! src (p+ src 1)))
+    (return 0)))  ; not found
+
+(defn- gmatch (L:(ptr lua_State)):i32
+  (let (ls:usize 0
+        lp:usize 0
+        s:(ptr i8) (bytes (luaL_checklstring L 1 &ls))
+        p:(ptr i8) (bytes (luaL_checklstring L 2 &lp))
+        init:usize (- (posrelatI (luaL_optinteger L 3 1) ls) 1))
+    (lua_settop L 2)  ; the strings stay in the closure, safe from collection
+    (let (gm:&GMatchState (unsafe/cast &GMatchState (lua_newuserdatauv L (sizeof GMatchState) 0)))
+      (when (> init ls)  ; it starts after the string's end?
+        (set! init (+ ls 1)))  ; so that 's + init' can't overflow
+      (prepstate &(gm 'ms) L s ls p lp)
+      (set! (gm 'src) (p+ s init))
+      (set! (gm 'p) p)
+      (set! (gm 'lastmatch) null)
+      (lua_pushcclosure L gmatch_aux 3)
+      (return 1))))
+
+(defn- add_s (ms:&MatchState b:&luaL_Buffer s:(ptr i8) e:(ptr i8)):void
+  (let (L:(ptr lua_State) (ms 'L)
+        l:usize 0
+        news:(ptr i8) (bytes (lua_tolstring L 3 &l))
+        p:(ptr i8) null)
+    (while true
+      (set! p (as (ptr i8) (memchr news (ch \%) l)))
+      (when (= p null) (break))
+      (luaL_addlstring b (cstr news) (cast_sizet (byte-diff p news)))
+      (set! p (p+ p 1))  ; skip the '%'
+      (cond
+        (= (deref p) (ch \%)) (luaL_addchar b (deref p))  ; '%%'
+        (= (deref p) (ch \0))  ; '%0'
+          (luaL_addlstring b (cstr s) (cast_sizet (byte-diff e s)))
+        (!= (isdigit (uc (deref p))) 0)  ; '%n'
+          (let (cap:(ptr i8) null
+                resl:i64 (get_onecapture ms (- (as i32 (deref p)) (ch \1)) s e &cap))
+            (if (= resl CAP_POSITION)
+              (luaL_addvalue b)  ; the position, already pushed
+              (luaL_addlstring b (cstr cap) (cast_sizet resl))))
+        true (luaL_error L "invalid use of '%c' in replacement string" (ch \%)))
+      (set! l (- l (cast_sizet (byte-diff (p+ p 1) news))))
+      (set! news (p+ p 1)))
+    (luaL_addlstring b (cstr news) l)))
+
+; Adds the replacement to 'b', and says whether the subject changed: a call or
+; an index giving nil or false keeps the original text.
+(defn- add_value (ms:&MatchState b:&luaL_Buffer s:(ptr i8) e:(ptr i8) tr:i32):bool
+  (let (L:(ptr lua_State) (ms 'L))
+    (cond
+      (= tr LUA_TFUNCTION)
+        (do (lua_pushvalue L 3)
+            (lua_call L (push_captures ms s e) 1))  ; the captures as arguments
+      (= tr LUA_TTABLE)
+        (do (push_onecapture ms 0 s e)  ; the first capture is the key
+            (lua_gettable L 3))
+      true  ; a number or a string
+        (do (add_s ms b s e)
+            (return true)))
+    (cond
+      (= (lua_toboolean L -1) 0)  ; nil or false?
+        (do (lua_pop L 1)
+            (luaL_addlstring b (cstr s) (cast_sizet (byte-diff e s)))  ; the original text
+            (return false))
+      (= (lua_isstring L -1) 0)
+        (do (luaL_error L "invalid replacement value (a %s)" (luaL_typename L -1))
+            (return false))
+      true
+        (do (luaL_addvalue b)
+            (return true)))))
+
+(defn- str_gsub (L:(ptr lua_State)):i32
+  (let (srcl:usize 0
+        lp:usize 0
+        src:(ptr i8) (bytes (luaL_checklstring L 1 &srcl))  ; the subject
+        p:(ptr i8) (bytes (luaL_checklstring L 2 &lp))  ; the pattern
+        lastmatch:(ptr i8) null  ; the end of the last match
+        tr:i32 (lua_type L 3)  ; the replacement's type
+        max_s:lua_Integer (luaL_optinteger L 4 (+ (cast_st2S srcl) 1))
+        anchor:bool (= (deref p) (ch \^))
+        n:lua_Integer 0  ; replacements made
+        changed:bool false
+        ms:&MatchState (alloca MatchState)
+        b:&luaL_Buffer (alloca luaL_Buffer))
+    (luaL_argexpected L (or (= tr LUA_TNUMBER) (= tr LUA_TSTRING)
+                            (= tr LUA_TFUNCTION) (= tr LUA_TTABLE))
+                      3 "string/function/table")
+    (luaL_buffinit L b)
+    (when anchor  ; skip the anchor
+      (set! p (p+ p 1))
+      (set! lp (- lp 1)))
+    (prepstate ms L src srcl p lp)
+    (while (< n max_s)
+      (reprepstate ms)
+      (let (e:(ptr i8) (do_match ms src p))
+        (cond
+          (and (!= e null) (!= e lastmatch))  ; a match?
+            (do (inc! n)
+                (set! changed (or (add_value ms b src e tr) changed))
+                (set! src e)
+                (set! lastmatch e))
+          (< src (ms 'src_end))  ; else copy one character
+            (do (luaL_addchar b (deref src))
+                (set! src (p+ src 1)))
+          true (break)))  ; the subject's end
+      (when anchor (break)))
+    (if (not changed)
+      (lua_pushvalue L 1)  ; the original string
+      (do (luaL_addlstring b (cstr src) (cast_sizet (byte-diff (ms 'src_end) src)))
+          (luaL_pushresult b)))
+    (lua_pushinteger L n)
+    (return 2)))
+
+; ---- string.format ----
+
+; '%f' items: format('%.99f', -maxfloat) is 99 + 3 + 309 bytes, so
+; 110 + DBL_MAX_10_EXP (308).
+(defconst MAX_ITEMF 418)
+; Every other item, as floats with exponents fit 99 significant digits.
+(defconst MAX_ITEM 120)
+; A conversion specification such as "%-099.99d", with room for a modifier.
+(defconst MAX_FORMAT 32)
+
+(defconst L_FMTFLAGSF "-+#0 ")  ; a, A, e, E, f, F, g and G
+(defconst L_FMTFLAGSX "-#0")    ; o, x and X
+(defconst L_FMTFLAGSI "-+0 ")   ; d and i
+(defconst L_FMTFLAGSU "-0")     ; u
+(defconst L_FMTFLAGSC "-")      ; c, p and s
+
+(defn- addquoted (b:&luaL_Buffer s0:(ptr i8) len0:usize):void
+  (let (s:(ptr i8) s0
+        len:usize len0
+        buff:(ptr i8) (alloca i8 10))
+    (luaL_addchar b (ch \"))
+    (while (> len 0)
+      (dec! len)
+      (cond
+        (or (= (deref s) (ch \")) (= (deref s) (ch \\)) (= (deref s) 10))
+          (do (luaL_addchar b (ch \\))
+              (luaL_addchar b (deref s)))
+        (!= (iscntrl (uc (deref s))) 0)
+          (do (if (= (isdigit (uc (aref s 1))) 0)
+                (snprintf buff 10 "\\%d" (uc (deref s)))
+                (snprintf buff 10 "\\%03d" (uc (deref s))))
+              (luaL_addstring b (cstr buff)))
+        true (luaL_addchar b (deref s)))
+      (set! s (p+ s 1)))
+    (luaL_addchar b (ch \"))))
+
+; A float that reads back exactly: hexadecimal, with inf, -inf and NaN (which
+; has no numeral) spelled out.
+(defn- quotefloat (L:(ptr lua_State) buff:(ptr i8) n:lua_Number):i32
+  (let (s:CStr (cond (= n +inf.0) "1e9999"
+                     (= n -inf.0) "-1e9999"
+                     (!= n n) "(0/0)"
+                     true (as CStr null)))
+    (when (= (as ptr s) null)
+      (let (nb:i32 (snprintf buff MAX_ITEM "%a" n))
+        (when (= (memchr buff (ch \.) (cast_sizet nb)) null)  ; no dot?
+          (let (point:i8 (lua_getlocaledecpoint)  ; then the locale's point
+                ppoint:(ptr i8) (as (ptr i8) (memchr buff (as i32 point) (cast_sizet nb))))
+            (when (!= ppoint null)
+              (set! (deref ppoint) (ch \.)))))
+        (return nb)))
+    (return (snprintf buff MAX_ITEM "%s" s))))
+
+(defn- addliteral (L:(ptr lua_State) b:&luaL_Buffer arg:i32):void
+  (let (t:i32 (lua_type L arg))
+    (cond
+      (= t LUA_TSTRING)
+        (let (len:usize 0
+              s:(ptr i8) (bytes (lua_tolstring L arg &len)))
+          (addquoted b s len))
+      (= t LUA_TNUMBER)
+        (let (buff:(ptr i8) (luaL_prepbuffsize b MAX_ITEM)
+              nb:i32 0)
+          (if (= (lua_isinteger L arg) 0)  ; a float?
+            (set! nb (quotefloat L buff (lua_tonumber L arg)))
+            (let (n:lua_Integer (lua_tointeger L arg))
+              (set! nb (if (= n LUA_MININTEGER)  ; it has no decimal numeral
+                         (snprintf buff MAX_ITEM "0x%llx" n)
+                         (snprintf buff MAX_ITEM "%lld" n)))))
+          (luaL_addsize b (cast_sizet nb)))
+      (or (= t LUA_TNIL) (= t LUA_TBOOLEAN))
+        (do (luaL_tolstring L arg null)
+            (luaL_addvalue b))
+      true (luaL_argerror L arg "value has no literal form"))))
+
+(defn- get2digits (s:(ptr i8)):(ptr i8)
+  (when (= (isdigit (uc (deref s))) 0) (return s))
+  (let (t:(ptr i8) (p+ s 1))
+    (return (if (!= (isdigit (uc (deref t))) 0) (p+ t 1) t))))  ; two digits at most
+
+; Whether the specification in 'form' (from '%' to its conversion) takes only
+; 'flags', a width, and a precision when 'precision' says so.
+(defn- checkformat (L:(ptr lua_State) form:(ptr i8) flags:CStr precision:bool):void
+  (let (spec:(ptr i8) (p+ form 1))  ; skip the '%'
+    (set! spec (p+ spec (strspn (cstr spec) flags)))
+    (when (!= (deref spec) (ch \0))  ; a width can't start with '0'
+      (set! spec (get2digits spec))
+      (when (and (= (deref spec) (ch \.)) precision)
+        (set! spec (get2digits (p+ spec 1)))))
+    (when (= (isalpha (uc (deref spec))) 0)  ; not at the end?
+      (luaL_error L "invalid conversion specification: '%s'" form))))
+
+; Copies a specification into 'form', and returns where its last character is.
+(defn- getformat (L:(ptr lua_State) strfrmt:(ptr i8) form:(ptr i8)):(ptr i8)
+  ; the flags, width and precision ('0' counts as a flag), and the conversion
+  (let (len:usize (+ (strspn (cstr strfrmt) "-+#0 123456789.") 1))
+    (when (>= len (- MAX_FORMAT 10))  ; room for '%', '\0' and a modifier
+      (luaL_error L "invalid format (too long)"))
+    (set! (deref form) (ch \%))
+    (memcpy (p+ form 1) strfrmt len)
+    (set! (aref form (+ len 1)) 0)
+    (return (p+ strfrmt (- len 1)))))
+
+; Puts the length modifier 'lenmod' before the conversion.
+(defn- addlenmod (form:(ptr i8) lenmod:CStr):void
+  (let (l:usize (strlen (cstr form))
+        lm:usize (strlen lenmod)
+        spec:i8 (aref form (- l 1)))
+    (strcpy (p+ form (- l 1)) lenmod)
+    (set! (aref form (- (+ l lm) 1)) spec)
+    (set! (aref form (+ l lm)) 0)))
+
+(defn- str_format (L:(ptr lua_State)):i32
+  (let (top:i32 (lua_gettop L)
+        arg:i32 1
+        sfl:usize 0
+        strfrmt:(ptr i8) (bytes (luaL_checklstring L arg &sfl))
+        strfrmt_end:(ptr i8) (p+ strfrmt sfl)
+        form:(ptr i8) (alloca i8 MAX_FORMAT)  ; the item's specification
+        b:&luaL_Buffer (alloca luaL_Buffer))
+    (luaL_buffinit L b)
+    (while (< strfrmt strfrmt_end)
+      (if (!= (deref strfrmt) (ch \%))
+        (do (luaL_addchar b (deref strfrmt))
+            (set! strfrmt (p+ strfrmt 1)))
+        (do (set! strfrmt (p+ strfrmt 1))
+            (if (= (deref strfrmt) (ch \%))  ; '%%'
+              (do (luaL_addchar b (deref strfrmt))
+                  (set! strfrmt (p+ strfrmt 1)))
+              (let (maxitem:usize MAX_ITEM  ; the most the item may produce
+                    buff:(ptr i8) (luaL_prepbuffsize b MAX_ITEM)  ; where it goes
+                    nb:i32 0)  ; its length
+                (when (> (inc! arg) top)
+                  (return (luaL_argerror L arg "no value")))
+                (set! strfrmt (getformat L strfrmt form))
+                (let (conv:i8 (deref strfrmt))
+                  (set! strfrmt (p+ strfrmt 1))
+                  (case conv
+                    (ch \c)
+                      (do (checkformat L form L_FMTFLAGSC false)
+                          (set! nb (snprintf buff maxitem (cstr form)
+                                             (cast_int (luaL_checkinteger L arg)))))
+                    (:or (ch \d) (ch \i) (ch \u) (ch \o) (ch \x) (ch \X))
+                      (let (n:lua_Integer (luaL_checkinteger L arg))
+                        (checkformat L form
+                                     (case conv
+                                       (:or (ch \d) (ch \i)) L_FMTFLAGSI
+                                       (ch \u) L_FMTFLAGSU
+                                       L_FMTFLAGSX)
+                                     true)
+                        (addlenmod form "ll")
+                        (set! nb (snprintf buff maxitem (cstr form) n)))
+                    (:or (ch \a) (ch \A))  ; luaconf's lua_number2strx is C99's '%a'
+                      (do (checkformat L form L_FMTFLAGSF true)
+                          (addlenmod form "")
+                          (set! nb (snprintf buff maxitem (cstr form) (luaL_checknumber L arg))))
+                    (:or (ch \f) (ch \e) (ch \E) (ch \g) (ch \G))
+                      (do (when (= conv (ch \f))  ; '%f' wants more room
+                            (set! maxitem MAX_ITEMF)
+                            (set! buff (luaL_prepbuffsize b MAX_ITEMF)))
+                          (let (n:lua_Number (luaL_checknumber L arg))
+                            (checkformat L form L_FMTFLAGSF true)
+                            (addlenmod form "")
+                            (set! nb (snprintf buff maxitem (cstr form) n))))
+                    (ch \p)
+                      (let (p:ptr (lua_topointer L arg))
+                        (checkformat L form L_FMTFLAGSC false)
+                        (when (= p null)  ; printf isn't given a null
+                          (set! p (as ptr "(null)"))
+                          (set! (aref form (- (strlen (cstr form)) 1)) (ch \s)))
+                        (set! nb (snprintf buff maxitem (cstr form) p)))
+                    (ch \q)
+                      (do (when (!= (aref form 2) 0)  ; modifiers?
+                            (return (luaL_error L "specifier '%%q' cannot have modifiers")))
+                          (addliteral L b arg))
+                    (ch \s)
+                      (let (l:usize 0
+                            s:CStr (luaL_tolstring L arg &l))
+                        (if (= (aref form 2) 0)  ; no modifiers?
+                          (luaL_addvalue b)  ; the whole string
+                          (do (luaL_argcheck L (= l (strlen s)) arg "string contains zeros")
+                              (checkformat L form L_FMTFLAGSC true)
+                              (if (and (= (strchr (cstr form) (ch \.)) null) (>= l 100))
+                                (luaL_addvalue b)  ; too long to format, and no precision
+                                (do (set! nb (snprintf buff maxitem (cstr form) s))
+                                    (lua_pop L 1))))))  ; luaL_tolstring's result
+                    (return (luaL_error L "invalid conversion '%s' to 'format'" form))))
+                (luaL_addsize b (cast_sizet nb)))))))
+    (luaL_pushresult b)
+    (return 1)))
+
+; ---- string.pack, string.unpack, string.packsize ----
+
+(defconst MAXINTSIZE 16)  ; the widest integer packed
+(defconst NB 8)           ; bits in a char
+(defconst MC 255)         ; a char's mask
+(defconst SZINT 8)        ; sizeof(lua_Integer)
+; offsetof(struct cD, u) for luaconf's LUAI_MAXALIGN, as there's no offsetof
+; (ISSUE-010): its widest member is 8 bytes.
+(defconst MAXALIGN 8)
+
+(defstruct Header L:(ptr lua_State) islittle:i32 maxalign:ui32)
+
+; The options (KOption).
+(defconst Kint 0)        ; signed integers
+(defconst Kuint 1)       ; unsigned integers
+(defconst Kfloat 2)      ; C floats
+(defconst Knumber 3)     ; Lua floats
+(defconst Kdouble 4)     ; C doubles
+(defconst Kchar 5)       ; fixed-length strings
+(defconst Kstring 6)     ; strings with a length prefix
+(defconst Kzstr 7)       ; zero-terminated strings
+(defconst Kpadding 8)
+(defconst Kpaddalign 9)  ; padding to an alignment
+(defconst Knop 10)       ; configuration or spaces
+
+; Whether the machine is little endian (C reads a union's first byte).
+(defn- nativelittle ():i32
+  (let (d:i32 1)
+    (return (as i32 (deref (as (ptr i8) (as ptr &d)))))))
+
+(defn- digit (c:i32):bool
+  (return (and (<= (ch \0) c) (<= c (ch \9)))))
+
+; A numeral read from 'fmt', or 'df' if there is none.
+(defn- getnum (fmt:(ptr (ptr i8)) df:usize):usize
+  (when (not (digit (as i32 (deref (deref fmt))))) (return df))
+  (let (a:usize 0)
+    (while true
+      (set! a (+ (* a 10) (cast_sizet (- (as i32 (deref (deref fmt))) (ch \0)))))
+      (set! (deref fmt) (p+ (deref fmt) 1))
+      (when (not (and (digit (as i32 (deref (deref fmt))))
+                      (<= a (/ (- (MAX_SIZE) 9) 10))))
+        (break)))
+    (return a)))
+
+; As getnum, with an error if it's outside an integer's sizes.
+(defn- getnumlimit (h:&Header fmt:(ptr (ptr i8)) df:usize):ui32
+  (let (sz:usize (getnum fmt df))
+    (when (>= (- sz 1) MAXINTSIZE)
+      (return (cast_uint (luaL_error (h 'L) "integral size (%d) out of limits [1,%d]"
+                                     (cast_int sz) MAXINTSIZE))))
+    (return (cast_uint sz))))
+
+(defn- initheader (L:(ptr lua_State) h:&Header):void
+  (set! (h 'L) L)
+  (set! (h 'islittle) (nativelittle))
+  (set! (h 'maxalign) 1))
+
+; Reads and classifies the next option, with its size in 'size'.
+(defn- getoption (h:&Header fmt:(ptr (ptr i8)) size:(ptr usize)):i32
+  (let (opt:i32 (as i32 (deref (deref fmt))))
+    (set! (deref fmt) (p+ (deref fmt) 1))
+    (set! (deref size) 0)
+    (case opt
+      (ch \b) (do (set! (deref size) (sizeof i8)) (return Kint))
+      (ch \B) (do (set! (deref size) (sizeof i8)) (return Kuint))
+      (ch \h) (do (set! (deref size) (sizeof i16)) (return Kint))
+      (ch \H) (do (set! (deref size) (sizeof i16)) (return Kuint))
+      (ch \l) (do (set! (deref size) (sizeof i64)) (return Kint))  ; a long
+      (ch \L) (do (set! (deref size) (sizeof i64)) (return Kuint))
+      (ch \j) (do (set! (deref size) (sizeof lua_Integer)) (return Kint))
+      (ch \J) (do (set! (deref size) (sizeof lua_Integer)) (return Kuint))
+      (ch \T) (do (set! (deref size) (sizeof usize)) (return Kuint))
+      (ch \f) (do (set! (deref size) (sizeof f32)) (return Kfloat))
+      (ch \n) (do (set! (deref size) (sizeof lua_Number)) (return Knumber))
+      (ch \d) (do (set! (deref size) (sizeof f64)) (return Kdouble))
+      (ch \i) (do (set! (deref size) (as usize (getnumlimit h fmt (sizeof i32)))) (return Kint))
+      (ch \I) (do (set! (deref size) (as usize (getnumlimit h fmt (sizeof i32)))) (return Kuint))
+      (ch \s) (do (set! (deref size) (as usize (getnumlimit h fmt (sizeof usize)))) (return Kstring))
+      (ch \c)
+        (do (set! (deref size) (getnum fmt (cast_sizet -1)))
+            (when (= (deref size) (cast_sizet -1))
+              (luaL_error (h 'L) "missing size for format option 'c'"))
+            (return Kchar))
+      (ch \z) (return Kzstr)
+      (ch \x) (do (set! (deref size) 1) (return Kpadding))
+      (ch \X) (return Kpaddalign)
+      32 (do)  ; ' '
+      (ch \<) (set! (h 'islittle) 1)
+      (ch \>) (set! (h 'islittle) 0)
+      (ch \=) (set! (h 'islittle) (nativelittle))
+      (ch \!) (set! (h 'maxalign) (getnumlimit h fmt MAXALIGN))
+      (luaL_error (h 'L) "invalid format option '%c'" opt))
+    (return Knop)))
+
+; Reads the next option, with its size in 'psize' and the padding its
+; alignment needs in 'ntoalign'. 'X' aligns as the option after it; others
+; align to their size, capped at 'maxalign'; a 'c' needs none.
+(defn- getdetails (h:&Header totalsize:usize fmt:(ptr (ptr i8)) psize:(ptr usize)
+                   ntoalign:(ptr ui32)):i32
+  (let (opt:i32 (getoption h fmt psize)
+        align:usize (deref psize))  ; usually the size
+    (when (= opt Kpaddalign)
+      (when (or (= (deref (deref fmt)) 0) (= (getoption h fmt &align) Kchar) (= align 0))
+        (luaL_argerror (h 'L) 1 "invalid next option for option 'X'")))
+    (if (or (<= align 1) (= opt Kchar))  ; no alignment needed?
+      (set! (deref ntoalign) 0)
+      (do (when (> align (as usize (h 'maxalign)))
+            (set! align (as usize (h 'maxalign))))
+          (if (!= (bit-and align (- align 1)) 0)  ; not a power of 2?
+            (do (set! (deref ntoalign) 0)
+                (luaL_argerror (h 'L) 1 "format asks for alignment not power of 2"))
+            (let (szmoda:usize (bit-and totalsize (- align 1)))  ; totalsize % align
+              (set! (deref ntoalign) (cast_uint (bit-and (- align szmoda) (- align 1))))))))
+    (return opt)))
+
+; Packs 'n' into 'size' bytes. Past a lua_Integer's size, a negative number's
+; extra bytes are sign-extended (they'd be zeros).
+(defn- packint (b:&luaL_Buffer n0:lua_Unsigned islittle:i32 size:ui32 neg:bool):void
+  (let (buff:(ptr i8) (luaL_prepbuffsize b (as usize size))
+        n:lua_Unsigned n0)
+    (set! (aref buff (if (!= islittle 0) 0 (- size 1))) (cast_char (bit-and n MC)))
+    (for (i:ui32 1) (< i size) (inc! i)
+      (set! n (bit-shr n NB))
+      (set! (aref buff (if (!= islittle 0) i (- (- size 1) i))) (cast_char (bit-and n MC))))
+    (when (and neg (> size SZINT))
+      (for (i:ui32 SZINT) (< i size) (inc! i)
+        (set! (aref buff (if (!= islittle 0) i (- (- size 1) i))) (cast_char MC))))
+    (luaL_addsize b (as usize size))))
+
+; Copies 'size' bytes, reversed if 'islittle' isn't the native order.
+(defn- copywithendian (dest0:(ptr i8) src0:(ptr i8) size0:ui32 islittle:i32):void
+  (if (= islittle (nativelittle))
+    (memcpy dest0 src0 (as usize size0))
+    (let (dest:(ptr i8) (p+ dest0 (- size0 1))
+          src:(ptr i8) src0
+          size:ui32 size0)
+      (while (!= size 0)
+        (dec! size)
+        (set! (deref dest) (deref src))
+        (set! dest (p+ dest -1))
+        (set! src (p+ src 1))))))
+
+(defn- str_pack (L:(ptr lua_State)):i32
+  (let (b:&luaL_Buffer (alloca luaL_Buffer)
+        h:&Header (alloca Header)
+        fmt:(ptr i8) (bytes (luaL_checkstring L 1))
+        arg:i32 1  ; the argument being packed
+        totalsize:usize 0
+        ntoalign:ui32 0
+        size:usize 0)
+    (initheader L h)
+    (lua_pushnil L)  ; separates the arguments from the buffer
+    (luaL_buffinit L b)
+    (while (!= (deref fmt) 0)
+      (let (opt:i32 (getdetails h totalsize &fmt &size &ntoalign))
+        (luaL_argcheck L (<= (+ size (as usize ntoalign)) (- (MAX_SIZE) totalsize)) arg
+                       "result too long")
+        (set! totalsize (+ totalsize (as usize ntoalign) size))
+        (while (> ntoalign 0)  ; the alignment padding
+          (dec! ntoalign)
+          (luaL_addchar b 0))
+        (inc! arg)
+        (case opt
+          Kint
+            (let (n:lua_Integer (luaL_checkinteger L arg))
+              (when (< size SZINT)  ; it may overflow?
+                (let (lim:lua_Integer (bit-shl (as lua_Integer 1)
+                                               (- (* (unsafe/cast i64 size) NB) 1)))
+                  (luaL_argcheck L (and (<= (- 0 lim) n) (< n lim)) arg "integer overflow")))
+              (packint b (l_castS2U n) (h 'islittle) (cast_uint size) (< n 0)))
+          Kuint
+            (let (n:lua_Integer (luaL_checkinteger L arg))
+              (when (< size SZINT)  ; it may overflow?
+                (luaL_argcheck L (< (l_castS2U n)
+                                    (bit-shl (as lua_Unsigned 1) (* (as lua_Unsigned size) NB)))
+                               arg "unsigned overflow"))
+              (packint b (l_castS2U n) (h 'islittle) (cast_uint size) false))
+          Kfloat
+            (let (f:f32 (unsafe/cast f32 (luaL_checknumber L arg))
+                  buff:(ptr i8) (luaL_prepbuffsize b (sizeof f32)))
+              (copywithendian buff (as (ptr i8) (as ptr &f)) (sizeof f32) (h 'islittle))
+              (luaL_addsize b size))
+          (:or Knumber Kdouble)  ; a lua_Number is a double
+            (let (f:f64 (luaL_checknumber L arg)
+                  buff:(ptr i8) (luaL_prepbuffsize b (sizeof f64)))
+              (copywithendian buff (as (ptr i8) (as ptr &f)) (sizeof f64) (h 'islittle))
+              (luaL_addsize b size))
+          Kchar  ; a fixed-size string
+            (let (len:usize 0
+                  s:CStr (luaL_checklstring L arg &len))
+              (luaL_argcheck L (<= len size) arg "string longer than given size")
+              (luaL_addlstring b s len)
+              (when (< len size)  ; padding
+                (let (psize:usize (- size len)
+                      buff:(ptr i8) (luaL_prepbuffsize b psize))
+                  (memset buff 0 psize)
+                  (luaL_addsize b psize))))
+          Kstring  ; a string after its length
+            (let (len:usize 0
+                  s:CStr (luaL_checklstring L arg &len))
+              ; SZINT, not (sizeof lua_Unsigned), which is signed (ISSUE-025)
+              (luaL_argcheck L (or (>= size SZINT)
+                                   (< (as lua_Unsigned len)
+                                      (bit-shl (as lua_Unsigned 1) (* (as lua_Unsigned size) NB))))
+                             arg "string length does not fit in given size")
+              (packint b (as lua_Unsigned len) (h 'islittle) (cast_uint size) false)
+              (luaL_addlstring b s len)
+              (set! totalsize (+ totalsize len)))
+          Kzstr
+            (let (len:usize 0
+                  s:CStr (luaL_checklstring L arg &len))
+              (luaL_argcheck L (= (strlen s) len) arg "string contains zeros")
+              (luaL_addlstring b s len)
+              (luaL_addchar b 0)  ; the terminating zero
+              (set! totalsize (+ totalsize len 1)))
+          Kpadding
+            (do (luaL_addchar b 0)
+                (dec! arg))  ; it takes no argument
+          (dec! arg))))  ; Kpaddalign and Knop take none
+    (luaL_pushresult b)
+    (return 1)))
+
+(defn- str_packsize (L:(ptr lua_State)):i32
+  (let (h:&Header (alloca Header)
+        fmt:(ptr i8) (bytes (luaL_checkstring L 1))
+        totalsize:usize 0
+        ntoalign:ui32 0
+        size:usize 0)
+    (initheader L h)
+    (while (!= (deref fmt) 0)
+      (let (opt:i32 (getdetails h totalsize &fmt &size &ntoalign))
+        (luaL_argcheck L (and (!= opt Kstring) (!= opt Kzstr)) 1 "variable-length format")
+        (set! size (+ size (as usize ntoalign)))  ; the space the option takes
+        (luaL_argcheck L (<= totalsize (- (MAX_SIZE) size)) 1 "format result too large")
+        (set! totalsize (+ totalsize size))))
+    (lua_pushinteger L (cast_st2S totalsize))
+    (return 1)))
+
+; Unpacks a 'size'-byte integer. A narrower one is sign-extended if signed; the
+; bytes of a wider one past a lua_Integer must be just the sign.
+(defn- unpackint (L:(ptr lua_State) str:(ptr i8) islittle:i32 size:i32 issigned:bool):lua_Integer
+  (let (res:lua_Unsigned 0
+        limit:i32 (if (<= size SZINT) size SZINT))
+    (for (i:i32 (- limit 1)) (>= i 0) (dec! i)
+      (set! res (bit-shl res NB))
+      (set! res (bit-or res (as lua_Unsigned
+                              (cast_uchar (aref str (if (!= islittle 0) i (- (- size 1) i))))))))
+    (cond
+      (< size SZINT)
+        (when issigned  ; sign extension
+          (let (mask:lua_Unsigned (bit-shl (as lua_Unsigned 1)
+                                           (unsafe/cast lua_Unsigned (- (* size NB) 1))))
+            (set! res (- (bit-xor res mask) mask))))
+      (> size SZINT)
+        (let (mask:i32 (if (or (not issigned) (>= (l_castU2S res) 0)) 0 MC))
+          (for (i:i32 limit) (< i size) (inc! i)
+            (when (!= (uc (aref str (if (!= islittle 0) i (- (- size 1) i)))) mask)
+              (luaL_error L "%d-byte integer does not fit into Lua Integer" size)))))
+    (return (l_castU2S res))))
+
+(defn- str_unpack (L:(ptr lua_State)):i32
+  (let (h:&Header (alloca Header)
+        fmt:(ptr i8) (bytes (luaL_checkstring L 1))
+        ld:usize 0
+        data:(ptr i8) (bytes (luaL_checklstring L 2 &ld))
+        pos:usize (- (posrelatI (luaL_optinteger L 3 1) ld) 1)
+        n:i32 0  ; the results
+        ntoalign:ui32 0
+        size:usize 0)
+    (luaL_argcheck L (<= pos ld) 3 "initial position out of string")
+    (initheader L h)
+    (while (!= (deref fmt) 0)
+      (let (opt:i32 (getdetails h pos &fmt &size &ntoalign))
+        (luaL_argcheck L (<= (+ (as usize ntoalign) size) (- ld pos)) 2 "data string too short")
+        (set! pos (+ pos (as usize ntoalign)))  ; skip the alignment
+        (luaL_checkstack L 2 "too many results")  ; the item and the next position
+        (inc! n)
+        (case opt
+          (:or Kint Kuint)
+            (lua_pushinteger L (unpackint L (p+ data pos) (h 'islittle) (cast_int size)
+                                          (= opt Kint)))
+          Kfloat
+            (let (f:f32 0.0)
+              (copywithendian (as (ptr i8) (as ptr &f)) (p+ data pos) (sizeof f32) (h 'islittle))
+              (lua_pushnumber L (as lua_Number f)))
+          (:or Knumber Kdouble)
+            (let (f:f64 0.0)
+              (copywithendian (as (ptr i8) (as ptr &f)) (p+ data pos) (sizeof f64) (h 'islittle))
+              (lua_pushnumber L f))
+          Kchar
+            (lua_pushlstring L (cstr (p+ data pos)) size)
+          Kstring
+            (let (len:lua_Unsigned (l_castS2U (unpackint L (p+ data pos) (h 'islittle)
+                                                         (cast_int size) false)))
+              (luaL_argcheck L (<= len (as lua_Unsigned (- (- ld pos) size))) 2 "data string too short")
+              (lua_pushlstring L (cstr (p+ data (+ pos size))) (cast_sizet len))
+              (set! pos (+ pos (cast_sizet len))))  ; skip the string
+          Kzstr
+            (let (len:usize (strlen (cstr (p+ data pos))))
+              (luaL_argcheck L (< (+ pos len) ld) 2 "unfinished string for format 'z'")
+              (lua_pushlstring L (cstr (p+ data pos)) len)
+              (set! pos (+ pos len 1)))  ; skip the string and its zero
+          (dec! n))  ; padding and no-ops give no result
+        (set! pos (+ pos size))))
+    (lua_pushinteger L (+ (cast_st2S pos) 1))  ; the next position
+    (return (+ n 1))))
+
+; The metatable strings share: arithmetic on numerals, and __index = string.
+(defn- createmetatable (L:(ptr lua_State)):void
+  (lua_createtable L 0 9)
+  (lua-setfuncs L 0
+    ("__add" arith_add) ("__sub" arith_sub) ("__mul" arith_mul) ("__mod" arith_mod)
+    ("__pow" arith_pow) ("__div" arith_div) ("__idiv" arith_idiv) ("__unm" arith_unm)
+    ("__index" null))  ; set below
+  (lua_pushliteral L "")  ; a dummy string
+  (lua_pushvalue L -2)
+  (lua_setmetatable L -2)
+  (lua_pop L 1)  ; the dummy
+  (lua_pushvalue L -2)  ; the string library
+  (lua_setfield L -2 "__index")
+  (lua_pop L 1))  ; the metatable
+
+(defn luaopen_string (L:(ptr lua_State)):i32
+  (lua-newlib L
+    ("byte" str_byte) ("char" str_char) ("dump" str_dump) ("find" str_find)
+    ("format" str_format) ("gmatch" gmatch) ("gsub" str_gsub) ("len" str_len)
+    ("lower" str_lower) ("match" str_match) ("rep" str_rep) ("reverse" str_reverse)
+    ("sub" str_sub) ("upper" str_upper) ("pack" str_pack) ("packsize" str_packsize)
+    ("unpack" str_unpack))
+  (createmetatable L)
+  (return 1))

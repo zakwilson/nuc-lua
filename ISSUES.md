@@ -27,7 +27,8 @@ Ranked by porter pain removed per unit of language work.
 | 21 | ISSUE-014 | `SIG_DFL` imports as the integer 0 | minor | interop | worked-around |
 | 22 | ISSUE-024 | A `_`-prefixed macro isn't imported, even ISO C's `_IOFBF` | papercut | design | worked-around |
 | 23 | ISSUE-020 | `set!` won't expand a macro in its place | papercut | missing-feature | worked-around |
-| 24 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
+| 24 | ISSUE-025 | `sizeof` is a signed integer, so comparing a size with it is refused | papercut | design | worked-around |
+| 25 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
 
 ## ISSUE-001: A C variadic couldn't be defined in Nucleus
 
@@ -377,6 +378,21 @@ Context: the importer treats every name starting with `_` as the implementation'
 and leaves it out unless the import is `unsafe/import-private`. ISO C gives a few public
 names that spelling: `setvbuf`'s three modes, `_Exit`, `_Bool`. Opting in pulls in every
 private name of the header to reach three constants.
+
+## ISSUE-025: `sizeof` is a signed integer, so comparing a size with it is refused
+
+- **Severity:** papercut
+- **Kind:** design
+- **Status:** worked-around
+- **Port sites:** `str_pack`'s `Kstring` case
+- **Workaround:** compare with a constant (`SZINT`), or bind `(sizeof T)` to a `usize` first,
+  which converts.
+
+Context: `(>= size (sizeof lua_Unsigned))` with `size:usize` stops with `>=: mixed
+signed/unsigned operands`. `sizeof` yields `ptr-int-type`, which is `i64` on this
+target; the docs call it "a pointer-sized integer (size_t)", meaning its width. C's
+`sizeof` is `size_t`, so every size comparison translated from C meets this. Making it
+`usize` would change every `(* n (sizeof T))` over a signed `n` in existing code.
 
 ## What worked well
 

@@ -14,6 +14,7 @@
 (import lua.dblib)
 (import lua.iolib)
 (import lua.loadlib)
+(import lua.strlib)
 (import lua.init)
 (import-use lua.util)
 (import-use "stdio.h")
