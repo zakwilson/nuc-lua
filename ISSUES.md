@@ -39,7 +39,9 @@ Ranked by porter pain removed per unit of language work.
 | 33 | ISSUE-025 | `sizeof` is a signed integer, so comparing a size with it is refused | papercut | design | worked-around |
 | 34 | ISSUE-035 | `unsafe/cast` from a function pointer to an integer is refused | papercut | bug | worked-around |
 | 35 | ISSUE-036 | A `defvar`'s array initializer isn't macroexpanded before its shape is checked | papercut | bug | worked-around |
-| 36 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
+| 36 | ISSUE-037 | A `defstruct` can't complete a struct its header declares without a body | papercut | missing-feature | worked-around |
+| 37 | ISSUE-038 | A parameter named like a special form is accepted, then misparsed at its use | papercut | design | worked-around |
+| 38 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
 
 ## ISSUE-001: A C variadic couldn't be defined in Nucleus
 
@@ -312,7 +314,8 @@ glibc's encoding of a wait status.
 - **Kind:** design
 - **Status:** worked-around
 - **Port sites:** `luaL_typeerror`, `luaL_fileresult`, `luaL_tolstring`, the panic
-  function; every `cond x ? lua_tostring(...) : "literal"` in the libraries
+  function; every `cond x ? lua_tostring(...) : "literal"` in the libraries;
+  `errorlimit`, `jumpscopeerror`, `getvarattribute` in `parser.nuc`
 - **Workaround:** `lua.util/cstr`, `(as CStr (as ptr p))`.
 
 Context: a `const char *` parameter imports as `CStr`, but a return value or a struct
@@ -325,7 +328,8 @@ or CStr". C's `?:` with a string literal on one side is common in Lua's sources.
 - **Severity:** papercut
 - **Kind:** missing-feature
 - **Status:** worked-around
-- **Port sites:** `errno = 0` in `luaL_loadfilex` (3), `liolib.c`, `loslib.c`
+- **Port sites:** `errno = 0` in `luaL_loadfilex` (3), `liolib.c`, `loslib.c`; the
+  `expdesc` union's setters (`set-u`, `set-ind`, `set-uvar`) in `code.nuc`
 - **Workaround:** a second macro, `set-errno`.
 
 Context: with `(defmacro errno () ...)` expanding to a `deref` place, `(set! (errno) 0)`
@@ -587,6 +591,39 @@ Context: `luaP_opmodes` is generated from the opcode rows by a macro expanding t
 with an (array T ...) literal". The check reads the initializer's syntax before any macro
 in it expands, though the expansion is exactly the literal it asks for. A computed table,
 which the docs recommend `macmap` and `~e` for, is the case it stops.
+
+## ISSUE-037: A `defstruct` can't complete a struct its header declares without a body
+
+- **Severity:** papercut
+- **Kind:** missing-feature
+- **Status:** worked-around
+- **Probe:** `probes/issue-037.nuc`
+- **Port sites:** `Block` in `parser.nuc`
+- **Workaround:** the struct takes another name, and the header's field is cast at
+  each read and store (`fs-bl`).
+
+Context: `lparser.h` declares `struct BlockCnt;` and `FuncState` points to one;
+`lparser.c` gives the body. In C the `.c` file completes the type. A Nucleus
+`(defstruct BlockCnt …)` under `(set-ir-prefix "")` is refused: "BlockCnt links as
+%BlockCnt, the LLVM type of BlockCnt — rename it". A module that ports a C file
+which owns such a struct needs a second name and casts at the boundary.
+
+## ISSUE-038: A parameter named like a special form is accepted, then misparsed at its use
+
+- **Severity:** papercut
+- **Kind:** design
+- **Status:** worked-around
+- **Probe:** `probes/issue-038.nuc`
+- **Port sites:** `closegoto` (`label` is `lb`), `fieldexp` (C's `field`), `condexp`
+  (C's `cond`) in `parser.nuc`
+- **Workaround:** rename.
+
+Context: `lparser.c` has a function `field` and a parameter `label`. `(defn- field …)`
+is refused at once, plainly: "'field' already names a special form". But
+`(defn closegoto (… label:(ptr Labeldesc) …) … (label 'pc))` is accepted at the
+parameter and fails at the use: "label: name must be symbol", which names neither
+the binding nor the conflict. A binding that can't be used should be refused where
+it is made, with the first message.
 
 ## What worked well
 

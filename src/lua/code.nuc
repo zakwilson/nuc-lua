@@ -41,6 +41,7 @@
 (defmacro ind (e f) `(((~e 'u) 'ind) ~f))
 (defmacro set-ind (e f v) `(set! (((~e 'u) 'ind) ~f) ~v))
 (defmacro uvar (e f) `(((~e 'u) 'var) ~f))
+(defmacro set-uvar (e f v) `(set! (((~e 'u) 'var) ~f) ~v))
 (defmacro copy-exp (dst src) `(memcpy ~dst ~src (sizeof expdesc)))
 
 ; VJMP expressions have jumps too.
@@ -48,12 +49,8 @@
 
 (defmacro vatab (p) `(!= (bit-and (~p 'flag) PF_VATAB) 0))
 (defmacro vahid (p) `(!= (bit-and (~p 'flag) PF_VAHID) 0))
+(defmacro isvararg (p) `(!= (bit-and (~p 'flag) (bit-or PF_VAHID PF_VATAB)) 0))
 (defmacro needvatab (p) `(set! (~p 'flag) (cast_uchar (bit-or (~p 'flag) PF_VATAB))))
-
-; luaM_limitN is the identity here: MAX_SIZET/sizeof(t) exceeds every int limit.
-(defmacro luaM_growvector (L v nelems size T limit e)
-  `(set! ~v (unsafe/cast (ptr ~T) (luaM_growaux_ ~L (as ptr ~v) ~nelems (ref ~size)
-                                                 (unsafe/cast ui32 (sizeof ~T)) ~limit ~e))))
 
 (defn luaK_semerror (ls:(ptr LexState) fmt:CStr :varargs argp):void
   (let (msg:CStr (luaO_pushvfstring (ls 'L) fmt argp))

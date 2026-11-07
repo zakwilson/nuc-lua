@@ -32,6 +32,7 @@
 (defmacro cast_sizet (x) `(unsafe/cast usize ~x))
 (defmacro cast_char (x) `(unsafe/cast i8 ~x))
 (defmacro cast_uchar (x) `(unsafe/cast ui8 ~x))
+(defmacro cast_short (x) `(unsafe/cast i16 ~x))
 (defmacro l_castS2U (x) `(unsafe/cast lua_Unsigned ~x))
 (defmacro l_castU2S (x) `(unsafe/cast lua_Integer ~x))
 (defmacro cast_st2S (x) `(unsafe/cast lua_Integer ~x))

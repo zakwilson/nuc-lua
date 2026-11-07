@@ -353,6 +353,13 @@
   `(unsafe/cast (ptr ~t) (luaM_realloc_ ~L (as ptr ~v)
                                          (* (cast_sizet ~oldn) (cast_sizet (sizeof ~t)))
                                          (* (cast_sizet ~n) (cast_sizet (sizeof ~t))))))
+; luaM_limitN is the identity here: MAX_SIZET/sizeof(t) exceeds every int limit.
+(defmacro luaM_growvector (L v nelems size T limit e)
+  `(set! ~v (unsafe/cast (ptr ~T) (luaM_growaux_ ~L (as ptr ~v) ~nelems (ref ~size)
+                                                 (unsafe/cast ui32 (sizeof ~T)) ~limit ~e))))
+(defmacro luaM_shrinkvector (L v size fs T)
+  `(set! ~v (unsafe/cast (ptr ~T) (luaM_shrinkvector_ ~L (as ptr ~v) (ref ~size) ~fs
+                                                      (unsafe/cast ui32 (sizeof ~T))))))
 
 ; ---- lstring.h ----
 (defmacro luaS_newliteral (L s) `(luaS_newlstr ~L ~s (strlen ~s)))

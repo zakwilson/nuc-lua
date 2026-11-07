@@ -1,0 +1,13 @@
+; ISSUE-038: a special form's name can't be a parameter or a private function.
+; expect: prints `3 4`; actual: `label: name must be symbol`
+; run: $NUCLEUSC $P -o $W/p && $W/p
+; fixed-when-output: 3 4
+(import-use "stdio.h")
+(defstruct Label pc:i32)
+(defn- field (x:i32):i32 (return (+ x 1)))
+(defn pcof (label:(ptr Label)):i32 (return (label 'pc)))
+(defn main ():i32
+  (let (l:(ptr Label) (alloca Label))
+    (set! (l 'pc) 3)
+    (printf "%d %d\n" (pcof l) (field 3))
+    (return 0)))

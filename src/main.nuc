@@ -26,6 +26,7 @@
 (import lua.opcodes)  ; the compiler
 (import lua.lex)
 (import lua.code)
+(import lua.parser)
 (import lua.init)
 (import-use lua.util)
 (import-use "stdio.h")

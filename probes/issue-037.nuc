@@ -1,0 +1,16 @@
+; ISSUE-037: a defstruct can't complete a struct its header declares without a body.
+; expect: prints `5`; actual: `defstruct: Block links as %Block, the LLVM type of Block ...`
+; run: $NUCLEUSC --cflag=-I$D $P -o $W/p && $W/p
+; fixed-when-output: 5
+(ns p37)
+(set-ir-prefix "")
+(import-use "stdio.h")
+(import-use "issue-037.h")
+(defstruct Block depth:i32)
+(defn main ():i32
+  (let (h:(ptr Holder) (alloca Holder)
+        b:(ptr Block) (alloca Block))
+    (set! (b 'depth) 5)
+    (set! (h 'bl) b)
+    (printf "%d\n" ((h 'bl) 'depth))
+    (return 0)))
