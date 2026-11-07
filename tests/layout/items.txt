@@ -1,0 +1,150 @@
+# What compiled C modules have baked in (PROMPT.md §6.2). One item per line:
+#   const NAME          an integer constant from the headers
+#   size T / align T    a type's size and alignment
+#   off T FIELD         a field's offset
+#   expr LABEL C NUC    an integer expression written in each language
+#   str NAME            a string constant
+size luaL_Buffer
+align luaL_Buffer
+off luaL_Buffer b
+off luaL_Buffer size
+off luaL_Buffer n
+off luaL_Buffer L
+off luaL_Buffer init
+size lua_Debug
+align lua_Debug
+off lua_Debug event
+off lua_Debug name
+off lua_Debug namewhat
+off lua_Debug what
+off lua_Debug source
+off lua_Debug srclen
+off lua_Debug currentline
+off lua_Debug linedefined
+off lua_Debug lastlinedefined
+off lua_Debug nups
+off lua_Debug nparams
+off lua_Debug isvararg
+off lua_Debug extraargs
+off lua_Debug istailcall
+off lua_Debug ftransfer
+off lua_Debug ntransfer
+off lua_Debug short_src
+off lua_Debug i_ci
+size luaL_Reg
+off luaL_Reg name
+off luaL_Reg func
+size luaL_Stream
+off luaL_Stream f
+off luaL_Stream closef
+size lua_Integer
+size lua_Number
+size lua_KContext
+const LUA_REGISTRYINDEX
+expr upvalueindex3 lua_upvalueindex(3) (lua_upvalueindex 3)
+expr extraspace (char*)lua_getextraspace((lua_State*)4096)-(char*)0 (unsafe/cast i64 (lua_getextraspace (unsafe/cast ptr 4096)))
+const LUA_EXTRASPACE
+const LUA_IDSIZE
+const LUAL_BUFFERSIZE
+const LUAL_NUMSIZES
+const LUA_VERSION_NUM
+const LUA_MULTRET
+const LUA_MINSTACK
+const LUA_NOREF
+const LUA_REFNIL
+const LUA_ERRFILE
+const LUA_OK
+const LUA_YIELD
+const LUA_ERRRUN
+const LUA_ERRSYNTAX
+const LUA_ERRMEM
+const LUA_ERRERR
+const LUA_TNONE
+const LUA_TNIL
+const LUA_TBOOLEAN
+const LUA_TLIGHTUSERDATA
+const LUA_TNUMBER
+const LUA_TSTRING
+const LUA_TTABLE
+const LUA_TFUNCTION
+const LUA_TUSERDATA
+const LUA_TTHREAD
+const LUA_NUMTYPES
+const LUA_RIDX_GLOBALS
+const LUA_RIDX_MAINTHREAD
+const LUA_RIDX_LAST
+const LUA_OPADD
+const LUA_OPSUB
+const LUA_OPMUL
+const LUA_OPMOD
+const LUA_OPPOW
+const LUA_OPDIV
+const LUA_OPIDIV
+const LUA_OPBAND
+const LUA_OPBOR
+const LUA_OPBXOR
+const LUA_OPSHL
+const LUA_OPSHR
+const LUA_OPUNM
+const LUA_OPBNOT
+const LUA_OPEQ
+const LUA_OPLT
+const LUA_OPLE
+const LUA_GCSTOP
+const LUA_GCRESTART
+const LUA_GCCOLLECT
+const LUA_GCCOUNT
+const LUA_GCCOUNTB
+const LUA_GCSTEP
+const LUA_GCISRUNNING
+const LUA_GCGEN
+const LUA_GCINC
+const LUA_GCPARAM
+const LUA_GCPMINORMUL
+const LUA_GCPMAJORMINOR
+const LUA_GCPMINORMAJOR
+const LUA_GCPPAUSE
+const LUA_GCPSTEPMUL
+const LUA_GCPSTEPSIZE
+const LUA_GCPN
+const LUA_HOOKCALL
+const LUA_HOOKRET
+const LUA_HOOKLINE
+const LUA_HOOKCOUNT
+const LUA_HOOKTAILCALL
+const LUA_MASKCALL
+const LUA_MASKRET
+const LUA_MASKLINE
+const LUA_MASKCOUNT
+str LUA_VERSION_MAJOR
+str LUA_VERSION_MINOR
+str LUA_VERSION_RELEASE
+str LUA_VERSION
+str LUA_RELEASE
+str LUA_COPYRIGHT
+str LUA_AUTHORS
+str LUA_SIGNATURE
+str LUA_GNAME
+str LUA_LOADED_TABLE
+str LUA_PRELOAD_TABLE
+str LUA_FILEHANDLE
+str LUA_VERSUFFIX
+str LUA_COLIBNAME
+str LUA_TABLIBNAME
+str LUA_IOLIBNAME
+str LUA_OSLIBNAME
+str LUA_STRLIBNAME
+str LUA_UTF8LIBNAME
+str LUA_MATHLIBNAME
+str LUA_DBLIBNAME
+str LUA_LOADLIBNAME
+str LUA_PATH_SEP
+str LUA_PATH_MARK
+str LUA_EXEC_DIR
+str LUA_IGMARK
+str LUA_DIRSEP
+str LUA_PATH_DEFAULT
+str LUA_CPATH_DEFAULT
+str LUA_NUMBER_FMT
+str LUA_NUMBER_FMT_N
+str LUA_INTEGER_FMT

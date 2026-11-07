@@ -5,3 +5,4 @@ reference/tests/
 *.o
 *.so
 lib/
+reference/lua-5.5.1/

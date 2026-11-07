@@ -1,0 +1,194 @@
+From beb0472a808129bec21d7665e068bd85d2df2cda Mon Sep 17 00:00:00 2001
+From: Zak Wilson <zak.wilson@gmail.com>
+Date: Sat, 7 Nov 2026 09:29:06 +0000
+Subject: [PATCH 3/3] cheader: read RET (name)(args); defvar arrays of a header
+ struct
+
+Two fixes found by the nuc-lua port.
+
+ISSUE-002: lua.h declares every API function as `int (lua_gettop)
+(lua_State *L);` so that a function-like macro of the same name can't
+expand there. The importer skipped all 157. One pair of parentheses
+around the name is now read; `int ((f))(int);` stays the canonical
+unread shape, and s16-c2-skip-reason-recorded now uses it.
+
+ISSUE-003: `(defvar regs:(array luaL_Reg 3) ...)` was refused as an
+array of an opaque type: the provisional prescan resolves the element
+before the header's layout is in, and checked opacity first.
+
+Test: lua-header-shapes in tests/suite-cimport.nuc.
+Gate: 1737 passed, 0 failed; bootstrap fixed point holds.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CsC8i2S7yJAHSpzRaddMj3
+---
+ design/progress.md            | 15 +++++++++++++++
+ docs/structs-unions.md        |  6 ++++--
+ src/cheader.nuc               | 11 +++++++++--
+ src/union-registry.nuc        |  9 +++++----
+ tests/fixtures/lua-shapes.c   |  3 +++
+ tests/fixtures/lua-shapes.h   |  6 ++++++
+ tests/fixtures/s16-unsigned.h |  6 +++---
+ tests/suite-cimport.nuc       | 21 +++++++++++++++++++++
+ 8 files changed, 66 insertions(+), 11 deletions(-)
+ create mode 100644 tests/fixtures/lua-shapes.c
+ create mode 100644 tests/fixtures/lua-shapes.h
+
+diff --git a/design/progress.md b/design/progress.md
+index 6737261..21d666e 100644
+--- a/design/progress.md
++++ b/design/progress.md
+@@ -5695,3 +5695,18 @@ LLVM's `va_arg` turned out to crash at `-O0` on x86-64 as well as being wrong on
+ so both aggregate classes are open-coded. `tests/run-varargs-cross-test.sh` runs C against
+ all three list classes at `-O0` and `-O2`, under qemu where it's there.
+ `tests/suite-varargs.nuc` and `examples/varargs.nuc` cover the rest.
++
++## Lua-port fixes: `lua.h` imports (lua-bugfixes)
++
++Found by the nuc-lua port (its ISSUE-002 and ISSUE-003).
++
++- **`RET (name)(args)` is read.** Lua declares every API function this way, so that a
++  function-like macro of the same name can't expand there, and the importer skipped all
++  157. One pair of parentheses around the name is now read; `int ((f))(int);` stays the
++  canonical unread shape, and `s16-c2-skip-reason-recorded` uses it.
++- **A `defvar` array of a header's struct.** The provisional prescan resolves the element
++  before the header's layout is in, and checked opacity first; it now returns before that
++  check, as it already did for a struct defined later in Nucleus.
++
++`tests/fixtures/lua-shapes.{h,c}` and `lua-header-shapes` in `tests/suite-cimport.nuc`
++cover both.
+diff --git a/docs/structs-unions.md b/docs/structs-unions.md
+index ec39ed7..68c737b 100644
+--- a/docs/structs-unions.md
++++ b/docs/structs-unions.md
+@@ -757,8 +757,10 @@ A declaration is skipped when it has:
+   `_BitInt`);
+ * **more than 32 parameters** (the importer's fixed parameter array), so a
+   truncated signature is never registered;
+-* a **declarator shape the parser does not recognize at all** — a parenthesised
+-  declarator (`int (f)(int);`) is the canonical case. This one reports only at
++* a **declarator shape the parser does not recognize at all** — a doubly
++  parenthesised declarator (`int ((f))(int);`) is the canonical case. A name in
++  one pair, `int (f)(int);`, which keeps a function-like macro of the same name
++  from expanding and is how `lua.h` declares every function, is read. This one reports only at
+   the point of use, since a preprocessed header is full of variables and macro
+   remnants that legitimately take the same path, and a warning on every one of
+   them would bury the tier above.
+diff --git a/src/cheader.nuc b/src/cheader.nuc
+index e06a3d5..3d47ddf 100644
+--- a/src/cheader.nuc
++++ b/src/cheader.nuc
+@@ -1358,13 +1358,20 @@
+     (when (and (< pos len) (= (cstr-byte-at buf pos) 40))
+       (let (fr:i32 (c-parse-fnret-decl buf pos len ret-type out-end decl-start))
+         (when (>= fr 0) (return fr))))
+-    ; Read the function name
++    ; Read the function name, which `RET (name)(args)` parenthesizes to stop a
++    ; function-like macro expanding it. Lua's headers declare every function so.
+     (let (name-end:i64 0
+-          fname:Symbol (c-read-ident buf pos len (as &i64 &name-end)))
++          paren:bool (and (< pos len) (= (cstr-byte-at buf pos) 40))
++          fname:Symbol (c-read-ident buf (if paren (c-skip-ws buf (+ pos 1) len) pos) len
++                                     (as &i64 &name-end)))
+       (when (= (symbol-len fname) 0)
+          (set! @out-end pos) (return 0))
+       (set! pos name-end)
+       (set! pos (c-skip-ws buf pos len))
++      (when paren
++        (when (or (>= pos len) (!= (cstr-byte-at buf pos) 41))
++          (set! @out-end pos) (return 0))
++        (set! pos (c-skip-ws buf (+ pos 1) len)))
+       ; Expect '('
+       (when (or (>= pos len) (!= (cstr-byte-at buf pos) 40))
+          (set! @out-end pos) (return 0))
+diff --git a/src/union-registry.nuc b/src/union-registry.nuc
+index 4b1b2a3..a7dd3ee 100644
+--- a/src/union-registry.nuc
++++ b/src/union-registry.nuc
+@@ -2585,14 +2585,15 @@
+             ; An element with no layout would give the array a wrong size and
+             ; the enclosing struct wrong offsets — the same two obligations a
+             ; by-value defstruct field carries (W3a / W1d).
+-            (reject-opaque-type et (node-line etn line) "array element")
+-            (reject-valist et (node-line etn line) "array element")
+-            (reject-cycle-pending-layout et (node-line etn line) "array element")
+             ; Mode 2 = the prescan: leave the length provisional (0) rather than
+             ; folding it, because macros are not registered during a prescan and
+-            ; folding there would accept `(_* K 2)` while refusing `(* K 2)`.
++            ; folding there would accept `(_* K 2)` while refusing `(* K 2)`. A C
++            ; header's struct is still opaque then too: emission asks again.
+             ; See g-array-ok's note in src/nucleusc.nuc.
+             (when (= array-ok 2) (return (array-type et 0)))
++            (reject-opaque-type et (node-line etn line) "array element")
++            (reject-valist et (node-line etn line) "array element")
++            (reject-cycle-pending-layout et (node-line etn line) "array element")
+             (when (= (const-fold-int lnn (as &i64 &len) lline) 0)
+               (die-at lline "(array T N): length must be a compile-time integer constant"))
+             (when (<= len 0)
+diff --git a/tests/fixtures/lua-shapes.c b/tests/fixtures/lua-shapes.c
+new file mode 100644
+index 0000000..a61d0b8
+--- /dev/null
++++ b/tests/fixtures/lua-shapes.c
+@@ -0,0 +1,3 @@
++#include "lua-shapes.h"
++long long (ls_twice) (long long n) { return 2 * n; }
++const char *(ls_name) (int i) { return i ? "one" : "zero"; }
+diff --git a/tests/fixtures/lua-shapes.h b/tests/fixtures/lua-shapes.h
+new file mode 100644
+index 0000000..23f8c2d
+--- /dev/null
++++ b/tests/fixtures/lua-shapes.h
+@@ -0,0 +1,6 @@
++/* Two shapes lua.h and lauxlib.h use throughout (nuc-lua ISSUE-002, ISSUE-003). */
++typedef struct LS LS;
++typedef int (*LCF)(LS *L);
++extern long long (ls_twice) (long long n);
++extern const char *(ls_name) (int i);
++typedef struct LReg { const char *name; LCF func; } LReg;
+diff --git a/tests/fixtures/s16-unsigned.h b/tests/fixtures/s16-unsigned.h
+index 272bd6a..f51a019 100644
+--- a/tests/fixtures/s16-unsigned.h
++++ b/tests/fixtures/s16-unsigned.h
+@@ -16,6 +16,6 @@ struct S16U08 { unsigned int a; int b; };
+ unsigned s16u_f(void);
+ signed s16u_g(unsigned x, signed y);
+ 
+-/* C2: a parenthesised declarator the parser does not read. It must be recorded
+-   with a reason, not dropped silently. */
+-int (s16u_odd)(int);
++/* C2: a doubly parenthesised declarator the parser does not read. It must be
++   recorded with a reason, not dropped silently. */
++int ((s16u_odd))(int);
+diff --git a/tests/suite-cimport.nuc b/tests/suite-cimport.nuc
+index d8a9853..6c18c39 100644
+--- a/tests/suite-cimport.nuc
++++ b/tests/suite-cimport.nuc
+@@ -899,3 +899,24 @@ int main(void){
+     (try (check-no-errors (ref c 'diags)))
+     (drop &c)
+     (return (ok))))
++
++; `RET (name)(args)`, the way Lua's headers declare every function, used to be
++; dropped without a word; and a defvar array of a header's struct was refused
++; at the prescan, before the header's layout was known.
++(deftest lua-header-shapes
++  (try (require-cc))
++  (let (p:String (try (test-write-file "lshape.nuc"
++                         "(import-use \"tests/fixtures/lua-shapes.h\")
++(import-use \"stdio.h\")
++(defvar regs:(array LReg 2))
++(defn main ():i32
++  (printf \"%lld %s %zu %d\\n\" (ls_twice 21) (ls_name 1) (sizeof LReg)
++          (if (= ((aref regs 1) 'func) null) 0 1))
++  (return 0))
++"))
++        got:String (try (build-run-file "" "--link-arg=tests/fixtures/lua-shapes.c"
++                                        (string-as-view &p))))
++    (try (check-golden (string-as-view &got) "42 one 16 0\n"))
++    (drop &got)
++    (drop &p)
++    (return (ok))))
+-- 
+2.47.3
+

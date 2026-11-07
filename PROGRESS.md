@@ -26,7 +26,7 @@ object model, the compiler, execution state, the collector and the VM (§10).
 | Milestone | State |
 |---|---|
 | 0 Setup | done: env and setup scripts, reference and suite, spike, probes, hybrid build |
-| 1 Binding and first library | in progress: `capi/` low level done, `libs/mayi` done |
+| 1 Binding and first library | done: `capi/` (both layers), layout gate, `libs/mayi`, `tests/capi/capi.c`, stock column |
 | 2–11 | not started |
 
 ### Nucleus
@@ -36,7 +36,7 @@ Compiler: `.nucleus-work` on `lua-bugfixes` (see CLAUDE.md).
 - `cd516e6` VA-0: a C variadic called through a `declare` (ISSUE-006)
 - `336a93b` variadic functions (ISSUE-001), accepted as recommended in
   `design/lua-bugfixes/variadic-functions.md`
-- pending: header import of `RET (name)(args)` (ISSUE-002), defvar arrays of a
+- `beb0472` header import of `RET (name)(args)` (ISSUE-002), defvar arrays of a
   header struct (ISSUE-003)
 
 ### Still stock
@@ -53,10 +53,19 @@ script) and `luac.c` (not built yet).
 - The spike: a Nucleus `luaopen_` module whose function raises with `luaL_error`
   (a real C variadic call) is caught by `pcall` in stock `lua`.
 
+## Gates
+
+- `scripts/check-capi.sh` (`--stock` for the stock column only): header diff,
+  `check-layout.sh` (144 sizes, offsets and constants against the C compiler), the
+  157-symbol table, `capi.c`'s coverage of all 209 functions and macros, the matrix.
+- `scripts/build-libs.sh` builds `libs/*` into `build/so/n/`; `setup.sh` builds the C
+  modules into `build/so/c/`.
+- `scripts/check-probes.sh`.
+
 ## Next
 
-M1: the idiomatic layer of `capi/`, the `offsetof` layout test, `tests/capi/capi.c`,
-`scripts/check-capi.sh` (header diff, symbol table, stock column of the matrix).
+M2: port `lua.c` (replacing `src/main.nuc`), `lauxlib.c` and each standard library,
+over the stock core. Then `scripts/check-suite.sh` and the port column of the matrix.
 
 ## Open questions
 

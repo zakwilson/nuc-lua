@@ -43,8 +43,10 @@ if [ ! -f build/suite/libs/lib1.so ]; then
   make -C build/suite/libs LUA_DIR="$ROOT/reference/build/src" >/dev/null
 fi
 
-mkdir -p build/so
-if [ ! -f build/so/mayi.so ]; then
-  gcc -shared -fPIC -I include scratch/mayi.c -o build/so/mayi.so
-fi
+# The C modules of the API matrix, built once; every host loads these same files.
+mkdir -p build/so/c
+for m in scratch/mayi.c tests/capi/capi.c; do
+  so=build/so/c/$(basename "$m" .c).so
+  [ "$so" -nt "$m" ] || gcc -shared -fPIC -I include "$m" -o "$so"
+done
 echo "setup: reference and suite ready"

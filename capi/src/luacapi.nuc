@@ -6,6 +6,45 @@
 (import-use "lua.h")
 (import-use "lauxlib.h")
 (import-use "lualib.h")
+(import-ct nucleus.node)
+
+; --- String constants ---
+; A header's string macros aren't imported (only integer ones fold), so these are
+; written out for the `make linux` configuration; scripts/check-layout.sh diffs
+; each against the C compiler's.
+
+(defconst LUA_VERSION_MAJOR "5")
+(defconst LUA_VERSION_MINOR "5")
+(defconst LUA_VERSION_RELEASE "1")
+(defconst LUA_VERSION "Lua 5.5")
+(defconst LUA_RELEASE "Lua 5.5.1")
+(defconst LUA_COPYRIGHT "Lua 5.5.1  Copyright (C) 1994-2026 Lua.org, PUC-Rio")
+(defconst LUA_AUTHORS "R. Ierusalimschy, L. H. de Figueiredo, W. Celes")
+(defconst LUA_SIGNATURE "\x1bLua")
+(defconst LUA_GNAME "_G")
+(defconst LUA_LOADED_TABLE "_LOADED")
+(defconst LUA_PRELOAD_TABLE "_PRELOAD")
+(defconst LUA_FILEHANDLE "FILE*")
+(defconst LUA_VERSUFFIX "_5_5")
+(defconst LUA_COLIBNAME "coroutine")
+(defconst LUA_TABLIBNAME "table")
+(defconst LUA_IOLIBNAME "io")
+(defconst LUA_OSLIBNAME "os")
+(defconst LUA_STRLIBNAME "string")
+(defconst LUA_UTF8LIBNAME "utf8")
+(defconst LUA_MATHLIBNAME "math")
+(defconst LUA_DBLIBNAME "debug")
+(defconst LUA_LOADLIBNAME "package")
+(defconst LUA_PATH_SEP ";")
+(defconst LUA_PATH_MARK "?")
+(defconst LUA_EXEC_DIR "!")
+(defconst LUA_IGMARK "-")
+(defconst LUA_DIRSEP "/")
+(defconst LUA_PATH_DEFAULT "/usr/local/share/lua/5.5/?.lua;/usr/local/share/lua/5.5/?/init.lua;/usr/local/lib/lua/5.5/?.lua;/usr/local/lib/lua/5.5/?/init.lua;./?.lua;./?/init.lua")
+(defconst LUA_CPATH_DEFAULT "/usr/local/lib/lua/5.5/?.so;/usr/local/lib/lua/5.5/loadall.so;./?.so")
+(defconst LUA_NUMBER_FMT "%.15g")
+(defconst LUA_NUMBER_FMT_N "%.17g")
+(defconst LUA_INTEGER_FMT "%lld")
 
 ; --- lua.h ---
 
@@ -45,9 +84,17 @@
 ; --- lauxlib.h ---
 
 (defmacro luaL_checkversion (L)
-  `(luaL_checkversion_ ~L LUA_VERSION_NUM LUAL_NUMSIZES))
+  `(luaL_checkversion_ ~L (as lua_Number LUA_VERSION_NUM) LUAL_NUMSIZES))
 (defmacro luaL_loadfile (L f) `(luaL_loadfilex ~L ~f null))
-(defmacro luaL_newlibtable (L n) `(lua_createtable ~L 0 ~n))
+; C sizes the table from sizeof(l); Nucleus has no sizeof of an expression
+; (ISSUE-011), so this counts up to the {NULL, NULL} sentinel, as luaL_setfuncs does.
+(defmacro luaL_newlibtable (L l)
+  (let (n (gensym))
+    `(let ((~n i32) 0)
+       (while (!= ((aref ~l ~n) 'name) null) (set! ~n (+ ~n 1)))
+       (lua_createtable ~L 0 ~n))))
+(defmacro luaL_newlib (L l)
+  `(do (luaL_checkversion ~L) (luaL_newlibtable ~L ~l) (luaL_setfuncs ~L ~l 0)))
 (defmacro luaL_argcheck (L cond arg extramsg)
   `(when (not ~cond) (luaL_argerror ~L ~arg ~extramsg)))
 (defmacro luaL_argexpected (L cond arg tname)
@@ -78,3 +125,96 @@
 ; --- lualib.h ---
 
 (defmacro luaL_openlibs (L) `(luaL_openselectedlibs ~L (bit-not 0) 0))
+
+; --- The idiomatic layer ---
+
+; A Lua C function whose parameters say how each argument is checked:
+;   (defn-lua f-add (L (a integer) (b number 1.0) (s string) (t table)) … (return 1))
+; binds a:lua_Integer, b:lua_Number (default 1.0), s:CStr, t:i32 (the stack index).
+; Kinds: integer number string boolean any table function, (udata T "tname").
+; The function is private (ISSUE-005): Lua reaches it through a table, never by name.
+(defmacro defn-lua (name params :rest body)
+  (let (L (ast-at params 0)
+        binds (node-list-new (name 'line))
+        checks (node-list-new (name 'line))
+        n (ast-len params)
+        i 1)
+    (while (< i n)
+      (let (p (ast-at params i)
+            v (ast-at p 0)
+            kind (ast-at p 1)
+            opt (= (ast-len p) 3)
+            dflt (ast-at p 2)
+            idx (node-int (as i64 i)))
+        (cond
+          (and (= (kind 'kind) NODE-LIST) (= (ast-at kind 0) 'udata))
+            (do (node-push binds v)
+                (node-push binds `(unsafe/cast (ref ~(ast-at kind 1))
+                                     (luaL_checkudata ~L ~idx ~(ast-at kind 2)))))
+          (= kind 'integer)
+            (do (node-push binds v)
+                (node-push binds (if opt `(luaL_optinteger ~L ~idx ~dflt)
+                                     `(luaL_checkinteger ~L ~idx))))
+          (= kind 'number)
+            (do (node-push binds v)
+                (node-push binds (if opt `(luaL_optnumber ~L ~idx ~dflt)
+                                     `(luaL_checknumber ~L ~idx))))
+          (= kind 'string)
+            (do (node-push binds v)
+                (node-push binds (if opt `(luaL_optlstring ~L ~idx ~dflt null)
+                                     `(luaL_checklstring ~L ~idx null))))
+          (= kind 'boolean)
+            (do (node-push binds v) (node-push binds `(!= (lua_toboolean ~L ~idx) 0)))
+          (= kind 'any)
+            (do (node-push binds v) (node-push binds `(as i32 ~idx))
+                (node-push checks `(luaL_checkany ~L ~idx)))
+          (= kind 'table)
+            (do (node-push binds v) (node-push binds `(as i32 ~idx))
+                (node-push checks `(luaL_checktype ~L ~idx LUA_TTABLE)))
+          (= kind 'function)
+            (do (node-push binds v) (node-push binds `(as i32 ~idx))
+                (node-push checks `(luaL_checktype ~L ~idx LUA_TFUNCTION)))
+          true (macro-error p "defn-lua: a parameter is (name kind) or (name kind default); kind is integer, number, string, boolean, any, table, function or (udata T \"tname\")"))
+        (set! i (+ i 1))))
+    `(defn- ~name ((~L (ref lua_State))):i32
+       ~@checks
+       (let ~binds ~@body))))
+
+; luaopen_NAME for a library of functions and userdata types:
+;   (deflualib luaopen_demo
+;     (("new" demo-new) ("sum" demo-sum))
+;     (("demo.Counter" ("__gc" counter-gc) ("get" counter-get))))
+; Each type gets a metatable in the registry under its name, whose __index is
+; itself, so its other entries are the methods. The table is built at run time:
+; a function address can't be constant data yet (ISSUE-004).
+(defmacro deflualib (name funcs :rest types)
+  (let (L (gensym)
+        body (node-list-new (name 'line)))
+    (when (= (ast-len types) 1)
+      (let (tl (ast-at types 0) i 0)
+        (while (< i (ast-len tl))
+          (let (ty (ast-at tl i) j 1)
+            (node-push body `(luaL_newmetatable ~L ~(ast-at ty 0)))
+            (node-push body `(lua_pushvalue ~L -1))
+            (node-push body `(lua_setfield ~L -2 "__index"))
+            (while (< j (ast-len ty))
+              (node-push body `(lua_pushcclosure ~L ~(ast-at (ast-at ty j) 1) 0))
+              (node-push body `(lua_setfield ~L -2 ~(ast-at (ast-at ty j) 0)))
+              (set! j (+ j 1)))
+            (node-push body `(lua_pop ~L 1)))
+          (set! i (+ i 1)))))
+    (node-push body `(lua_createtable ~L 0 ~(node-int (as i64 (ast-len funcs)))))
+    (let (i 0)
+      (while (< i (ast-len funcs))
+        (node-push body `(lua_pushcclosure ~L ~(ast-at (ast-at funcs i) 1) 0))
+        (node-push body `(lua_setfield ~L -2 ~(ast-at (ast-at funcs i) 0)))
+        (set! i (+ i 1))))
+    `(defn ~name ((~L (ref lua_State))):i32 ~@body (return 1))))
+
+; A new full userdata holding a T, with the metatable named tname; zeroed.
+(defmacro lua-new-udata (L T tname)
+  (let (p (gensym))
+    `(let ((~p (ref ~T)) (unsafe/cast (ref ~T) (lua_newuserdatauv ~L (sizeof ~T) 0)))
+       (memset ~p 0 (sizeof ~T))
+       (luaL_setmetatable ~L ~tname)
+       ~p)))

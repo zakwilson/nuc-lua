@@ -19,6 +19,7 @@ export NUCLEUSC=$NUCLEUS_HOME/build/nucleusc
 export NUCLEUS=$NUCLEUS_HOME/build/nucleus
 
 export LUA_SRC=${LUA_SRC:-$PARENT/lua-5.5.1}
+[ -d "$LUA_SRC" ] || LUA_SRC=$ROOT/reference/lua-5.5.1
 export LUA_TESTS=${LUA_TESTS:-$PARENT/lua-5.5.1-tests}
 [ -d "$LUA_TESTS" ] || LUA_TESTS=$ROOT/reference/tests/lua-5.5.1-tests
 export REF=$ROOT/reference/build
