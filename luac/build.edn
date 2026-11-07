@@ -1,6 +1,5 @@
 ;; The port's `luac`: one build.edn makes one program, so the second has its own
-;; project, sharing the port's sources. The stock modules not yet ported link as
-;; for `lua` (../build.edn).
+;; project, sharing the port's sources.
 {:name "luac"
  :opt 2
  :entry "../src/luac.nuc"
@@ -8,5 +7,4 @@
  :cflags ["-I../include" "-I../reference/build/src" "-DLUA_USE_LINUX"]
  :libs ["m"]
  :deps {luacapi {:path "../capi"}}
- :c-sources ["../reference/build/src/lgc.c"
-             "../reference/build/src/lvm.c"]}
+ :c-sources ["../reference/build/src/lvm.c"]}

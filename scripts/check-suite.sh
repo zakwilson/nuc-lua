@@ -4,8 +4,8 @@
 set -uo pipefail
 source "$(dirname "$0")/env.sh"
 LUA=$(realpath "${LUA:-$ROOT/build/lua}")
-SUITE=$ROOT/build/suite
-LOG=$ROOT/build/suite.log
+SUITE=${SUITE:-$ROOT/build/suite}  # a copy lets two runs go at once
+LOG=${LOG:-$ROOT/build/suite.log}
 [ -f "$SUITE/all.lua" ] || { echo "check-suite: run scripts/setup.sh first" >&2; exit 2; }
 start=$(date +%s)
 (cd "$SUITE" && : | "$LUA" "$@" all.lua) > "$LOG" 2>&1

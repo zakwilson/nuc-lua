@@ -35,7 +35,8 @@ object model, the compiler, execution state, the collector and the VM (§10).
 | 3 Object model | done: `lctype`, `lzio`, `lmem`, `lobject`, `lstring`, `lfunc`, `ltm`, `ltable` |
 | 4 Compiler | done: `lopcodes`, `llex`, `lcode`, `lparser`, `ldump`, `lundump`, `luac.c` |
 | 5 Execution state | done: `lstate`, `ldebug`, `ldo`, `lapi` |
-| 6–11 | not started |
+| 6 The collector | done: `lgc`; the suite passes collecting as often as it can, in both modes |
+| 7–11 | not started |
 
 ### Nucleus
 
@@ -57,9 +58,9 @@ Compiler: `.nucleus-work` on `lua-bugfixes` (see CLAUDE.md).
 
 ### Still stock
 
-Part of execution state, the collector and the VM: every module in `build.edn`'s
-`:c-sources` (`lgc`, `lvm`). `lstate`, `ldebug`, `ldo` and `lapi` are `state.nuc`,
-`debug.nuc`, `do.nuc` and `api.nuc`; `api.nuc`'s `lua_ident` is spelled out in bytes
+The VM: every module in `build.edn`'s
+`:c-sources` (`lvm`). `lstate`, `ldebug`, `ldo`, `lapi` and `lgc` are `state.nuc`,
+`debug.nuc`, `do.nuc`, `api.nuc` and `gc.nuc`; `api.nuc`'s `lua_ident` is spelled out in bytes
 (ISSUE-044); `do.nuc`'s `LongJmp` is C's `lua_longjmp` (ISSUE-037), its
 `jmp_buf` a struct field, `_setjmp`/`_longjmp` by name. The object model is in `src/lua/`
 (`ctype`, `zio`, `mem`, `object`, `string`, `func`, `tm`, `table`), and so is the
@@ -99,6 +100,8 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
   addresses masked) as stock `luac` does, and answers 21 option cases (usage, `-v`,
   `--`, `-`, `-o -`, `luac.out`, errors) byte for byte. Compiling all of them ten times
   takes 2.28 s against stock `luac`'s 2.21 s.
+- M6: with `lgc` in Nucleus, both stressed runs pass, as on stock. A script counting
+  `__gc` sentinels sees the same number of cycles as stock in each mode.
 - The spike: a Nucleus `luaopen_` module whose function raises with `luaL_error`
   (a real C variadic call) is caught by `pcall` in stock `lua`.
 
@@ -120,13 +123,17 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
   answer its options as stock does.
 - `scripts/check-tables.sh`: `luaP_opmodes` and `luai_ctype_` byte-identical to stock's.
 - `scripts/check-suite.sh` runs the official suite (`LUA=` picks the binary).
+- `scripts/check-gcstress.sh` runs it once per collector mode with the collector
+  busy: incremental with `pause` 0 (a cycle always in progress), generational with
+  `minormul` 1 (12 times the default's minor collections). On stock, `minormul` 0
+  ran past ten minutes in `db.lua`'s hook tests, and `stepsize` 0 took nine and
+  failed its count-hook test (`db.lua:605`). `MODES=`
+  picks one, logs in `build/`; `SUITE=` (for `check-suite.sh` too) runs on a copy.
 
 ## Next
 
-M6, the collector: `lgc`, incremental and generational, deleted from both
-`build.edn` files. Then a stress driver for the suite that sets
-`collectgarbage("param", …)` to collect as often as it can, in both modes, as a gate
-beside the suite, bytecode and matrix (PROMPT §10). `code.nuc` holds `lcode.h`'s macros and the `expdesc`
+M7, the VM: `lvm` as `src/lua/vm.nuc`, its dispatch threaded with `label-addr` and
+`goto-ptr`; then no stock object in the link (`nm`), and the benchmark (§7.5). `code.nuc` holds `lcode.h`'s macros and the `expdesc`
 union accessors (`u`, `set-u`, `ind`, `set-ind`, `uvar`, `set-uvar`) that `parser.nuc`
 uses; `parser.nuc`'s `Block` is C's `BlockCnt` (ISSUE-037). `opcodes.nuc` generates `luaP_opmodes` from one
 opcode row table (`with-opcodes`); `luac`'s `opnames` come from the same rows.
