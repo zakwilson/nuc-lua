@@ -21,7 +21,11 @@ done
 if "$ROOT/scripts/check-layout.sh" > "$W/layout.log" 2>&1; then ok "$(tail -1 "$W/layout.log")"
 else bad "layout: see $W/layout.log"; fi
 
-api_symbols() { nm -D --defined-only "$1" | awk '$3 ~ /^(lua|luaL|luaopen)_/ {print $2, $3}' | sort -k2; }
+# Function or data, not strong or weak: the port's definitions are weak (ISSUE-015).
+api_symbols() {
+  nm -D --defined-only "$1" | awk '$3 ~ /^(lua|luaL|luaopen)_/ {
+    k = ($2 ~ /^[TtWw]$/) ? "F" : ($2 ~ /^[Vv]$/ ? "D" : $2); if (k ~ /^[DdBbRr]$/) k = "D"; print k, $3 }' | sort -k2
+}
 api_symbols "$REFLUA" > "$W/syms-stock.txt"
 [ "$(wc -l < "$W/syms-stock.txt")" = 157 ] || bad "stock lua exports $(wc -l < "$W/syms-stock.txt") API symbols, not 157"
 if [[ $hosts == *port* ]]; then
@@ -29,7 +33,7 @@ if [[ $hosts == *port* ]]; then
   if diff "$W/syms-stock.txt" "$W/syms-port.txt" > "$W/syms.diff"; then ok "port exports the 157 API symbols"
   else bad "symbol table: see $W/syms.diff"; fi
   # Anything else the port exports could bind a module's references (PROMPT.md §6.6).
-  nm -D --defined-only "$PORT" | awk '$3 !~ /^(lua|luaL|luaopen)_/ && $2 ~ /[TDBR]/ {print $3}' \
+  nm -D --defined-only "$PORT" | awk '$3 !~ /^(lua|luaL|luaopen)_/ && $2 ~ /[TDBRWV]/ {print $3}' \
     | sort > "$W/extra-exports.txt"
   echo "info  port exports $(wc -l < "$W/extra-exports.txt") other symbols ($W/extra-exports.txt)"
 fi

@@ -1,0 +1,208 @@
+; The UTF-8 library.
+;
+; lutf8lib.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.utf8lib)
+(set-ir-prefix "")
+(import-use luacapi)
+(import-use lua.util)
+(import-use "stdlib.h")
+(import-use "string.h")
+
+(defconst MAXUNICODE 0x10FFFF)
+(defconst MAXUTF 0x7FFFFFFF)
+(defconst MSGInvalid "invalid UTF-8 code")
+
+; Whether the byte at 'p' continues a sequence.
+(defmacro- iscontp (p) `(= (bit-and (as i32 (cast_uchar (deref ~p))) 0xC0) 0x80))
+
+; A relative string position: a negative one counts back from the end.
+(defn- u_posrelat (pos:lua_Integer len:usize):lua_Integer
+  (cond
+    (>= pos 0) (return pos)
+    (> (- 0 (l_castS2U pos)) len) (return 0)
+    true (return (+ (l_castU2S len) pos 1))))
+
+; The smallest code point for each sequence length, to catch overlong forms.
+; The first entry rejects a non-ASCII byte with no continuation bytes.
+(defvar- limits:(array ui32 6) (array ui32 0xFFFFFFFF 0x80 0x800 0x10000 0x200000 0x4000000))
+
+; Decodes one sequence into 'val' (when given) and returns what follows it, or
+; null when it's invalid.
+(defn- utf8_decode (s:(ptr i8) val:(ptr ui32) strict:bool):(ptr i8)
+  (let (c:ui32 (as ui32 (cast_uchar (aref s 0)))
+        res:ui32 0)
+    (cond
+      (< c 0x80) (set! res c)  ; ASCII
+      (>= c 0xfe) (return null)  ; would need six or more continuation bytes
+      true
+        (let (count:i32 0)
+          (while (!= (bit-and c 0x40) 0)  ; while it needs continuation bytes
+            (set! count (+ count 1))
+            (let (cc:ui32 (as ui32 (cast_uchar (aref s count))))
+              (when (!= (bit-and cc 0xC0) 0x80)  ; not a continuation byte?
+                (return null))
+              (set! res (bit-or (bit-shl res 6) (bit-and cc 0x3F))))
+            (set! c (bit-shl c 1)))
+          (set! res (bit-or res (bit-shl (bit-and c 0x7F) (cast_uint (* count 5)))))  ; the first byte
+          (when (or (> res MAXUTF) (< res (aref limits count)))
+            (return null))
+          (set! s (unsafe/ptr+ s (as i64 count)))))
+    (when (and strict (or (> res MAXUNICODE) (and (<= 0xD800 res) (<= res 0xDFFF))))
+      (return null))  ; too large, or a surrogate
+    (when (!= val null) (set! (deref val) res))
+    (return (unsafe/ptr+ s 1))))
+
+; utf8.len(s [, i [, j [, lax]]]): how many characters start in [i,j], or fail
+; and the position of the first bad byte.
+(defn- utflen (L:(ptr lua_State)):i32
+  (let (n:lua_Integer 0
+        len:usize 0
+        s:(ptr i8) (bytes (luaL_checklstring L 1 &len))
+        posi:lua_Integer (u_posrelat (luaL_optinteger L 2 1) len)
+        posj:lua_Integer (u_posrelat (luaL_optinteger L 3 -1) len)
+        lax:bool (!= (lua_toboolean L 4) 0))
+    (luaL_argcheck L (and (<= 1 posi) (<= (dec! posi) (l_castU2S len))) 2
+                   "initial position out of bounds")
+    (luaL_argcheck L (< (dec! posj) (l_castU2S len)) 3 "final position out of bounds")
+    (while (<= posi posj)
+      (let (s1:(ptr i8) (utf8_decode (unsafe/ptr+ s posi) null (not lax)))
+        (when (= s1 null)  ; a bad sequence
+          (luaL_pushfail L)
+          (lua_pushinteger L (+ posi 1))
+          (return 2))
+        (set! posi (byte-diff s1 s))
+        (set! n (+ n 1))))
+    (lua_pushinteger L n)
+    (return 1)))
+
+; utf8.codepoint(s [, i [, j [, lax]]]): the code points of the characters that
+; start in [i,j].
+(defn- codepoint (L:(ptr lua_State)):i32
+  (let (len:usize 0
+        s:(ptr i8) (bytes (luaL_checklstring L 1 &len))
+        posi:lua_Integer (u_posrelat (luaL_optinteger L 2 1) len)
+        pose:lua_Integer (u_posrelat (luaL_optinteger L 3 posi) len)
+        lax:bool (!= (lua_toboolean L 4) 0)
+        n:i32 0)
+    (luaL_argcheck L (>= posi 1) 2 "out of bounds")
+    (luaL_argcheck L (<= pose (l_castU2S len)) 3 "out of bounds")
+    (when (> posi pose) (return 0))  ; an empty interval
+    (when (>= (- pose posi) INT_MAX)  ; too long for an int
+      (return (luaL_error L "string slice too long")))
+    (luaL_checkstack L (+ (cast_int (- pose posi)) 1) "string slice too long")
+    (let (se:(ptr i8) (unsafe/ptr+ s pose)  ; the end
+          code:ui32 0)
+      (set! s (unsafe/ptr+ s (- posi 1)))
+      (while (< (byte-diff s se) 0)
+        (set! s (utf8_decode s &code (not lax)))
+        (when (= s null)
+          (return (luaL_error L MSGInvalid)))
+        (lua_pushinteger L (as lua_Integer code))
+        (set! n (+ n 1))))
+    (return n)))
+
+(defn- pushutfchar (L:(ptr lua_State) arg:i32):void
+  (let (code:lua_Unsigned (l_castS2U (luaL_checkinteger L arg)))
+    (luaL_argcheck L (<= code MAXUTF) arg "value out of range")
+    (lua_pushfstring L "%U" code)))
+
+; utf8.char(n1, n2, ...): the characters, concatenated.
+(defn- utfchar (L:(ptr lua_State)):i32
+  (let (n:i32 (lua_gettop L))
+    (if (= n 1)  ; the common case
+      (pushutfchar L 1)
+      (let (b:&luaL_Buffer (alloca luaL_Buffer))
+        (luaL_buffinit L b)
+        (for (i:i32 1) (<= i n) (inc! i)
+          (pushutfchar L i)
+          (luaL_addvalue b))
+        (luaL_pushresult b)))
+    (return 1)))
+
+; utf8.offset(s, n [, i]): where the n-th character counted from position i
+; starts and ends; n = 0 means the character at i.
+(defn- byteoffset (L:(ptr lua_State)):i32
+  (let (len:usize 0
+        s:(ptr i8) (bytes (luaL_checklstring L 1 &len))
+        n:lua_Integer (luaL_checkinteger L 2)
+        posi:lua_Integer (u_posrelat (luaL_optinteger L 3 (if (>= n 0) 1 (+ (l_castU2S len) 1)))
+                                     len))
+    (luaL_argcheck L (and (<= 1 posi) (<= (dec! posi) (l_castU2S len))) 3
+                   "position out of bounds")
+    (if (= n 0)
+      ; the start of the current sequence
+      (while (and (> posi 0) (iscontp (unsafe/ptr+ s posi)))
+        (dec! posi))
+      (do
+        (when (iscontp (unsafe/ptr+ s posi))
+          (return (luaL_error L "initial position is a continuation byte")))
+        (if (< n 0)
+          (while (and (< n 0) (> posi 0))  ; back
+            (dec! posi)  ; to the start of the previous character
+            (while (and (> posi 0) (iscontp (unsafe/ptr+ s posi)))
+              (dec! posi))
+            (inc! n))
+          (do
+            (dec! n)  ; the first character is where we are
+            (while (and (> n 0) (< posi (l_castU2S len)))  ; forward
+              (inc! posi)  ; to the start of the next character
+              (while (iscontp (unsafe/ptr+ s posi))  ; stops at the final '\0'
+                (inc! posi))
+              (dec! n))))))
+    (when (!= n 0)  ; no such character
+      (luaL_pushfail L)
+      (return 1))
+    (lua_pushinteger L (+ posi 1))  ; where it starts
+    (when (!= (bit-and (aref s posi) (as i8 -128)) 0)  ; a multi-byte character?
+      (when (iscontp (unsafe/ptr+ s posi))
+        (return (luaL_error L "initial position is a continuation byte")))
+      (while (iscontp (unsafe/ptr+ s (+ posi 1)))
+        (inc! posi)))  ; to its last continuation byte
+    (lua_pushinteger L (+ posi 1))  ; where it ends
+    (return 2)))
+
+(defn- iter_aux (L:(ptr lua_State) strict:bool):i32
+  (let (len:usize 0
+        s:(ptr i8) (bytes (luaL_checklstring L 1 &len))
+        n:lua_Unsigned (l_castS2U (lua_tointeger L 2)))
+    (when (< n len)
+      (while (iscontp (unsafe/ptr+ s (l_castU2S n)))  ; to the next character
+        (inc! n)))
+    (when (>= n len)  ; also when 'n' started negative
+      (return 0))  ; no more code points
+    (let (code:ui32 0
+          next:(ptr i8) (utf8_decode (unsafe/ptr+ s (l_castU2S n)) &code strict))
+      (when (or (= next null) (iscontp next))
+        (return (luaL_error L MSGInvalid)))
+      (lua_pushinteger L (l_castU2S (+ n 1)))
+      (lua_pushinteger L (as lua_Integer code))
+      (return 2))))
+
+(defn- iter_auxstrict (L:(ptr lua_State)):i32
+  (return (iter_aux L true)))
+
+(defn- iter_auxlax (L:(ptr lua_State)):i32
+  (return (iter_aux L false)))
+
+(defn- iter_codes (L:(ptr lua_State)):i32
+  (let (lax:bool (!= (lua_toboolean L 2) 0)
+        s:(ptr i8) (bytes (luaL_checkstring L 1)))
+    (luaL_argcheck L (not (iscontp s)) 1 MSGInvalid)
+    (if lax
+      (lua_pushcfunction L iter_auxlax)
+      (lua_pushcfunction L iter_auxstrict))
+    (lua_pushvalue L 1)
+    (lua_pushinteger L 0)
+    (return 3)))
+
+; The pattern for one UTF-8 character. It holds a NUL, so its length is given.
+(defconst UTF8PATT "[\0-\x7F\xC2-\xFD][\x80-\xBF]*")
+(defconst UTF8PATT_LEN 14)
+
+(defn luaopen_utf8 (L:(ptr lua_State)):i32
+  (lua-newlib L
+    ("offset" byteoffset) ("codepoint" codepoint) ("char" utfchar) ("len" utflen)
+    ("codes" iter_codes) ("charpattern" null))  ; a placeholder
+  (lua_pushlstring L UTF8PATT UTF8PATT_LEN)
+  (lua_setfield L -2 "charpattern")
+  (return 1))

@@ -1,0 +1,79 @@
+; What the port's modules share from llimits.h: byte literals, the stdout and
+; stderr writers, and the assertion switch.
+;
+; llimits.h: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.util)
+(import-use "stdio.h")
+(import-ct nucleus.node)
+
+; A byte as an integer literal: (ch \e) is 101. A `\e` is a 32-bit Char, which
+; won't compare with an i8 byte, and converting it is refused as lossy.
+(defmacro ch (c) (node-int (c 'i)))
+
+; The bytes of a C string, for indexing; a CStr can't be indexed.
+(defmacro bytes (s) `(as (ptr i8) (as ptr ~s)))
+
+; The reverse, for a `char *` the importer read as (ptr i8), such as a field or
+; lua_tostring's result, where a CStr is wanted (ISSUE-019).
+(defmacro cstr (p) `(as CStr (as ptr ~p)))
+
+(defmacro lua_writestring (s l) `(fwrite ~s 1 ~l stdout))
+(defmacro lua_writeline () `(do (fwrite "\n" 1 1 stdout) (fflush stdout)))
+(defmacro lua_writestringerror (s p) `(do (fprintf stderr ~s ~p) (fflush stderr)))
+
+; lua_assert is compiled out, as in a stock build without LUAI_ASSERT.
+(defmacro lua_assert (c) `(do))
+
+; llimits.h's casts. C converts silently and Nucleus's `as` refuses anything
+; that can lose bits, so these are the port's one spelling of a C cast (ISSUE-008).
+(defmacro cast_int (x) `(unsafe/cast i32 ~x))
+(defmacro cast_uint (x) `(unsafe/cast ui32 ~x))
+(defmacro cast_num (x) `(unsafe/cast lua_Number ~x))
+(defmacro cast_sizet (x) `(unsafe/cast usize ~x))
+(defmacro cast_char (x) `(unsafe/cast i8 ~x))
+(defmacro cast_uchar (x) `(unsafe/cast ui8 ~x))
+(defmacro l_castS2U (x) `(unsafe/cast lua_Unsigned ~x))
+(defmacro l_castU2S (x) `(unsafe/cast lua_Integer ~x))
+
+; errno is a macro over __errno_location(), which the header import can't read.
+(defmacro errno () `(deref (__errno_location)))
+; set! won't expand a macro in its place, so (set! (errno) 0) is refused (ISSUE-020).
+(defmacro set-errno (v) `(set! (deref (__errno_location)) ~v))
+
+; How many bytes 'q' is past 'p'. Pointers can't be subtracted (ISSUE-021).
+(defmacro byte-diff (q p) `(- (unsafe/cast i64 (as ptr ~q)) (unsafe/cast i64 (as ptr ~p))))
+
+; luaL_setfuncs over a luaL_Reg list built on the stack, as a function's address
+; can't be constant data (ISSUE-004). `(name null)` is a placeholder entry.
+(defmacro lua-setfuncs (L nup :rest regs)
+  (let (l (gensym)
+        n (ast-len regs)
+        body (node-list-new (L 'line))
+        i 0)
+    (while (< i n)
+      (let (r (ast-at regs i)
+            k (node-int (as i64 i)))
+        (node-push body `(set! ((aref ~l ~k) 'name) (bytes ~(ast-at r 0))))
+        (node-push body `(set! ((aref ~l ~k) 'func) ~(ast-at r 1))))
+      (set! i (+ i 1)))
+    `(let ((~l (ptr luaL_Reg)) (alloca luaL_Reg ~(node-int (as i64 (+ n 1)))))
+       ~@body
+       (set! ((aref ~l ~(node-int (as i64 n))) 'name) null)
+       (set! ((aref ~l ~(node-int (as i64 n))) 'func) null)
+       (luaL_setfuncs ~L ~l ~nup))))
+
+; luaL_newlib over such a list.
+(defmacro lua-newlib (L :rest regs)
+  `(do (luaL_checkversion ~L)
+       (lua_createtable ~L 0 ~(node-int (as i64 (ast-len regs))))
+       (lua-setfuncs ~L 0 ~@regs)))
+
+; luaconf.h's lua_numbertointeger: whether float 'n' is in the integer range, and
+; if so stores it truncated into the integer place 'p'.
+(defmacro lua_numbertointeger (n p)
+  (let (d (gensym))
+    `(let ((~d f64) ~n)
+       (if (and (>= ~d (unsafe/cast f64 LUA_MININTEGER))
+                (< ~d (- 0.0 (unsafe/cast f64 LUA_MININTEGER))))
+         (do (set! ~p (unsafe/cast i64 ~d)) true)
+         false))))

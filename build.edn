@@ -3,7 +3,7 @@
 {:name "lua"
  :opt 2
  :cflags ["-Iinclude" "-DLUA_USE_LINUX"]
- :link-args ["-Wl,-E"]
+ :link-args ["-Wl,--dynamic-list=src/lua.dynlist"]
  :libs ["m" "dl"]
  :deps {luacapi {:path "capi"}}
  :c-sources ["reference/build/src/lapi.c" "reference/build/src/lcode.c"
@@ -16,9 +16,9 @@
              "reference/build/src/lstring.c" "reference/build/src/ltable.c"
              "reference/build/src/ltm.c" "reference/build/src/lundump.c"
              "reference/build/src/lvm.c" "reference/build/src/lzio.c"
-             "reference/build/src/lauxlib.c" "reference/build/src/lbaselib.c"
-             "reference/build/src/lcorolib.c" "reference/build/src/ldblib.c"
-             "reference/build/src/liolib.c" "reference/build/src/lmathlib.c"
+
+ "reference/build/src/ldblib.c"
+             "reference/build/src/liolib.c"
              "reference/build/src/loadlib.c" "reference/build/src/loslib.c"
              "reference/build/src/lstrlib.c" "reference/build/src/ltablib.c"
-             "reference/build/src/lutf8lib.c" "reference/build/src/linit.c"]}
+ "reference/build/src/linit.c"]}

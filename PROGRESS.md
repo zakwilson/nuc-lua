@@ -27,7 +27,8 @@ object model, the compiler, execution state, the collector and the VM (§10).
 |---|---|
 | 0 Setup | done: env and setup scripts, reference and suite, spike, probes, hybrid build |
 | 1 Binding and first library | done: `capi/` (both layers), layout gate, `libs/mayi`, `tests/capi/capi.c`, stock column |
-| 2–11 | not started |
+| 2 Host and libraries | in progress: `lua.c`, `lauxlib.c`, `lbaselib`, `lcorolib`, `lmathlib`, `lutf8lib` ported |
+| 3–11 | not started |
 
 ### Nucleus
 
@@ -38,11 +39,20 @@ Compiler: `.nucleus-work` on `lua-bugfixes` (see CLAUDE.md).
   `design/lua-bugfixes/variadic-functions.md`
 - `beb0472` header import of `RET (name)(args)` (ISSUE-002), defvar arrays of a
   header struct (ISSUE-003)
+- `5dab7cb` an imported file defines a function its header declares (ISSUE-013)
+- `0081d2a` an array field of a nested place decays into the place (ISSUE-023)
 
 ### Still stock
 
-Everything but `lua.c` (replaced by a stub host in `src/main.nuc` that runs one
-script) and `luac.c` (not built yet).
+Everything but `lua.c` (`src/main.nuc`, namespace `lua.host`), `lauxlib.c`
+(`src/lua/aux.nuc`, `lua.aux`) and the libraries in `src/lua/` (`baselib`, `corolib`,
+`mathlib`, `utf8lib`). A library's `luaL_Reg` table is built on the stack by
+`lua.util/lua-newlib` (ISSUE-004). `luac.c` isn't built yet. `src/lua/util.nuc` holds what
+the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `cstr`,
+`errno`, `set-errno`, `byte-diff`, the `cast_*` family).
+
+`src/lua.dynlist` limits the executable's dynamic table to `lua_*`, `luaL_*` and
+`luaopen_*`, so a module loaded by `require` binds only the API, as with stock `lua`.
 
 ## Verified
 
@@ -50,6 +60,9 @@ script) and `luac.c` (not built yet).
 - `scratch/mayi.c` built by gcc and `libs/mayi` built by Nucleus behave the same in
   stock `lua`: `false` four times on an idle pipe, `true` with data, `require`
   returns a table.
+- The port, with Nucleus `lua.c` and `lauxlib.c` over the stock core, passes the
+  suite (`scripts/check-suite.sh`) and the whole `check-capi.sh` matrix, both modules
+  in both hosts. `lua.c`'s options checked by hand: `-v -e -i -E -`, `LUA_INIT`, usage.
 - The spike: a Nucleus `luaopen_` module whose function raises with `luaL_error`
   (a real C variadic call) is caught by `pcall` in stock `lua`.
 
@@ -61,11 +74,12 @@ script) and `luac.c` (not built yet).
 - `scripts/build-libs.sh` builds `libs/*` into `build/so/n/`; `setup.sh` builds the C
   modules into `build/so/c/`.
 - `scripts/check-probes.sh`.
+- `scripts/check-suite.sh` runs the official suite (`LUA=` picks the binary).
 
 ## Next
 
-M2: port `lua.c` (replacing `src/main.nuc`), `lauxlib.c` and each standard library,
-over the stock core. Then `scripts/check-suite.sh` and the port column of the matrix.
+M2: the libraries, one at a time, each followed by `check-suite.sh`: `ldblib`,
+`liolib`, `loadlib`, `loslib`, `lstrlib`, `ltablib`, `linit`. Then the M2 gate and commit.
 
 ## Open questions
 

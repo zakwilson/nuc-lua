@@ -1,0 +1,136 @@
+; The coroutine library.
+;
+; lcorolib.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.corolib)
+(set-ir-prefix "")
+(import-use luacapi)
+(import-use lua.util)
+(import-use "stdlib.h")
+
+(defn- getco (L:(ptr lua_State)):(ptr lua_State)
+  (let (co:(ptr lua_State) (lua_tothread L 1))
+    (luaL_argexpected L (!= co null) 1 "thread")
+    (return co)))
+
+; Resumes 'co' with 'narg' arguments: the number of results, or -1 on an error.
+(defn- auxresume (L:(ptr lua_State) co:(ptr lua_State) narg:i32):i32
+  (when (= (lua_checkstack co narg) 0)
+    (lua_pushliteral L "too many arguments to resume")
+    (return -1))
+  (lua_xmove L co narg)
+  (let (nres:i32 0
+        status:i32 (lua_resume co L narg &nres))
+    (when (or (= status LUA_OK) (= status LUA_YIELD))
+      (when (= (lua_checkstack L (+ nres 1)) 0)
+        (lua_pop co nres)  ; drop the results anyway
+        (lua_pushliteral L "too many results to resume")
+        (return -1))
+      (lua_xmove co L nres)  ; the yielded values
+      (return nres))
+    (lua_xmove co L 1)  ; the error message
+    (return -1)))
+
+(defn- luaB_coresume (L:(ptr lua_State)):i32
+  (let (co:(ptr lua_State) (getco L)
+        r:i32 (auxresume L co (- (lua_gettop L) 1)))
+    (when (< r 0)
+      (lua_pushboolean L 0)
+      (lua_insert L -2)
+      (return 2))  ; false and the message
+    (lua_pushboolean L 1)
+    (lua_insert L (- 0 (+ r 1)))
+    (return (+ r 1))))  ; true and what resume returned
+
+(defn- luaB_auxwrap (L:(ptr lua_State)):i32
+  (let (co:(ptr lua_State) (lua_tothread L (lua_upvalueindex 1))
+        r:i32 (auxresume L co (lua_gettop L)))
+    (when (< r 0)
+      (let (stat:i32 (lua_status co))
+        (when (and (!= stat LUA_OK) (!= stat LUA_YIELD))  ; an error in the coroutine?
+          (set! stat (lua_closethread co L))  ; close its tbc variables
+          (lua_xmove co L 1))  ; the message, to the caller
+        (when (and (!= stat LUA_ERRMEM) (= (lua_type L -1) LUA_TSTRING))
+          (luaL_where L 1)  ; add the position, if there is one
+          (lua_insert L -2)
+          (lua_concat L 2))
+        (return (lua_error L))))
+    (return r)))
+
+(defn- luaB_cocreate (L:(ptr lua_State)):i32
+  (luaL_checktype L 1 LUA_TFUNCTION)
+  (let (NL:(ptr lua_State) (lua_newthread L))
+    (lua_pushvalue L 1)
+    (lua_xmove L NL 1)  ; the function, into the new thread
+    (return 1)))
+
+(defn- luaB_cowrap (L:(ptr lua_State)):i32
+  (luaB_cocreate L)
+  (lua_pushcclosure L luaB_auxwrap 1)
+  (return 1))
+
+(defn- luaB_yield (L:(ptr lua_State)):i32
+  (return (lua_yield L (lua_gettop L))))
+
+(defconst COS_RUN 0)
+(defconst COS_DEAD 1)
+(defconst COS_YIELD 2)
+(defconst COS_NORM 3)
+
+(defvar- statname:(array CStr 4) (array CStr "running" "dead" "suspended" "normal"))
+
+(defn- auxstatus (L:(ptr lua_State) co:(ptr lua_State)):i32
+  (when (= L co) (return COS_RUN))
+  (let (s:i32 (lua_status co))
+    (cond
+      (= s LUA_YIELD) (return COS_YIELD)
+      (= s LUA_OK)
+        (let (ar:&lua_Debug (alloca lua_Debug))
+          (cond
+            (!= (lua_getstack co 0 ar) 0) (return COS_NORM)  ; it has frames: running
+            (= (lua_gettop co) 0) (return COS_DEAD)
+            true (return COS_YIELD)))))  ; not started
+  (return COS_DEAD))  ; an error
+
+(defn- luaB_costatus (L:(ptr lua_State)):i32
+  (let (co:(ptr lua_State) (getco L))
+    (lua_pushstring L (aref statname (auxstatus L co)))
+    (return 1)))
+
+(defn- getoptco (L:(ptr lua_State)):(ptr lua_State)
+  (return (if (lua_isnone L 1) L (getco L))))
+
+(defn- luaB_yieldable (L:(ptr lua_State)):i32
+  (lua_pushboolean L (lua_isyieldable (getoptco L)))
+  (return 1))
+
+(defn- luaB_corunning (L:(ptr lua_State)):i32
+  (lua_pushboolean L (lua_pushthread L))
+  (return 2))
+
+(defn- luaB_close (L:(ptr lua_State)):i32
+  (let (co:(ptr lua_State) (getoptco L)
+        status:i32 (auxstatus L co))
+    (cond
+      (or (= status COS_DEAD) (= status COS_YIELD))
+        (do (set! status (lua_closethread co L))
+            (when (= status LUA_OK)
+              (lua_pushboolean L 1)
+              (return 1))
+            (lua_pushboolean L 0)
+            (lua_xmove co L 1)  ; the error message
+            (return 2))
+      (= status COS_NORM)
+        (return (luaL_error L "cannot close a %s coroutine" (aref statname status)))
+      (= status COS_RUN)
+        (do (lua_geti L LUA_REGISTRYINDEX LUA_RIDX_MAINTHREAD)
+            (when (= (lua_tothread L -1) co)
+              (return (luaL_error L "cannot close main thread")))
+            (lua_closethread co L)))  ; closes itself, and doesn't return
+    (return 0)))
+
+(defn luaopen_coroutine (L:(ptr lua_State)):i32
+  (lua-newlib L
+    ("create" luaB_cocreate) ("resume" luaB_coresume) ("running" luaB_corunning)
+    ("status" luaB_costatus) ("wrap" luaB_cowrap) ("yield" luaB_yield)
+    ("isyieldable" luaB_yieldable) ("close" luaB_close))
+  (return 1))

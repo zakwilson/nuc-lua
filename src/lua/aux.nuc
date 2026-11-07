@@ -1,0 +1,754 @@
+; The auxiliary library: functions for building Lua libraries, written against
+; the public API only.
+;
+; lauxlib.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.aux)
+(set-ir-prefix "")
+(import-use luacapi)
+(import-use lua.util)
+(import-use "stdio.h")
+(import-use "stdlib.h")
+(import-use "string.h")
+(import-use "errno.h")
+(import-use "time.h")
+
+; ---- Traceback ----
+
+(defconst LEVELS1 10)  ; size of the first part of the stack
+(defconst LEVELS2 11)  ; size of the second part of the stack
+
+; Looks for the value at 'objidx' (absolute) in the table on the top, at most
+; 'level' tables deep. On success leaves its name on the top and returns true.
+(defn- findfield (L:(ptr lua_State) objidx:i32 level:i32):bool
+  (when (or (= level 0) (not (lua_istable L -1)))
+    (return false))
+  (lua_pushnil L)  ; start the 'next' loop
+  (while (!= (lua_next L -2) 0)
+    (when (= (lua_type L -2) LUA_TSTRING)  ; ignore non-string keys
+      (cond
+        (!= (lua_rawequal L objidx -1) 0)
+          (do (lua_pop L 1)  ; remove the value, keep the name
+              (return true))
+        (findfield L objidx (- level 1))
+          (do ; stack: lib_name, lib_table, field_name (top)
+              (lua_pushliteral L ".")
+              (lua_replace L -3)  ; in the table's slot
+              (lua_concat L 3)    ; lib_name.field_name
+              (return true))))
+    (lua_pop L 1))
+  (return false))
+
+; Searches every loaded module for a name for the function in 'ar'.
+(defn- pushglobalfuncname (L:(ptr lua_State) ar:(ptr lua_Debug)):bool
+  (let (top:i32 (lua_gettop L))
+    (lua_getinfo L "f" ar)  ; push the function
+    (lua_getfield L LUA_REGISTRYINDEX LUA_LOADED_TABLE)
+    (luaL_checkstack L 6 "not enough stack")  ; slots for findfield
+    (if (findfield L (+ top 1) 2)
+      (let (name:CStr (lua_tostring L -1))
+        (when (= (strncmp name "_G." 3) 0)
+          (lua_pushstring L (as CStr (as ptr (unsafe/ptr+ (bytes name) 3))))
+          (lua_remove L -2))  ; the original name
+        (lua_copy L -1 (+ top 1))
+        (lua_settop L (+ top 1))  ; drop the "loaded" table and the copy
+        (return true))
+      (do (lua_settop L top)  ; drop the function and the table
+          (return false)))))
+
+(defn- pushfuncname (L:(ptr lua_State) ar:&lua_Debug):void
+  (cond
+    (!= (aref (bytes (ar 'namewhat)) 0) 0)  ; a name from the code?
+      (lua_pushfstring L "%s '%s'" (ar 'namewhat) (ar 'name))
+    (= (aref (bytes (ar 'what)) 0) (ch \m))  ; main?
+      (lua_pushliteral L "main chunk")
+    (pushglobalfuncname L ar)
+      (do (lua_pushfstring L "function '%s'" (lua_tostring L -1))
+          (lua_remove L -2))
+    (!= (aref (bytes (ar 'what)) 0) (ch \C))  ; a Lua function: use <file:line>
+      (lua_pushfstring L "function <%s:%d>" (ref ar 'short_src) (ar 'linedefined))
+    true (lua_pushliteral L "?")))
+
+(defn- lastlevel (L:(ptr lua_State)):i32
+  (let (ar:&lua_Debug (alloca lua_Debug)
+        li:i32 1
+        le:i32 1)
+    (while (!= (lua_getstack L le ar) 0)  ; find an upper bound
+      (set! li le)
+      (set! le (* le 2)))
+    (while (< li le)  ; binary search
+      (let (m:i32 (/ (+ li le) 2))
+        (if (!= (lua_getstack L m ar) 0)
+          (set! li (+ m 1))
+          (set! le m))))
+    (return (- le 1))))
+
+(defn luaL_traceback (L:(ptr lua_State) L1:(ptr lua_State) msg:CStr level:i32):void
+  (let (b:&luaL_Buffer (alloca luaL_Buffer)
+        ar:&lua_Debug (alloca lua_Debug)
+        last:i32 (lastlevel L1)
+        limit2show:i32 (if (> (- last level) (+ LEVELS1 LEVELS2)) LEVELS1 -1))
+    (luaL_buffinit L b)
+    (when (!= (as ptr msg) null)
+      (luaL_addstring b msg)
+      (luaL_addchar b (ch \newline)))
+    (luaL_addstring b "stack traceback:")
+    (while (!= (lua_getstack L1 level ar) 0)
+      (set! level (+ level 1))
+      (if (= limit2show 0)  ; too many levels?
+        (let (n:i32 (+ (- last level LEVELS2) 1))  ; levels to skip
+          (lua_pushfstring L "\n\t...\t(skipping %d levels)" n)
+          (luaL_addvalue b)
+          (set! level (+ level n)))
+        (do
+          (lua_getinfo L1 "Slnt" ar)
+          (if (<= (ar 'currentline) 0)
+            (lua_pushfstring L "\n\t%s: in " (ref ar 'short_src))
+            (lua_pushfstring L "\n\t%s:%d: in " (ref ar 'short_src) (ar 'currentline)))
+          (luaL_addvalue b)
+          (pushfuncname L ar)
+          (luaL_addvalue b)
+          (when (!= (ar 'istailcall) 0)
+            (luaL_addstring b "\n\t(...tail calls...)"))))
+      (set! limit2show (- limit2show 1)))
+    (luaL_pushresult b)))
+
+; ---- Error reporting ----
+
+(defn luaL_argerror (L:(ptr lua_State) arg:i32 extramsg:CStr):i32
+  (let (ar:&lua_Debug (alloca lua_Debug)
+        argword:CStr "argument")
+    (when (= (lua_getstack L 0 ar) 0)  ; no stack frame?
+      (return (luaL_error L "bad argument #%d (%s)" arg extramsg)))
+    (lua_getinfo L "nt" ar)
+    (if (<= arg (as i32 (ar 'extraargs)))  ; an extra argument?
+      (set! argword "extra argument")
+      (do
+        (set! arg (- arg (as i32 (ar 'extraargs))))  ; don't count extra arguments
+        (when (= (strcmp (ar 'namewhat) "method") 0)  ; colon syntax?
+          (set! arg (- arg 1))  ; don't count self
+          (when (= arg 0)  ; the error is in self
+            (return (luaL_error L "calling '%s' on bad self (%s)" (ar 'name) extramsg))))))
+    (when (= (as ptr (ar 'name)) null)
+      (let (gname:CStr "?")
+        (when (pushglobalfuncname L ar) (set! gname (lua_tostring L -1)))
+        (set! (ar 'name) (bytes gname))))
+    (return (luaL_error L "bad %s #%d to '%s' (%s)" argword arg (ar 'name) extramsg))))
+
+(defn luaL_typeerror (L:(ptr lua_State) arg:i32 tname:CStr):i32
+  (let (typearg:CStr  ; the name of the actual argument's type
+          (cond
+            (= (luaL_getmetafield L arg "__name") LUA_TSTRING) (cstr (lua_tostring L -1))
+            (= (lua_type L arg) LUA_TLIGHTUSERDATA) "light userdata"
+            true (cstr (luaL_typename L arg))))
+    (return (luaL_argerror L arg (lua_pushfstring L "%s expected, got %s" tname typearg)))))
+
+(defn- tag-error (L:(ptr lua_State) arg:i32 tag:i32):void
+  (luaL_typeerror L arg (lua_typename L tag)))
+
+; lua_pushfstring needs no reserved stack space, so neither does this.
+(defn luaL_where (L:(ptr lua_State) level:i32):void
+  (let (ar:&lua_Debug (alloca lua_Debug))
+    (when (!= (lua_getstack L level ar) 0)  ; check the function at 'level'
+      (lua_getinfo L "Sl" ar)
+      (when (> (ar 'currentline) 0)
+        (lua_pushfstring L "%s:%d: " (ref ar 'short_src) (ar 'currentline))
+        (return)))
+    (lua_pushfstring L "")))
+
+; lua_pushvfstring needs no reserved stack space either; at worst it raises a
+; memory error in place of the message.
+(defn luaL_error (L:(ptr lua_State) fmt:CStr :varargs argp):i32
+  (luaL_where L 1)
+  (lua_pushvfstring L fmt argp)
+  (lua_concat L 2)
+  (return (lua_error L)))
+
+(defn luaL_fileresult (L:(ptr lua_State) stat:i32 fname:CStr):i32
+  (let (en:i32 (errno))  ; the API may change errno
+    (when (!= stat 0)
+      (lua_pushboolean L 1)
+      (return 1))
+    (luaL_pushfail L)
+    (let (msg:CStr (if (!= en 0) (cstr (strerror en)) "(no extra info)"))
+      (if (!= (as ptr fname) null)
+        (lua_pushfstring L "%s: %s" fname msg)
+        (lua_pushstring L msg))
+      (lua_pushinteger L (as lua_Integer en))
+      (return 3))))
+
+(defn luaL_execresult (L:(ptr lua_State) stat:i32):i32
+  (when (and (!= stat 0) (!= (errno) 0))  ; an error with an errno?
+    (return (luaL_fileresult L 0 (as CStr null))))
+  (let (what:CStr "exit")  ; how the process ended
+    ; l_inspectstat: WIFEXITED and the rest are function-like macros (ISSUE-018).
+    (cond
+      (= (bit-and stat 0x7f) 0)  ; WIFEXITED
+        (set! stat (bit-and (bit-shr stat 8) 0xff))  ; WEXITSTATUS
+      (> (bit-shr (unsafe/cast i8 (+ (bit-and stat 0x7f) 1)) 1) 0)  ; WIFSIGNALED
+        (do (set! stat (bit-and stat 0x7f))  ; WTERMSIG
+            (set! what "signal")))
+    (if (and (= (aref (bytes what) 0) (ch \e)) (= stat 0))
+      (lua_pushboolean L 1)
+      (luaL_pushfail L))
+    (lua_pushstring L what)
+    (lua_pushinteger L (as lua_Integer stat))
+    (return 3)))  ; true/fail, what, code
+
+; ---- Userdata metatables ----
+
+(defn luaL_newmetatable (L:(ptr lua_State) tname:CStr):i32
+  (when (!= (luaL_getmetatable L tname) LUA_TNIL)  ; the name is in use
+    (return 0))  ; leave the previous value on top
+  (lua_pop L 1)
+  (lua_createtable L 0 2)
+  (lua_pushstring L tname)
+  (lua_setfield L -2 "__name")  ; metatable.__name = tname
+  (lua_pushvalue L -1)
+  (lua_setfield L LUA_REGISTRYINDEX tname)  ; registry.name = metatable
+  (return 1))
+
+(defn luaL_setmetatable (L:(ptr lua_State) tname:CStr):void
+  (luaL_getmetatable L tname)
+  (lua_setmetatable L -2))
+
+(defn luaL_testudata (L:(ptr lua_State) ud:i32 tname:CStr):ptr
+  (let (p:ptr (lua_touserdata L ud))
+    (when (and (!= p null) (!= (lua_getmetatable L ud) 0))
+      (luaL_getmetatable L tname)  ; the right metatable
+      (when (= (lua_rawequal L -1 -2) 0)
+        (set! p null))  ; a userdata with the wrong metatable
+      (lua_pop L 2)
+      (return p))
+    (return null)))  ; not a userdata with a metatable
+
+(defn luaL_checkudata (L:(ptr lua_State) ud:i32 tname:CStr):ptr
+  (let (p:ptr (luaL_testudata L ud tname))
+    (luaL_argexpected L (!= p null) ud tname)
+    (return p)))
+
+; ---- Argument checks ----
+
+(defn luaL_checkoption (L:(ptr lua_State) arg:i32 def:CStr lst0:ptr):i32
+  (let (name:CStr (if (!= (as ptr def) null)
+                    (luaL_optstring L arg def)
+                    (luaL_checkstring L arg))
+        lst:(ptr CStr) (unsafe/cast (ptr CStr) lst0)  ; the header's array imports as ptr
+        i:i32 0)
+    (while (!= (as ptr (aref lst i)) null)
+      (when (= (strcmp (aref lst i) name) 0)
+        (return i))
+      (set! i (+ i 1)))
+    (return (luaL_argerror L arg (lua_pushfstring L "invalid option '%s'" name)))))
+
+; Error handling needs a few slots to format its message; without them Lua
+; raises the same 'stack overflow', only without 'msg'.
+(defn luaL_checkstack (L:(ptr lua_State) space:i32 msg:CStr):void
+  (when (= (lua_checkstack L space) 0)
+    (if (!= (as ptr msg) null)
+      (luaL_error L "stack overflow (%s)" msg)
+      (luaL_error L "stack overflow"))))
+
+(defn luaL_checktype (L:(ptr lua_State) arg:i32 t:i32):void
+  (when (!= (lua_type L arg) t)
+    (tag-error L arg t)))
+
+(defn luaL_checkany (L:(ptr lua_State) arg:i32):void
+  (when (= (lua_type L arg) LUA_TNONE)
+    (luaL_argerror L arg "value expected")))
+
+(defn luaL_checklstring (L:(ptr lua_State) arg:i32 len:(ptr usize)):CStr
+  (let (s:CStr (lua_tolstring L arg len))
+    (when (= (as ptr s) null) (tag-error L arg LUA_TSTRING))
+    (return s)))
+
+(defn luaL_optlstring (L:(ptr lua_State) arg:i32 def:CStr len:(ptr usize)):CStr
+  (when (lua_isnoneornil L arg)
+    (when (!= len null)
+      (set! (deref len) (if (!= (as ptr def) null) (strlen def) 0)))
+    (return def))
+  (return (luaL_checklstring L arg len)))
+
+(defn luaL_checknumber (L:(ptr lua_State) arg:i32):lua_Number
+  (let (isnum:i32 0
+        d:lua_Number (lua_tonumberx L arg &isnum))
+    (when (= isnum 0) (tag-error L arg LUA_TNUMBER))
+    (return d)))
+
+(defn luaL_optnumber (L:(ptr lua_State) arg:i32 def:lua_Number):lua_Number
+  (return (luaL_opt L luaL_checknumber arg def)))
+
+(defn- interror (L:(ptr lua_State) arg:i32):void
+  (if (!= (lua_isnumber L arg) 0)
+    (luaL_argerror L arg "number has no integer representation")
+    (tag-error L arg LUA_TNUMBER)))
+
+(defn luaL_checkinteger (L:(ptr lua_State) arg:i32):lua_Integer
+  (let (isnum:i32 0
+        d:lua_Integer (lua_tointegerx L arg &isnum))
+    (when (= isnum 0) (interror L arg))
+    (return d)))
+
+(defn luaL_optinteger (L:(ptr lua_State) arg:i32 def:lua_Integer):lua_Integer
+  (return (luaL_opt L luaL_checkinteger arg def)))
+
+; ---- Buffers ----
+
+; A userdata boxing a block from the state's allocator.
+(defstruct UBox
+  box:ptr
+  bsize:usize)
+
+; Resizes a box's block. Resizing to the same size is common (__gc resizes a
+; closed box to 0; pushresult may resize to the size the buffer began with).
+(defn- resizebox (L:(ptr lua_State) idx:i32 newsize:usize):ptr
+  (let (box:&UBox (unsafe/cast &UBox (lua_touserdata L idx)))
+    (when (= (box 'bsize) newsize)
+      (return (box 'box)))
+    (let (ud:ptr null
+          allocf:lua_Alloc (lua_getallocf L &ud)
+          temp:ptr (allocf ud (box 'box) (box 'bsize) newsize))
+      (when (and (= temp null) (> newsize 0))  ; allocation error?
+        (lua_pushliteral L "not enough memory")
+        (lua_error L))  ; raise a memory error
+      (set! (box 'box) temp)
+      (set! (box 'bsize) newsize)
+      (return temp))))
+
+(defn- boxgc (L:(ptr lua_State)):i32
+  (resizebox L 1 0)
+  (return 0))
+
+; Gets or creates the boxes' metatable. Built call by call rather than from a
+; luaL_Reg table, which can't be constant data (ISSUE-004).
+(defn- getBoxMT (L:(ptr lua_State)):void
+  (when (= (luaL_getmetatable L "_UBOX*") LUA_TNIL)
+    (lua_createtable L 0 2)
+    (lua_pushcfunction L boxgc)
+    (lua_setfield L -2 "__gc")
+    (lua_pushcfunction L boxgc)
+    (lua_setfield L -2 "__close")
+    (lua_copy L -1 -2)  ; nil,MT -> MT,MT
+    (lua_setfield L LUA_REGISTRYINDEX "_UBOX*")))
+
+(defn- newbox (L:(ptr lua_State)):void
+  (let (box:&UBox (unsafe/cast &UBox (lua_newuserdatauv L (sizeof UBox) 0)))
+    (set! (box 'box) null)
+    (set! (box 'bsize) 0)
+    (getBoxMT L)
+    (lua_setmetatable L -2)))
+
+; Whether the buffer has moved into a box on the stack. `b` is a CStr, whose `=`
+; compares contents, so the addresses are compared as plain pointers.
+(defmacro- buffonstack (B) `(!= (as ptr (~B 'b)) (as ptr ((~B 'init) 'b))))
+
+(defconst MAX_SIZE 0x7fffffffffffffff)  ; LUA_MAXINTEGER, smaller than MAX_SIZET
+
+; A size for 'B' with room for 'sz' more bytes and a terminating zero.
+(defn- newbuffsize (B:&luaL_Buffer sz:usize):usize
+  (let (newsize:usize (B 'size))
+    (when (>= sz (- MAX_SIZE (B 'n)))
+      (return (cast_sizet (luaL_error (B 'L) "resulting string too large"))))
+    (when (<= newsize (* (/ MAX_SIZE 3) 2))  ; no overflow?
+      (set! newsize (+ newsize (bit-shr newsize 1))))  ; grow by half
+    (when (< newsize (+ (B 'n) sz 1))  ; not big enough?
+      (set! newsize (+ (B 'n) sz 1)))
+    (return newsize)))
+
+; Room for 'sz' bytes in 'B'. 'boxidx' is where the buffer's box, or its
+; placeholder, sits on the stack.
+(defn- prepbuffsize (B:&luaL_Buffer sz:usize boxidx:i32):(ptr i8)
+  (when (>= (- (B 'size) (B 'n)) sz)  ; enough space?
+    (return (unsafe/ptr+ (bytes (B 'b)) (as i64 (B 'n)))))
+  (let (L:(ptr lua_State) (B 'L)
+        newsize:usize (newbuffsize B sz)
+        newbuff:(ptr i8) null)
+    (if (buffonstack B)  ; already boxed?
+      (set! newbuff (as (ptr i8) (resizebox L boxidx newsize)))
+      (do
+        (lua_remove L boxidx)  ; the placeholder
+        (newbox L)
+        (lua_insert L boxidx)  ; the box goes where the placeholder was
+        (lua_toclose L boxidx)
+        (set! newbuff (as (ptr i8) (resizebox L boxidx newsize)))
+        (memcpy newbuff (B 'b) (B 'n))))  ; the content so far
+    (set! (B 'b) (as CStr (as ptr newbuff)))
+    (set! (B 'size) newsize)
+    (return (unsafe/ptr+ newbuff (as i64 (B 'n))))))
+
+(defn luaL_prepbuffsize (B:(ptr luaL_Buffer) sz:usize):CStr
+  (return (as CStr (as ptr (prepbuffsize (unsafe/cast &luaL_Buffer B) sz -1)))))
+
+(defn luaL_addlstring (B:(ptr luaL_Buffer) s:CStr l:usize):void
+  (when (> l 0)  ; 's' may be NULL when 'l' is 0
+    (let (b:(ptr i8) (prepbuffsize (unsafe/cast &luaL_Buffer B) l -1))
+      (memcpy b s l)
+      (luaL_addsize B l))))
+
+(defn luaL_addstring (B:(ptr luaL_Buffer) s:CStr):void
+  (luaL_addlstring B s (strlen s)))
+
+(defn luaL_pushresult (B0:(ptr luaL_Buffer)):void
+  (let (B:&luaL_Buffer (unsafe/cast &luaL_Buffer B0)
+        L:(ptr lua_State) (B 'L))
+    (if (not (buffonstack B))  ; the buffer inside the struct?
+      (lua_pushlstring L (B 'b) (B 'n))
+      (let (box:&UBox (unsafe/cast &UBox (lua_touserdata L -1))
+            ud:ptr null
+            allocf:lua_Alloc (lua_getallocf L &ud)  ; frees the block later
+            len:usize (B 'n))
+        (resizebox L -1 (+ len 1))  ; fit the block to the content
+        (let (s:(ptr i8) (as (ptr i8) (box 'box)))
+          (set! (aref s (as i64 len)) 0)
+          ; Lua takes the block over, so the box lets go of it
+          (set! (box 'bsize) 0)
+          (set! (box 'box) null)
+          (lua_pushexternalstring L (as CStr (as ptr s)) len allocf ud)
+          (lua_closeslot L -2)  ; close the box
+          (lua_gc L LUA_GCSTEP (cast_int len)))))
+    (lua_remove L -2)))  ; the box or the placeholder
+
+(defn luaL_pushresultsize (B:(ptr luaL_Buffer) sz:usize):void
+  (luaL_addsize B sz)
+  (luaL_pushresult B))
+
+; The one buffer function whose box isn't on the top: the value sits above it,
+; so prepbuffsize is told -2. Creating a box can collect, so the string stays on
+; the stack until the space is there.
+(defn luaL_addvalue (B0:(ptr luaL_Buffer)):void
+  (let (B:&luaL_Buffer (unsafe/cast &luaL_Buffer B0)
+        L:(ptr lua_State) (B 'L)
+        len:usize 0
+        s:CStr (lua_tolstring L -1 &len)
+        b:(ptr i8) (prepbuffsize B len -2))
+    (memcpy b s len)
+    (luaL_addsize B len)
+    (lua_pop L 1)))
+
+(defn luaL_buffinit (L:(ptr lua_State) B:(ptr luaL_Buffer)):void
+  (set! (B 'L) L)
+  (set! (B 'b) (as CStr (as ptr ((B 'init) 'b))))
+  (set! (B 'n) 0)
+  (set! (B 'size) LUAL_BUFFERSIZE)
+  (lua_pushlightuserdata L B))  ; the placeholder
+
+(defn luaL_buffinitsize (L:(ptr lua_State) B:(ptr luaL_Buffer) sz:usize):CStr
+  (luaL_buffinit L B)
+  (return (as CStr (as ptr (prepbuffsize (unsafe/cast &luaL_Buffer B) sz -1)))))
+
+; ---- References ----
+
+; Freed references form a list: t[1] is the first free index, t[t[1]] the
+; second, and so on; 0 ends it.
+(defn luaL_ref (L:(ptr lua_State) t:i32):i32
+  (when (lua_isnil L -1)
+    (lua_pop L 1)
+    (return LUA_REFNIL))  ; nil has its own fixed reference
+  (set! t (lua_absindex L t))
+  (let (ref:i32 0)
+    (if (= (lua_rawgeti L t 1) LUA_TNUMBER)  ; initialized?
+      (set! ref (cast_int (lua_tointeger L -1)))  ; ref = t[1]
+      (do (lua_assert (= (lua_toboolean L -1) 0))
+          (lua_pushinteger L 0)  ; an empty list
+          (lua_rawseti L t 1)))
+    (lua_pop L 1)
+    (if (!= ref 0)  ; a free element?
+      (do (lua_rawgeti L t (as lua_Integer ref))  ; take it off the list
+          (lua_rawseti L t 1))  ; t[1] = t[ref]
+      (set! ref (+ (cast_int (lua_rawlen L t)) 1)))  ; a new reference
+    (lua_rawseti L t (as lua_Integer ref))
+    (return ref)))
+
+(defn luaL_unref (L:(ptr lua_State) t:i32 ref:i32):void
+  (when (>= ref 0)
+    (set! t (lua_absindex L t))
+    (lua_rawgeti L t 1)
+    (lua_rawseti L t (as lua_Integer ref))  ; t[ref] = t[1]
+    (lua_pushinteger L (as lua_Integer ref))
+    (lua_rawseti L t 1)))  ; t[1] = ref
+
+; ---- Loading ----
+
+(defstruct LoadF
+  n:ui32  ; pre-read bytes
+  f:(ptr FILE)
+  buff:(array i8 BUFSIZ))
+
+(defn- getF (L:(ptr lua_State) ud:ptr size:(ptr usize)):CStr
+  (let (lf:&LoadF (unsafe/cast &LoadF ud))
+    (if (> (lf 'n) 0)  ; pre-read bytes first
+      (do (set! (deref size) (as usize (lf 'n)))
+          (set! (lf 'n) 0))
+      (do
+        ; fread can return data and set EOF at once; reading again could block
+        ; waiting for input, so stop here.
+        (when (!= (feof (lf 'f)) 0) (return (as CStr null)))
+        (set! (deref size) (fread (ref lf 'buff) 1 BUFSIZ (lf 'f)))))
+    (return (as CStr (as ptr (ref lf 'buff))))))
+
+(defn- errfile (L:(ptr lua_State) what:CStr fnameindex:i32):i32
+  (let (err:i32 (errno)
+        filename:CStr (as CStr (as ptr (unsafe/ptr+ (bytes (lua_tostring L fnameindex)) 1))))
+    (if (!= err 0)
+      (lua_pushfstring L "cannot %s %s: %s" what filename (strerror err))
+      (lua_pushfstring L "cannot %s %s" what filename))
+    (lua_remove L fnameindex)
+    (return LUA_ERRFILE)))
+
+; Skips a BOM. A partial one returns its first byte, to force an error: no
+; chunk starts with 0xEF.
+(defn- skipBOM (f:(ptr FILE)):i32
+  (let (c:i32 (getc f))
+    (if (and (= c 0xEF) (= (getc f) 0xBB) (= (getc f) 0xBF))
+      (return (getc f))
+      (return c))))
+
+; Skips a BOM and a first line starting with '#'. Returns whether it skipped a
+; line; 'cp' gets the first byte after them.
+(defn- skipcomment (f:(ptr FILE) cp:&i32):bool
+  (let (c:i32 (skipBOM f))
+    (set! (deref cp) c)
+    (when (= c (ch \#))  ; a Unix executable's first line
+      (while (and (!= c EOF) (!= c (ch \newline)))
+        (set! c (getc f)))
+      (set! (deref cp) (getc f))
+      (return true))
+    (return false)))
+
+(defn luaL_loadfilex (L:(ptr lua_State) filename:CStr mode:CStr):i32
+  (let (lf:&LoadF (alloca LoadF)
+        c:i32 0
+        fnameindex:i32 (+ (lua_gettop L) 1))  ; where the name goes
+    (if (= (as ptr filename) null)
+      (do (lua_pushliteral L "=stdin")
+          (set! (lf 'f) stdin))
+      (do (lua_pushfstring L "@%s" filename)
+          (set-errno 0)
+          (set! (lf 'f) (fopen filename "r"))
+          (when (= (lf 'f) null) (return (errfile L "open" fnameindex)))))
+    (set! (lf 'n) 0)
+    (when (skipcomment (lf 'f) &c)
+      (set! (aref (ref lf 'buff) 0) (ch \newline))  ; keep the line numbers right
+      (set! (lf 'n) 1))
+    (when (= c (aref (bytes LUA_SIGNATURE) 0))  ; a binary chunk?
+      (set! (lf 'n) 0)  ; no newline
+      (when (!= (as ptr filename) null)
+        (set-errno 0)
+        (set! (lf 'f) (freopen filename "rb" (lf 'f)))
+        (when (= (lf 'f) null) (return (errfile L "reopen" fnameindex)))
+        (skipcomment (lf 'f) &c)))
+    (when (!= c EOF)
+      (set! (aref (ref lf 'buff) (as i64 (lf 'n))) (cast_char c))
+      (set! (lf 'n) (+ (lf 'n) 1)))
+    (let (status:i32 (lua_load L getF lf (lua_tostring L -1) mode)
+          readstatus:i32 (ferror (lf 'f)))
+      (set-errno 0)  ; no useful error number until here
+      (when (!= (as ptr filename) null) (fclose (lf 'f)))
+      (when (!= readstatus 0)
+        (lua_settop L fnameindex)  ; ignore lua_load's results
+        (return (errfile L "read" fnameindex)))
+      (lua_remove L fnameindex)
+      (return status))))
+
+(defstruct LoadS
+  s:CStr
+  size:usize)
+
+(defn- getS (L:(ptr lua_State) ud:ptr size:(ptr usize)):CStr
+  (let (ls:&LoadS (unsafe/cast &LoadS ud))
+    (when (= (ls 'size) 0) (return (as CStr null)))
+    (set! (deref size) (ls 'size))
+    (set! (ls 'size) 0)
+    (return (ls 's))))
+
+(defn luaL_loadbufferx (L:(ptr lua_State) buff:CStr size:usize name:CStr mode:CStr):i32
+  (let (ls:&LoadS (alloca LoadS))
+    (set! (ls 's) buff)
+    (set! (ls 'size) size)
+    (return (lua_load L getS ls name mode))))
+
+(defn luaL_loadstring (L:(ptr lua_State) s:CStr):i32
+  (return (luaL_loadbufferx L s (strlen s) s "t")))
+
+; ---- Metafields, length, tostring ----
+
+(defn luaL_getmetafield (L:(ptr lua_State) obj:i32 event:CStr):i32
+  (when (= (lua_getmetatable L obj) 0)
+    (return LUA_TNIL))
+  (lua_pushstring L event)
+  (let (tt:i32 (lua_rawget L -2))
+    (if (= tt LUA_TNIL)
+      (lua_pop L 2)       ; the metatable and the nil
+      (lua_remove L -2))  ; only the metatable
+    (return tt)))
+
+(defn luaL_callmeta (L:(ptr lua_State) obj:i32 event:CStr):i32
+  (set! obj (lua_absindex L obj))
+  (when (= (luaL_getmetafield L obj event) LUA_TNIL)
+    (return 0))
+  (lua_pushvalue L obj)
+  (lua_call L 1 1)
+  (return 1))
+
+(defn luaL_len (L:(ptr lua_State) idx:i32):lua_Integer
+  (let (isnum:i32 0)
+    (lua_len L idx)
+    (let (l:lua_Integer (lua_tointegerx L -1 &isnum))
+      (when (= isnum 0)
+        (luaL_error L "object length is not an integer"))
+      (lua_pop L 1)
+      (return l))))
+
+(defn luaL_tolstring (L:(ptr lua_State) idx:i32 len:(ptr usize)):CStr
+  (set! idx (lua_absindex L idx))
+  (if (!= (luaL_callmeta L idx "__tostring") 0)
+    (when (= (lua_isstring L -1) 0)
+      (luaL_error L "'__tostring' must return a string"))
+    (case (lua_type L idx)
+      LUA_TNUMBER
+        (let (buff:(ptr i8) (alloca i8 LUA_N2SBUFFSZ))
+          (lua_numbertocstring L idx buff)
+          (lua_pushstring L (as CStr (as ptr buff))))
+      LUA_TSTRING (lua_pushvalue L idx)
+      LUA_TBOOLEAN (lua_pushstring L (if (!= (lua_toboolean L idx) 0) "true" "false"))
+      LUA_TNIL (lua_pushliteral L "nil")
+      (let (tt:i32 (luaL_getmetafield L idx "__name")
+            kind:CStr (if (= tt LUA_TSTRING) (lua_tostring L -1) (luaL_typename L idx)))
+        (lua_pushfstring L "%s: %p" kind (lua_topointer L idx))
+        (when (!= tt LUA_TNIL)
+          (lua_remove L -2)))))
+  (return (lua_tolstring L -1 len)))
+
+; Sets the functions in 'l' into the table below the 'nup' upvalues on the top;
+; each closure gets all of them. Leaves only the table.
+(defn luaL_setfuncs (L:(ptr lua_State) l:(ptr luaL_Reg) nup:i32):void
+  (luaL_checkstack L nup "too many upvalues")
+  (let (i:i64 0)
+    (while (!= (as ptr ((aref l i) 'name)) null)
+      (if (= ((aref l i) 'func) null)  ; a placeholder?
+        (lua_pushboolean L 0)
+        (do (dotimes (k:i32 nup) (lua_pushvalue L (- 0 nup)))
+            (lua_pushcclosure L ((aref l i) 'func) nup)))
+      (lua_setfield L (- 0 (+ nup 2)) ((aref l i) 'name))
+      (set! i (+ i 1))))
+  (lua_pop L nup))
+
+; Makes sure stack[idx][fname] is a table, and pushes it.
+(defn luaL_getsubtable (L:(ptr lua_State) idx:i32 fname:CStr):i32
+  (when (= (lua_getfield L idx fname) LUA_TTABLE)
+    (return 1))  ; already there
+  (lua_pop L 1)
+  (set! idx (lua_absindex L idx))
+  (lua_newtable L)
+  (lua_pushvalue L -1)  ; a copy to leave on top
+  (lua_setfield L idx fname)
+  (return 0))
+
+; A stripped-down 'require': opens the module unless it's loaded, records it in
+; package.loaded and, if 'glb', in the globals. Leaves the module on top.
+(defn luaL_requiref (L:(ptr lua_State) modname:CStr openf:lua_CFunction glb:i32):void
+  (luaL_getsubtable L LUA_REGISTRYINDEX LUA_LOADED_TABLE)
+  (lua_getfield L -1 modname)  ; LOADED[modname]
+  (when (= (lua_toboolean L -1) 0)  ; not loaded yet?
+    (lua_pop L 1)
+    (lua_pushcfunction L openf)
+    (lua_pushstring L modname)
+    (lua_call L 1 1)
+    (lua_pushvalue L -1)
+    (lua_setfield L -3 modname))  ; LOADED[modname] = module
+  (lua_remove L -2)  ; the LOADED table
+  (when (!= glb 0)
+    (lua_pushvalue L -1)
+    (lua_setglobal L modname)))
+
+(defn luaL_addgsub (b:(ptr luaL_Buffer) s:CStr p:CStr r:CStr):void
+  (let (l:usize (strlen p)
+        wild:CStr (strstr s p))
+    (while (!= (as ptr wild) null)
+      (luaL_addlstring b s (as usize (byte-diff wild s)))  ; the prefix
+      (luaL_addstring b r)  ; the replacement
+      (set! s (as CStr (as ptr (unsafe/ptr+ (bytes wild) (as i64 l)))))
+      (set! wild (strstr s p)))
+    (luaL_addstring b s)))  ; the rest
+
+(defn luaL_gsub (L:(ptr lua_State) s:CStr p:CStr r:CStr):CStr
+  (let (b:&luaL_Buffer (alloca luaL_Buffer))
+    (luaL_buffinit L b)
+    (luaL_addgsub b s p r)
+    (luaL_pushresult b)
+    (return (lua_tostring L -1))))
+
+; ---- The state ----
+
+(defn luaL_alloc (ud:ptr p:ptr osize:usize nsize:usize):ptr
+  (when (= nsize 0)
+    (free p)
+    (return null))
+  (return (realloc p nsize)))
+
+; The default panic function prints the message. Testing the type first avoids
+; a memory error inside lua_tostring.
+(defn- panic (L:(ptr lua_State)):i32
+  (let (msg:CStr (if (= (lua_type L -1) LUA_TSTRING)
+                   (cstr (lua_tostring L -1))
+                   "error object is not a string"))
+    (lua_writestringerror "PANIC: unprotected error in call to Lua API (%s)\n" msg)
+    (return 0)))  ; back to Lua, which aborts
+
+; The warning system's three states: off, ready for a new message, and in the
+; middle of one.
+
+; Runs a control message ("@on", "@off") and says whether it was one.
+(defn- checkcontrol (L:(ptr lua_State) message:CStr tocont:i32):bool
+  (when (or (!= tocont 0) (!= (aref (bytes message) 0) (ch \@)))
+    (return false))
+  (let (ctl:CStr (as CStr (as ptr (unsafe/ptr+ (bytes message) 1))))
+    (cond
+      (= (strcmp ctl "off") 0) (lua_setwarnf L warnfoff L)
+      (= (strcmp ctl "on") 0) (lua_setwarnf L warnfon L))
+    (return true)))
+
+(defn- warnfoff (ud:ptr message:CStr tocont:i32):void
+  (checkcontrol ud message tocont))
+
+; Writes the message, finishing it unless it continues.
+(defn- warnfcont (ud:ptr message:CStr tocont:i32):void
+  (lua_writestringerror "%s" message)
+  (if (!= tocont 0)
+    (lua_setwarnf ud warnfcont ud)  ; to be continued
+    (do (lua_writestringerror "%s" "\n")
+        (lua_setwarnf ud warnfon ud))))  ; the next call starts a message
+
+(defn- warnfon (ud:ptr message:CStr tocont:i32):void
+  (when (checkcontrol ud message tocont) (return))
+  (lua_writestringerror "%s" "Lua warning: ")
+  (warnfcont ud message tocont))
+
+; A seed with some randomness, from address-space layout and the time.
+(defn- luai-makeseed ():ui32
+  (let (buff:(ptr ui32) (alloca ui32 4)  ; a pointer and a time_t, in ints
+        t:time_t (time null)
+        b:ptr (as ptr buff))
+    (memcpy b &b (sizeof ptr))  ; a local variable's address
+    (memcpy (unsafe/ptr+ (as (ptr i8) b) 8) &t (sizeof time_t))
+    (let (res:ui32 (aref buff 0))
+      (dotimes (i:i64 3)
+        (set! res (bit-xor res (+ (bit-shr res 3) (bit-shl res 7) (aref buff (+ i 1))))))
+      (return res))))
+
+(defn luaL_makeseed (L:(ptr lua_State)):ui32
+  (return (luai-makeseed)))
+
+(defn luaL_newstate ():(ptr lua_State)
+  (let (L:(ptr lua_State) (lua_newstate luaL_alloc null (luaL_makeseed null)))
+    (when (!= L null)
+      (lua_atpanic L panic)
+      (lua_setwarnf L warnfon L))
+    (return L)))
+
+(defn luaL_checkversion_ (L:(ptr lua_State) ver:lua_Number sz:usize):void
+  (let (v:lua_Number (lua_version L))
+    (cond
+      (!= sz LUAL_NUMSIZES)  ; the numeric types
+        (luaL_error L "core and library have incompatible numeric types")
+      (!= v ver)
+        (luaL_error L "version mismatch: app. needs %f, Lua core provides %f" ver v))))

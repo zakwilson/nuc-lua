@@ -1,0 +1,6 @@
+/* The port exports the Lua API and nothing else (PROMPT.md §6.1, §6.6). */
+{
+  lua_*;
+  luaL_*;
+  luaopen_*;
+};

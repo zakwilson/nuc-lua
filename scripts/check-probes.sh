@@ -5,7 +5,7 @@
 source "$(dirname "$0")/env.sh" || exit 1
 cd "$ROOT/probes"
 fixed=0; open=0
-for P in "$PWD"/issue-*.nuc; do
+for P in "$PWD"/issue-[0-9][0-9][0-9].nuc; do
   id=$(basename "$P" .nuc)
   run=$(sed -n 's/^; run: //p' "$P")
   want=$(sed -n 's/^; fixed-when-output: //p' "$P")

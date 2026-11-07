@@ -1,0 +1,370 @@
+; The basic library: print, error, pcall, load and the rest of the globals.
+;
+; lbaselib.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.baselib)
+(set-ir-prefix "")
+(import-use luacapi)
+(import-use lua.util)
+(import-use "ctype.h")
+(import-use "stdio.h")
+(import-use "stdlib.h")
+(import-use "string.h")
+
+(defn- luaB_print (L:(ptr lua_State)):i32
+  (let (n:i32 (lua_gettop L))
+    (for (i:i32 1) (<= i n) (inc! i)
+      (let (l:usize 0
+            s:CStr (luaL_tolstring L i &l))  ; convert it to a string
+        (when (> i 1) (lua_writestring "\t" 1))
+        (lua_writestring s l)
+        (lua_pop L 1)))
+    (lua_writeline)
+    (return 0)))
+
+; Checks every argument first, so that an error can't leave a warning half
+; written.
+(defn- luaB_warn (L:(ptr lua_State)):i32
+  (let (n:i32 (lua_gettop L))
+    (luaL_checkstring L 1)  ; at least one argument
+    (for (i:i32 2) (<= i n) (inc! i)
+      (luaL_checkstring L i))
+    (for (i:i32 1) (< i n) (inc! i)
+      (lua_warning L (lua_tostring L i) 1))
+    (lua_warning L (lua_tostring L n) 0)  ; close the warning
+    (return 0)))
+
+(defconst SPACECHARS " \x0c\n\r\t\x0b")
+
+; Reads an integer numeral in 'base'; returns the end of it, or null.
+(defn- b_str2int (s0:CStr base:ui32 pn:&lua_Integer):(ptr i8)
+  (let (s:(ptr i8) (unsafe/ptr+ (bytes s0) (as i64 (strspn s0 SPACECHARS)))  ; skip spaces
+        n:lua_Unsigned 0
+        neg:bool false)
+    (cond
+      (= (deref s) (ch \-)) (do (set! s (unsafe/ptr+ s 1)) (set! neg true))
+      (= (deref s) (ch \+)) (set! s (unsafe/ptr+ s 1)))
+    (when (= (isalnum (as i32 (cast_uchar (deref s)))) 0)  ; no digit?
+      (return null))
+    (while true
+      (let (c:i32 (as i32 (cast_uchar (deref s)))
+            digit:ui32 (cast_uint (if (!= (isdigit c) 0)
+                                    (- c (ch \0))
+                                    (+ (- (toupper c) (ch \A)) 10))))
+        (when (>= digit base) (return null))  ; invalid numeral
+        (set! n (+ (* n (as lua_Unsigned base)) (as lua_Unsigned digit)))
+        (set! s (unsafe/ptr+ s 1)))
+      (when (= (isalnum (as i32 (cast_uchar (deref s)))) 0) (break)))
+    (set! s (unsafe/ptr+ s (as i64 (strspn (cstr s) SPACECHARS))))  ; trailing spaces
+    (set! (deref pn) (l_castU2S (if neg (- 0 n) n)))
+    (return s)))
+
+(defn- luaB_tonumber (L:(ptr lua_State)):i32
+  (if (lua_isnoneornil L 2)  ; standard conversion?
+    (do
+      (when (= (lua_type L 1) LUA_TNUMBER)  ; already a number?
+        (lua_settop L 1)
+        (return 1))
+      (let (l:usize 0
+            s:CStr (lua_tolstring L 1 &l))
+        (when (and (!= (as ptr s) null) (= (lua_stringtonumber L s) (+ l 1)))
+          (return 1))  ; converted
+        (luaL_checkany L 1)))  ; not a number, but there must be an argument
+    (let (l:usize 0
+          n:lua_Integer 0
+          base:lua_Integer (luaL_checkinteger L 2))
+      (luaL_checktype L 1 LUA_TSTRING)  ; no numbers as strings
+      (let (s:CStr (lua_tolstring L 1 &l))
+        (luaL_argcheck L (and (<= 2 base) (<= base 36)) 2 "base out of range")
+        (when (= (as ptr (b_str2int s (cast_uint base) &n))
+                 (as ptr (unsafe/ptr+ (bytes s) (as i64 l))))
+          (lua_pushinteger L n)
+          (return 1)))))
+  (luaL_pushfail L)  ; not a number
+  (return 1))
+
+(defn- luaB_error (L:(ptr lua_State)):i32
+  (let (level:i32 (cast_int (luaL_optinteger L 2 1)))
+    (lua_settop L 1)
+    (when (and (= (lua_type L 1) LUA_TSTRING) (> level 0))
+      (luaL_where L level)  ; add the position
+      (lua_pushvalue L 1)
+      (lua_concat L 2))
+    (return (lua_error L))))
+
+(defn- luaB_getmetatable (L:(ptr lua_State)):i32
+  (luaL_checkany L 1)
+  (when (= (lua_getmetatable L 1) 0)
+    (lua_pushnil L)
+    (return 1))  ; no metatable
+  (luaL_getmetafield L 1 "__metatable")
+  (return 1))  ; the __metatable field if there is one, else the metatable
+
+(defn- luaB_setmetatable (L:(ptr lua_State)):i32
+  (let (t:i32 (lua_type L 2))
+    (luaL_checktype L 1 LUA_TTABLE)
+    (luaL_argexpected L (or (= t LUA_TNIL) (= t LUA_TTABLE)) 2 "nil or table")
+    (when (!= (luaL_getmetafield L 1 "__metatable") LUA_TNIL)
+      (return (luaL_error L "cannot change a protected metatable")))
+    (lua_settop L 2)
+    (lua_setmetatable L 1)
+    (return 1)))
+
+(defn- luaB_rawequal (L:(ptr lua_State)):i32
+  (luaL_checkany L 1)
+  (luaL_checkany L 2)
+  (lua_pushboolean L (lua_rawequal L 1 2))
+  (return 1))
+
+(defn- luaB_rawlen (L:(ptr lua_State)):i32
+  (let (t:i32 (lua_type L 1))
+    (luaL_argexpected L (or (= t LUA_TTABLE) (= t LUA_TSTRING)) 1 "table or string")
+    (lua_pushinteger L (l_castU2S (lua_rawlen L 1)))
+    (return 1)))
+
+(defn- luaB_rawget (L:(ptr lua_State)):i32
+  (luaL_checktype L 1 LUA_TTABLE)
+  (luaL_checkany L 2)
+  (lua_settop L 2)
+  (lua_rawget L 1)
+  (return 1))
+
+(defn- luaB_rawset (L:(ptr lua_State)):i32
+  (luaL_checktype L 1 LUA_TTABLE)
+  (luaL_checkany L 2)
+  (luaL_checkany L 3)
+  (lua_settop L 3)
+  (lua_rawset L 1)
+  (return 1))
+
+(defn- pushmode (L:(ptr lua_State) oldmode:i32):i32
+  (if (= oldmode -1)
+    (luaL_pushfail L)  ; lua_gc was called from a finalizer
+    (lua_pushstring L (if (= oldmode LUA_GCINC) "incremental" "generational")))
+  (return 1))
+
+(defvar- gc-opts:(array CStr 10)
+  (array CStr "stop" "restart" "collect" "count" "step" "isrunning" "generational"
+         "incremental" "param" (as CStr null)))
+(defvar- gc-optsnum:(array i32 9)
+  (array i32 LUA_GCSTOP LUA_GCRESTART LUA_GCCOLLECT LUA_GCCOUNT LUA_GCSTEP
+         LUA_GCISRUNNING LUA_GCGEN LUA_GCINC LUA_GCPARAM))
+(defvar- gc-params:(array CStr 7)
+  (array CStr "minormul" "majorminor" "minormajor" "pause" "stepmul" "stepsize"
+         (as CStr null)))
+(defvar- gc-pnum:(array i32 6)
+  (array i32 LUA_GCPMINORMUL LUA_GCPMAJORMINOR LUA_GCPMINORMAJOR LUA_GCPPAUSE
+         LUA_GCPSTEPMUL LUA_GCPSTEPSIZE))
+
+; A result of -1 means lua_gc was called from a finalizer: that is C's
+; `checkvalres`, which breaks out to the fail at the end.
+(defn- luaB_collectgarbage (L:(ptr lua_State)):i32
+  (let (o:i32 (aref gc-optsnum (luaL_checkoption L 1 "collect" gc-opts)))
+    (cond
+      (= o LUA_GCCOUNT)
+        (let (k:i32 (lua_gc L o)
+              b:i32 (lua_gc L LUA_GCCOUNTB))
+          (when (!= k -1)
+            (lua_pushnumber L (+ (as lua_Number k) (/ (as lua_Number b) 1024.0)))
+            (return 1)))
+      (= o LUA_GCSTEP)
+        (let (n:lua_Integer (luaL_optinteger L 2 0)
+              res:i32 (lua_gc L o (cast_sizet n)))
+          (when (!= res -1)
+            (lua_pushboolean L res)
+            (return 1)))
+      (= o LUA_GCISRUNNING)
+        (let (res:i32 (lua_gc L o))
+          (when (!= res -1)
+            (lua_pushboolean L res)
+            (return 1)))
+      (or (= o LUA_GCGEN) (= o LUA_GCINC))
+        (return (pushmode L (lua_gc L o)))
+      (= o LUA_GCPARAM)
+        (let (p:i32 (aref gc-pnum (luaL_checkoption L 2 (as CStr null) gc-params))
+              value:lua_Integer (luaL_optinteger L 3 -1))
+          (lua_pushinteger L (as lua_Integer (lua_gc L o p (cast_int value))))
+          (return 1))
+      true
+        (let (res:i32 (lua_gc L o))
+          (when (!= res -1)
+            (lua_pushinteger L (as lua_Integer res))
+            (return 1)))))
+  (luaL_pushfail L)  ; called from a finalizer
+  (return 1))
+
+(defn- luaB_type (L:(ptr lua_State)):i32
+  (let (t:i32 (lua_type L 1))
+    (luaL_argcheck L (!= t LUA_TNONE) 1 "value expected")
+    (lua_pushstring L (lua_typename L t))
+    (return 1)))
+
+(defn- luaB_next (L:(ptr lua_State)):i32
+  (luaL_checktype L 1 LUA_TTABLE)
+  (lua_settop L 2)  ; a second argument if there isn't one
+  (when (!= (lua_next L 1) 0)
+    (return 2))
+  (lua_pushnil L)
+  (return 1))
+
+(defn- pairscont (L:(ptr lua_State) status:i32 k:lua_KContext):i32
+  (return 4))  ; __pairs did all the work
+
+(defn- luaB_pairs (L:(ptr lua_State)):i32
+  (luaL_checkany L 1)
+  (if (= (luaL_getmetafield L 1 "__pairs") LUA_TNIL)  ; no metamethod?
+    (do (lua_pushcfunction L luaB_next)  ; the generator,
+        (lua_pushvalue L 1)  ; the state,
+        (lua_pushnil L)  ; the initial value
+        (lua_pushnil L))  ; and the to-be-closed object
+    (do (lua_pushvalue L 1)  ; 'self' for the metamethod
+        (lua_callk L 1 4 0 pairscont)))
+  (return 4))
+
+(defn- ipairsaux (L:(ptr lua_State)):i32
+  (let (i:lua_Integer (luaL_intop + (luaL_checkinteger L 2) 1))
+    (lua_pushinteger L i)
+    (return (if (= (lua_geti L 1 i) LUA_TNIL) 1 2))))
+
+; Returns ipairsaux, the "table" (which may not be one), and 0.
+(defn- luaB_ipairs (L:(ptr lua_State)):i32
+  (luaL_checkany L 1)
+  (lua_pushcfunction L ipairsaux)
+  (lua_pushvalue L 1)
+  (lua_pushinteger L 0)
+  (return 3))
+
+(defn- load_aux (L:(ptr lua_State) status:i32 envidx:i32):i32
+  (when (= status LUA_OK)
+    (when (!= envidx 0)  ; an 'env' argument?
+      (lua_pushvalue L envidx)
+      (when (= (as ptr (lua_setupvalue L -2 1)) null)  ; as the first upvalue
+        (lua_pop L 1)))  ; the function has no upvalues
+    (return 1))
+  (luaL_pushfail L)  ; the message is on the top
+  (lua_insert L -2)
+  (return 2))
+
+(defn- getMode (L:(ptr lua_State) idx:i32):CStr
+  (let (mode:CStr (luaL_optstring L idx (as CStr null)))
+    (when (and (!= (as ptr mode) null) (!= (as ptr (strchr mode (ch \B))) null))
+      (luaL_argerror L idx "invalid mode"))  ; Lua code can't use fixed buffers
+    (return mode)))
+
+(defn- luaB_loadfile (L:(ptr lua_State)):i32
+  (let (fname:CStr (luaL_optstring L 1 (as CStr null))
+        mode:CStr (getMode L 2)
+        env:i32 (if (lua_isnone L 3) 0 3)
+        status:i32 (luaL_loadfilex L fname mode))
+    (return (load_aux L status env))))
+
+; The reader for 'load' from a function: calls it for each piece.
+(defn- generic_reader (L:(ptr lua_State) ud:ptr size:(ptr usize)):CStr
+  (let (firstcall:(ptr i32) (unsafe/cast (ptr i32) ud))
+    (luaL_checkstack L 2 "too many nested functions")
+    (if (!= (deref firstcall) 0)
+      (set! (deref firstcall) 0)
+      (lua_pop L 1))  ; the previous piece
+    (lua_pushvalue L 1)
+    (lua_call L 0 1)
+    (when (lua_isnil L -1)
+      (set! (deref size) 0)
+      (return (as CStr null)))
+    (when (= (lua_isstring L -1) 0)
+      (luaL_error L "reader function must return a string"))
+    (return (lua_tolstring L -1 size))))
+
+(defn- luaB_load (L:(ptr lua_State)):i32
+  (let (l:usize 0
+        s:CStr (lua_tolstring L 1 &l)
+        mode:CStr (getMode L 3)
+        env:i32 (if (lua_isnone L 4) 0 4)
+        status:i32 0)
+    (if (!= (as ptr s) null)  ; a string?
+      (let (chunkname:CStr (luaL_optstring L 2 s))
+        (set! status (luaL_loadbufferx L s l chunkname mode)))
+      (let (firstcall:i32 1
+            chunkname:CStr (luaL_optstring L 2 "=(load)"))
+        (luaL_checktype L 1 LUA_TFUNCTION)
+        (set! status (lua_load L generic_reader &firstcall chunkname mode))))
+    (return (load_aux L status env))))
+
+(defn- dofilecont (L:(ptr lua_State) d1:i32 d2:lua_KContext):i32
+  (return (- (lua_gettop L) 1)))
+
+(defn- luaB_dofile (L:(ptr lua_State)):i32
+  (let (fname:CStr (luaL_optstring L 1 (as CStr null)))
+    (lua_settop L 1)
+    (when (!= (luaL_loadfilex L fname "bt") LUA_OK)
+      (return (lua_error L)))
+    (lua_callk L 0 LUA_MULTRET 0 dofilecont)
+    (return (dofilecont L 0 0))))
+
+(defn- luaB_assert (L:(ptr lua_State)):i32
+  (when (!= (lua_toboolean L 1) 0)
+    (return (lua_gettop L)))  ; all the arguments
+  (luaL_checkany L 1)  ; there must be a condition
+  (lua_remove L 1)
+  (lua_pushliteral L "assertion failed!")  ; the default message
+  (lua_settop L 1)  ; the message, given or default
+  (return (luaB_error L)))
+
+(defn- luaB_select (L:(ptr lua_State)):i32
+  (let (n:i32 (lua_gettop L))
+    (when (and (= (lua_type L 1) LUA_TSTRING)
+               (= (aref (bytes (lua_tostring L 1)) 0) (ch \#)))
+      (lua_pushinteger L (as lua_Integer (- n 1)))
+      (return 1))
+    (let (i:lua_Integer (luaL_checkinteger L 1))
+      (cond
+        (< i 0) (set! i (+ (as lua_Integer n) i))
+        (> i (as lua_Integer n)) (set! i (as lua_Integer n)))
+      (luaL_argcheck L (<= 1 i) 1 "index out of range")
+      (return (- n (cast_int i))))))
+
+; The continuation of pcall and xpcall, which pushed a true before calling: on
+; success return everything but 'extra' values.
+(defn- finishpcall (L:(ptr lua_State) status:i32 extra:lua_KContext):i32
+  (when (and (!= status LUA_OK) (!= status LUA_YIELD))  ; an error?
+    (lua_pushboolean L 0)
+    (lua_pushvalue L -2)  ; the message
+    (return 2))
+  (return (- (lua_gettop L) (cast_int extra))))
+
+(defn- luaB_pcall (L:(ptr lua_State)):i32
+  (luaL_checkany L 1)
+  (lua_pushboolean L 1)  ; the first result if there's no error
+  (lua_insert L 1)
+  (return (finishpcall L (lua_pcallk L (- (lua_gettop L) 2) LUA_MULTRET 0 0 finishpcall) 0)))
+
+; After the rotate the stack is <f, err, true, f, args...>, so 'finishpcall'
+; skips 2.
+(defn- luaB_xpcall (L:(ptr lua_State)):i32
+  (let (n:i32 (lua_gettop L))
+    (luaL_checktype L 2 LUA_TFUNCTION)  ; the error function
+    (lua_pushboolean L 1)
+    (lua_pushvalue L 1)
+    (lua_rotate L 3 2)  ; both below the function's arguments
+    (return (finishpcall L (lua_pcallk L (- n 2) LUA_MULTRET 2 2 finishpcall) 2))))
+
+(defn- luaB_tostring (L:(ptr lua_State)):i32
+  (luaL_checkany L 1)
+  (luaL_tolstring L 1 null)
+  (return 1))
+
+(defn luaopen_base (L:(ptr lua_State)):i32
+  (lua_pushglobaltable L)  ; the library goes into the global table
+  (lua-setfuncs L 0
+    ("assert" luaB_assert) ("collectgarbage" luaB_collectgarbage)
+    ("dofile" luaB_dofile) ("error" luaB_error) ("getmetatable" luaB_getmetatable)
+    ("ipairs" luaB_ipairs) ("loadfile" luaB_loadfile) ("load" luaB_load)
+    ("next" luaB_next) ("pairs" luaB_pairs) ("pcall" luaB_pcall) ("print" luaB_print)
+    ("warn" luaB_warn) ("rawequal" luaB_rawequal) ("rawlen" luaB_rawlen)
+    ("rawget" luaB_rawget) ("rawset" luaB_rawset) ("select" luaB_select)
+    ("setmetatable" luaB_setmetatable) ("tonumber" luaB_tonumber)
+    ("tostring" luaB_tostring) ("type" luaB_type) ("xpcall" luaB_xpcall)
+    (LUA_GNAME null) ("_VERSION" null))  ; placeholders
+  (lua_pushvalue L -1)
+  (lua_setfield L -2 LUA_GNAME)  ; _G
+  (lua_pushliteral L LUA_VERSION)
+  (lua_setfield L -2 "_VERSION")
+  (return 1))

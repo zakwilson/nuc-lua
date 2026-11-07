@@ -1,0 +1,11 @@
+; ISSUE-013: a file that is imported, not the entry, can't define a function its
+; own header import declares.
+; expect: prints 3 60; actual (before the fix): `failed to parse generated IR ...
+;   invalid redefinition of function 'bar'`, and for a :varargs definition
+;   `defn: variadic 'sum' can't be overloaded`
+; run: cd $D && $NUCLEUSC -I$D $P -o $W/p && $W/p
+; fixed-when-output: 3 60
+(import issue-013-impl)
+(import-use "issue-013.h")
+(import-use "stdio.h")
+(defn main ():i32 (printf "%d %d\n" (bar 1) (sum 3 10 20 30)) (return 0))

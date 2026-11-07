@@ -1,12 +1,440 @@
-;; Milestone 0's host: runs one script on the stock core. Milestone 2 replaces it
-;; with the port of lua.c.
-(import luacapi)
+; The standalone interpreter.
+;
+; lua.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.host)
+(set-ir-prefix "")
+(import-use luacapi)
+(import lua.aux)
+(import lua.baselib)  ; the libraries, for linit
+(import lua.corolib)
+(import lua.mathlib)
+(import lua.utf8lib)
+(import-use lua.util)
+(import-use "stdio.h")
+(import-use "stdlib.h")
+(import-use "string.h")
+(import-use "signal.h")
+(import-use "unistd.h")
+(import-use "dlfcn.h")
+
+(defconst LUA_PROGNAME "lua")
+(defconst LUA_INIT_VAR "LUA_INIT")
+(defconst LUA_INITVARVERSION "LUA_INIT_5_5")
+(defconst LUA_RLLIB_VAR "LUA_READLINELIB")
+(defconst LUA_READLINELIB "libreadline.so")
+(defconst LUA_PROMPT "> ")
+(defconst LUA_PROMPT2 ">> ")
+(defconst LUA_MAXINPUT 512)
+(defconst EOFMARK "<eof>")
+
+(defvar- globalL:ptr null)
+(defvar- progname:CStr LUA_PROGNAME)
+(defvar- l-getenv:(fn CStr)(CStr) null)
+(defvar- l-readline:(fn CStr)(CStr) null)
+(defvar- l-addhist:(fn void)(CStr) null)
+; SIG_DFL is ((__sighandler_t) 0), which the header import folds to the int 0.
+(defconst sig-dfl null)
+
+(defn- setsignal (sig:i32 handler:(fn void)(i32)):void
+  (let (sa:(ref sigaction) (alloca sigaction))
+    (memset sa 0 (sizeof sigaction))
+    (set! ((sa '__sigaction_handler) 'sa_handler) handler)
+    (sigemptyset (ref sa 'sa_mask))  ; do not mask any signal
+    (sigaction sig sa null)))
+
+; Hook set by the signal function to stop the interpreter.
+(defn- lstop (L:&lua_State ar:(ptr lua_Debug)):void
+  (lua_sethook L null 0 0)
+  (luaL_error L "interrupted!"))
+
+; A C signal can't safely change a Lua state, so it only sets a hook that will
+; stop the interpreter.
+(defn- laction (i:i32):void
+  (let (flag:i32 (bit-or LUA_MASKCALL LUA_MASKRET LUA_MASKLINE LUA_MASKCOUNT))
+    (setsignal i sig-dfl)  ; if another SIGINT happens, terminate the process
+    (lua_sethook globalL lstop flag 1)))
+
+(defn- print-usage (badoption:CStr):void
+  (lua_writestringerror "%s: " progname)
+  (let (o (aref (bytes badoption) 1))
+    (if (or (= o (ch \e)) (= o (ch \l)))
+      (lua_writestringerror "'%s' needs argument\n" badoption)
+      (lua_writestringerror "unrecognized option '%s'\n" badoption)))
+  (lua_writestringerror
+    "usage: %s [options] [script [args]]\nAvailable options are:\n  -e stat   execute string 'stat'\n  -i        enter interactive mode after executing 'script'\n  -l mod    require library 'mod' into global 'mod'\n  -l g=mod  require library 'mod' into global 'g'\n  -v        show version information\n  -E        ignore environment variables\n  -W        turn warnings on\n  --        stop handling options\n  -         stop handling options and execute stdin\n"
+    progname))
+
+; Prints an error message, with the program name in front of it if there is one.
+(defn- l-message (pname:CStr msg:CStr):void
+  (when (!= (as ptr pname) null) (lua_writestringerror "%s: " pname))
+  (lua_writestringerror "%s\n" msg))
+
+; If 'status' isn't OK, prints the error message on the top of the stack.
+(defn- report (L:&lua_State status:i32):i32
+  (when (!= status LUA_OK)
+    (let (msg:CStr (lua_tostring L -1))
+      (when (= (as ptr msg) null) (set! msg "(error message not a string)"))
+      (l-message progname msg)
+      (lua_pop L 1)))
+  (return status))
+
+; The message handler for every chunk.
+(defn- msghandler (L:&lua_State):i32
+  (let (msg:CStr (lua_tostring L 1))
+    (when (= (as ptr msg) null)  ; is the error object not a string?
+      (when (and (!= (luaL_callmeta L 1 "__tostring") 0)
+                 (= (lua_type L -1) LUA_TSTRING))
+        (return 1))  ; that is the message
+      (set! msg (lua_pushfstring L "(error object is a %s value)" (luaL_typename L 1))))
+    (luaL_traceback L L msg 1)  ; append a standard traceback
+    (return 1)))
+
+; lua_pcall with the message handler and the SIGINT handler in place.
+(defn- docall (L:&lua_State narg:i32 nres:i32):i32
+  (let (base:i32 (- (lua_gettop L) narg))  ; function index
+    (lua_pushcfunction L msghandler)
+    (lua_insert L base)  ; under the function and its arguments
+    (set! globalL L)  ; for laction
+    (setsignal SIGINT laction)
+    (let (status:i32 (lua_pcall L narg nres base))
+      (setsignal SIGINT sig-dfl)
+      (lua_remove L base)
+      (return status))))
+
+(defn- print-version ():void
+  (lua_writestring LUA_COPYRIGHT (strlen LUA_COPYRIGHT))
+  (lua_writeline))
+
+; The 'arg' table holds every command-line argument, with the script name at
+; index 0, its arguments after it and the interpreter's options before it.
+(defn- createargtable (L:&lua_State argv:(ptr CStr) argc:i32 script:i32):void
+  (let (narg:i32 (- argc (+ script 1)))  ; number of positive indices
+    (lua_createtable L narg (+ script 1))
+    (dotimes (i:i32 argc)
+      (lua_pushstring L (aref argv i))
+      (lua_rawseti L -2 (as lua_Integer (- i script))))
+    (lua_setglobal L "arg")))
+
+(defn- dochunk (L:&lua_State status:i32):i32
+  (when (= status LUA_OK) (set! status (docall L 0 0)))
+  (return (report L status)))
+
+(defn- dofile (L:&lua_State name:CStr):i32
+  (return (dochunk L (luaL_loadfilex L name "bt"))))
+
+(defn- dostring (L:&lua_State s:CStr name:CStr):i32
+  (return (dochunk L (luaL_loadbufferx L s (strlen s) name "t"))))
+
+; Runs 'globname = require(modname)' for 'globname[=modname]'. Without a
+; modname, a '-' in globname starts a version suffix the global leaves out.
+(defn- dolibrary (L:&lua_State globname:CStr):i32
+  (let (suffix:(ptr i8) null
+        modname:(ptr i8) (bytes (strchr globname (ch \=))))
+    (if (= modname null)
+      (do (set! modname (bytes globname))
+          (set! suffix (bytes (strchr globname (ch \-)))))
+      (do (set! (aref modname 0) 0)  ; the global name ends here
+          (set! modname (unsafe/ptr+ modname 1))))
+    (lua_getglobal L "require")
+    (lua_pushstring L (as CStr (as ptr modname)))
+    (let (status:i32 (docall L 1 1))
+      (when (= status LUA_OK)
+        (when (!= suffix null) (set! (aref suffix 0) 0))
+        (lua_setglobal L globname))
+      (return (report L status)))))
+
+; Pushes arg[1] .. arg[#arg].
+(defn- pushargs (L:&lua_State):i32
+  (when (!= (lua_getglobal L "arg") LUA_TTABLE)
+    (luaL_error L "'arg' is not a table"))
+  (let (n:i32 (cast_int (luaL_len L -1))
+        i:i32 1)
+    (luaL_checkstack L (+ n 3) "too many arguments to script")
+    (while (<= i n)
+      (lua_rawgeti L (- 0 i) (as lua_Integer i))
+      (set! i (+ i 1)))
+    (lua_remove L (- 0 i))  ; remove the table
+    (return n)))
+
+(defn- handle-script (L:&lua_State argv:(ptr CStr)):i32
+  (let (fname:CStr (aref argv 0))
+    (when (and (= fname "-") (!= (aref (unsafe/ptr+ argv -1) 0) "--"))
+      (set! fname (as CStr null)))  ; stdin
+    (let (status:i32 (luaL_loadfilex L fname "bt"))
+      (when (= status LUA_OK)
+        (set! status (docall L (pushargs L) LUA_MULTRET)))
+      (return (report L status)))))
+
+; Bits of the argument summary collectargs returns.
+(defconst has-error 1)  ; bad option
+(defconst has-i 2)      ; -i
+(defconst has-v 4)      ; -v
+(defconst has-e 8)      ; -e
+(defconst has-E 16)     ; -E
+
+; Scans argv for what must be known before running any Lua code. 'first' gets
+; the bad argument's index on error; otherwise -1 if there's no program name, 0
+; if there's no script, or the script's index.
+(defn- collectargs (argv:(ptr CStr) first:(ref i32)):i32
+  (let (args:i32 0 i:i32 1)
+    (if (!= (as ptr (aref argv 0)) null)
+      (when (!= (aref (bytes (aref argv 0)) 0) 0)
+        (set! progname (aref argv 0)))
+      (do (set! (deref first) -1) (return 0)))
+    (while (!= (as ptr (aref argv i)) null)
+      (set! (deref first) i)
+      (let (a:(ptr i8) (bytes (aref argv i)))
+        (when (!= (aref a 0) (ch \-)) (return args))  ; not an option
+        (case (as i32 (aref a 1))
+          (ch \-)
+            (do (when (!= (aref a 2) 0) (return has-error))
+                ; a script name, if any, comes after '--'
+                (set! (deref first) (if (!= (as ptr (aref argv (+ i 1))) null) (+ i 1) 0))
+                (return args))
+          0 (return args)  ; '-' is the script "name"
+          (ch \E)
+            (do (when (!= (aref a 2) 0) (return has-error))
+                (set! args (bit-or args has-E)))
+          (ch \W)
+            (when (!= (aref a 2) 0) (return has-error))
+          (:or (ch \i) (ch \v))
+            (do (when (!= (aref a 2) 0) (return has-error))
+                (when (= (aref a 1) (ch \i)) (set! args (bit-or args has-i)))  ; -i implies -v
+                (set! args (bit-or args has-v)))
+          (:or (ch \e) (ch \l))  ; both need an argument
+            (do (when (= (aref a 1) (ch \e)) (set! args (bit-or args has-e)))
+                (when (= (aref a 2) 0)  ; no concatenated argument?
+                  (set! i (+ i 1))
+                  (when (or (= (as ptr (aref argv i)) null)
+                            (= (aref (bytes (aref argv i)) 0) (ch \-)))
+                    (return has-error))))
+          (return has-error)))
+      (set! i (+ i 1)))
+    (set! (deref first) 0)  ; no script name
+    (return args)))
+
+; Runs -e and -l, which run Lua code, and -W, which changes the state. Returns
+; 0 if some code raises an error.
+(defn- runargs (L:&lua_State argv:(ptr CStr) n:i32):i32
+  (lua_warning L "@off" 0)  ; the standalone interpreter starts with warnings off
+  (let (i:i32 1)
+    (while (< i n)
+      (let (option:i8 (aref (bytes (aref argv i)) 1))
+        (cond
+          (or (= option (ch \e)) (= option (ch \l)))
+            (let (extra:CStr (as CStr (as ptr (unsafe/ptr+ (bytes (aref argv i)) 2))))
+              (when (= (aref (bytes extra) 0) 0)
+                (set! i (+ i 1))
+                (set! extra (aref argv i)))
+              (when (!= (if (= option (ch \e))
+                          (dostring L extra "=(command line)")
+                          (dolibrary L extra))
+                        LUA_OK)
+                (return 0)))
+          (= option (ch \W))
+            (lua_warning L "@on" 0)))
+      (set! i (+ i 1))))
+  (return 1))
+
+; Used by -E to ignore environment variables.
+(defn- no-getenv (name:CStr):CStr (return (as CStr null)))
+
+(defn- handle-luainit (L:&lua_State):i32
+  (let (name:CStr "=LUA_INIT_5_5"
+        init:CStr (l-getenv LUA_INITVARVERSION))
+    (when (= (as ptr init) null)
+      (set! name "=LUA_INIT")
+      (set! init (l-getenv LUA_INIT_VAR)))  ; the alternative name
+    (cond
+      (= (as ptr init) null) (return LUA_OK)
+      (= (aref (bytes init) 0) (ch \@))
+        (return (dofile L (as CStr (as ptr (unsafe/ptr+ (bytes init) 1)))))
+      true (return (dostring L init name)))))
+
+; ---- The read-eval-print loop ----
+
+(defn- lua-readline (buff:(ptr i8) prompt:CStr):CStr
+  (when (!= l-readline null)
+    (return (l-readline prompt)))
+  ; emulate readline over 'buff'
+  (fputs prompt stdout)
+  (fflush stdout)
+  (return (fgets buff LUA_MAXINPUT stdin)))
+
+(defn- lua-saveline (line:CStr):void
+  (when (!= l-addhist null) (l-addhist line)))
+
+(defn- lua-freeline (line:CStr):void
+  ; lua-readline's own buffer is on the caller's stack
+  (when (!= l-readline null) (free line)))
+
+; Loads readline dynamically if it's there.
+(defn- lua-initreadline (L:&lua_State):void
+  (let (rllib:CStr (l-getenv LUA_RLLIB_VAR))
+    (when (= (as ptr rllib) null) (set! rllib LUA_READLINELIB))
+    (let (lib:ptr (dlopen rllib (bit-or RTLD_NOW RTLD_LOCAL)))
+      (when (!= lib null)
+        (let (name:(ptr CStr) (unsafe/cast (ptr CStr) (dlsym lib "rl_readline_name")))
+          (when (!= name null) (set! (deref name) "lua")))
+        (set! l-readline (unsafe/cast ((fn CStr) (CStr)) (dlsym lib "readline")))
+        (set! l-addhist (unsafe/cast ((fn void) (CStr)) (dlsym lib "add_history")))
+        (when (!= l-readline null) (return))))
+    (lua_warning L "unable to load readline library '" 1)
+    (lua_warning L rllib 1)
+    (lua_warning L "'" 0)))
+
+; The prompt, from _PROMPT/_PROMPT2 or the default; the value (or nil) stays on
+; the stack to keep it anchored.
+(defn- get-prompt (L:&lua_State firstline:bool):CStr
+  (if (= (lua_getglobal L (if firstline "_PROMPT" "_PROMPT2")) LUA_TNIL)
+    (return (if firstline LUA_PROMPT LUA_PROMPT2))
+    (let (p:CStr (luaL_tolstring L -1 null))
+      (lua_remove L -2)  ; the original value
+      (return p))))
+
+; Whether 'status' is a syntax error whose message ends in "<eof>": an
+; incomplete statement.
+(defn- incomplete (L:&lua_State status:i32):bool
+  (when (= status LUA_ERRSYNTAX)
+    (let (lmsg:usize 0
+          msg:CStr (lua_tolstring L -1 &lmsg)
+          marklen:usize (strlen EOFMARK))
+      (when (and (>= lmsg marklen)
+                 (= (strcmp (as CStr (as ptr (unsafe/ptr+ (bytes msg) (as i64 (- lmsg marklen)))))
+                            EOFMARK) 0))
+        (return true))))
+  (return false))
+
+; Prompts, reads a line and pushes it.
+(defn- pushline (L:&lua_State firstline:bool):bool
+  (let (buffer:(ptr i8) (alloca i8 LUA_MAXINPUT)
+        prmt:CStr (get-prompt L firstline)
+        b:CStr (lua-readline buffer prmt))
+    (lua_pop L 1)  ; the prompt
+    (when (= (as ptr b) null) (return false))  ; no input
+    (let (l:usize (strlen b))
+      (when (and (> l 0) (= (aref (bytes b) (as i64 (- l 1))) (ch \newline)))
+        (set! l (- l 1))
+        (set! (aref (bytes b) (as i64 l)) 0))
+      (lua_pushlstring L b l)
+      (lua-freeline b)
+      (return true))))
+
+; Tries the line on the stack as 'return <line>;'. Leaves the compiled chunk,
+; or the original line if that fails.
+(defn- addreturn (L:&lua_State):i32
+  (let (line:CStr (lua_tostring L -1)
+        retline:CStr (lua_pushfstring L "return %s;" line)
+        status:i32 (luaL_loadbufferx L retline (strlen retline) "=stdin" "t"))
+    (if (= status LUA_OK)
+      (lua_remove L -2)  ; the modified line
+      (lua_pop L 2))     ; the error and the modified line
+    (return status)))
+
+(defn- checklocal (line:CStr):void
+  (let (p:(ptr i8) (unsafe/ptr+ (bytes line) (as i64 (strspn line " \t"))))
+    (when (and (= (strncmp (as CStr (as ptr p)) "local" 5) 0)
+               (!= (as ptr (strchr " \t" (as i32 (aref p 5)))) null))
+      (lua_writestringerror "%s\n" "warning: locals do not survive across lines in interactive mode"))))
+
+; Reads lines until they make a complete statement or an error that isn't an
+; incomplete statement. The first line is already on the stack.
+(defn- multiline (L:&lua_State):i32
+  (let (len:usize 0
+        line:CStr (lua_tolstring L 1 &len))
+    (checklocal line)
+    (while true
+      (let (status:i32 (luaL_loadbufferx L line len "=stdin" "t"))
+        (when (or (not (incomplete L status)) (not (pushline L false)))
+          (return status))
+        (lua_remove L -2)  ; the error message from the incomplete line
+        (lua_pushliteral L "\n")
+        (lua_insert L -2)
+        (lua_concat L 3)
+        (set! line (lua_tolstring L 1 &len))))
+    (return 0)))
+
+; Reads a line and compiles it as an expression ('return ...'), else as a
+; statement. Returns the status, with the chunk (if any) on the stack.
+(defn- loadline (L:&lua_State):i32
+  (lua_settop L 0)
+  (when (not (pushline L true)) (return -1))  ; no input
+  (let (status:i32 (addreturn L))
+    (when (!= status LUA_OK) (set! status (multiline L)))
+    (let (line:CStr (lua_tostring L 1))
+      (when (!= (aref (bytes line) 0) 0) (lua-saveline line)))
+    (lua_remove L 1)  ; the line
+    (lua_assert (= (lua_gettop L) 1))
+    (return status)))
+
+; Prints the values on the stack with Lua's 'print'.
+(defn- l-print (L:&lua_State):void
+  (let (n:i32 (lua_gettop L))
+    (when (> n 0)
+      (luaL_checkstack L LUA_MINSTACK "too many results to print")
+      (lua_getglobal L "print")
+      (lua_insert L 1)
+      (when (!= (lua_pcall L n 0 0) LUA_OK)
+        (l-message progname (lua_pushfstring L "error calling 'print' (%s)" (lua_tostring L -1)))))))
+
+(defn- doREPL (L:&lua_State):void
+  (let (oldprogname:CStr progname
+        status:i32 0)
+    (set! progname (as CStr null))  ; no program name on errors in interactive mode
+    (lua-initreadline L)
+    (while (!= (set! status (loadline L)) -1)
+      (when (= status LUA_OK) (set! status (docall L 0 LUA_MULTRET)))
+      (if (= status LUA_OK) (l-print L) (report L status)))
+    (lua_settop L 0)
+    (lua_writeline)
+    (set! progname oldprogname)))
+
+; The interpreter's body, run in protected mode.
+(defn- pmain (L:&lua_State):i32
+  (let (argc:i32 (cast_int (lua_tointeger L 1))
+        argv:(ptr CStr) (unsafe/cast (ptr CStr) (lua_touserdata L 2))
+        script:i32 0
+        args:i32 (collectargs argv &script)
+        optlim:i32 (if (> script 0) script argc))  ; the first argv that isn't an option
+    (luaL_checkversion L)
+    (when (= args has-error)
+      (print-usage (aref argv script))  ; 'script' is the bad argument's index
+      (return 0))
+    (when (!= (bit-and args has-v) 0) (print-version))
+    (if (!= (bit-and args has-E) 0)
+      (do (set! l-getenv no-getenv)
+          (lua_pushboolean L 1)  ; tells the libraries to ignore the environment too
+          (lua_setfield L LUA_REGISTRYINDEX "LUA_NOENV"))
+      (set! l-getenv getenv))
+    (luaL_openlibs L)
+    (createargtable L argv argc script)
+    (lua_gc L LUA_GCRESTART)
+    (lua_gc L LUA_GCGEN)  ; the standalone interpreter collects generationally
+    (when (!= (handle-luainit L) LUA_OK) (return 0))
+    (when (= (runargs L argv optlim) 0) (return 0))
+    (when (and (> script 0) (!= (handle-script L (unsafe/ptr+ argv (as i64 script))) LUA_OK))
+      (return 0))
+    (cond
+      (!= (bit-and args has-i) 0) (doREPL L)
+      (and (< script 1) (= (bit-and args (bit-or has-e has-v)) 0))
+        (if (!= (isatty 0) 0)
+          (do (print-version) (doREPL L))
+          (dofile L (as CStr null))))  ; run stdin as a file
+    (lua_pushboolean L 1)  ; no errors
+    (return 1)))
 
 (defn main (argc:i32 argv:(ptr CStr)):i32
-  (let (L:ptr (luaL_newstate))
-    (luaL_openlibs L)
-    (when (and (> argc 1) (luaL_dofile L (aref argv 1)))
-      (fprintf stderr "%s\n" (lua_tostring L -1))
-      (return 1))
-    (lua_close L)
-    (return 0)))
+  (if-some (L (as ?&lua_State (luaL_newstate)))
+   (do
+    (lua_gc L LUA_GCSTOP)  ; no collection while the state is being built
+    (lua_pushcfunction L pmain)
+    (lua_pushinteger L (as lua_Integer argc))
+    (lua_pushlightuserdata L argv)
+    (let (status:i32 (lua_pcall L 2 1 0)
+          result:i32 (lua_toboolean L -1))
+      (report L status)
+      (lua_close L)
+      (return (if (and (!= result 0) (= status LUA_OK)) EXIT_SUCCESS EXIT_FAILURE))))
+   (do
+    (l-message (aref argv 0) "cannot create state: not enough memory")
+    (return EXIT_FAILURE))))

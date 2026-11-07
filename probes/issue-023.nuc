@@ -1,0 +1,13 @@
+; ISSUE-023: an array field of a nested place decays to a copy's address.
+; expect: prints `65 1`; actual (before the fix): `0 0`, the store lost in a temporary
+; run: $NUCLEUSC $P -o $W/p && $W/p
+; fixed-when-output: 65 1
+(import-use "stdio.h")
+(defstruct In x:i32 b:(array i8 8))
+(defstruct Out n:i64 in:In)
+(defn main ():i32
+  (let (o:&Out (alloca Out))
+    (set! (aref ((o 'in) 'b) 0) 65)
+    (printf "%d %d\n" (aref (ref (o 'in) 'b) 0)
+            (if (= (as ptr ((o 'in) 'b)) (as ptr (ref (o 'in) 'b))) 1 0)))
+  (return 0))

@@ -1,0 +1,185 @@
+From 5dab7cba1088d29341a2d0e8b1a3f89c708f8e02 Mon Sep 17 00:00:00 2001
+From: Zak Wilson <zak.wilson@gmail.com>
+Date: Sat, 7 Nov 2026 10:03:25 +0000
+Subject: [PATCH] cheader: let an imported file define a function its header
+ declares
+
+A header's declaration was emitted beside a C-prefixed definition in an
+imported file, which LLVM rejects; the name stays bound but the declare
+is skipped. The prescan also registered a :varargs method without its
+variadic flag, so the header's `...` read as another overload.
+Found by the nuc-lua port (ISSUE-013).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CsC8i2S7yJAHSpzRaddMj3
+---
+ design/progress.md        | 15 +++++++++++++++
+ src/cheader.nuc           |  4 ++++
+ src/generics.nuc          | 14 ++++++++++++++
+ src/nucleusc.nuc          |  3 ++-
+ tests/fixtures/lua-impl.h |  4 ++++
+ tests/suite-cimport.nuc   | 29 +++++++++++++++++++++++++++++
+ tests/suite-varargs.nuc   | 18 ++++++++++++++++++
+ 7 files changed, 86 insertions(+), 1 deletion(-)
+ create mode 100644 tests/fixtures/lua-impl.h
+
+diff --git a/design/progress.md b/design/progress.md
+index 21d666e..c39c8e0 100644
+--- a/design/progress.md
++++ b/design/progress.md
+@@ -5710,3 +5710,18 @@ Found by the nuc-lua port (its ISSUE-002 and ISSUE-003).
+ 
+ `tests/fixtures/lua-shapes.{h,c}` and `lua-header-shapes` in `tests/suite-cimport.nuc`
+ cover both.
++
++## Lua-port fixes: a header function defined in an imported file (lua-bugfixes)
++
++Found by the nuc-lua port (its ISSUE-013). `lauxlib.h` declares `luaL_error`, and the
++port defines it in an imported file under `(set-ir-prefix "")`.
++
++- **No second `declare`.** The header's declaration was emitted beside the definition,
++  which LLVM rejects as a redefinition. `c-finish-fn-decl` still binds the name, so
++  unqualified calls resolve, but skips the `declare` when a C-prefixed user method
++  already implements it (`generic-implements-c-fn?`).
++- **A `:varargs` definition matches its header.** The prescan registered the method
++  without its variadic flag, so the header's `...` read as a different overload.
++
++`lua-imported-file-implements-header` (with `tests/fixtures/lua-impl.h`) and
++`varargs-called-before-its-definition` cover both.
+diff --git a/src/cheader.nuc b/src/cheader.nuc
+index 3d47ddf..506ae2a 100644
+--- a/src/cheader.nuc
++++ b/src/cheader.nuc
+@@ -1138,6 +1138,10 @@
+           (set! (csym 'returns-twice) 1)))
+       (when (= fname "malloc")
+         (set! g-malloc-decl-done 1))
++      ; A `defn` that implements this declaration emits its `define` under
++      ; the same symbol, and LLVM refuses a declare beside it.
++      (when (generic-implements-c-fn? fname (as ?&Type ret-type) param-types num-params is-variadic)
++        (return 1))
+       ; Emit LLVM declare, lowering a struct-by-value parameter or return
+       ; to the platform C ABI (sret / byval / register coercion) exactly
+       ; as `emit-nuch-declare-import` and `emit-defn` do.
+diff --git a/src/generics.nuc b/src/generics.nuc
+index 848979f..50554a3 100644
+--- a/src/generics.nuc
++++ b/src/generics.nuc
+@@ -832,6 +832,7 @@
+       (type-set-params ft param-types nparams)
+       (set! (ft 'ret) ret)
+       (set! (ft 'has-rest) has-rest)
++      (set! (ft 'variadic) variadic)
+       (set-fields! m
+                    'variadic    variadic
+                    'has-rest    has-rest
+@@ -1138,6 +1139,19 @@
+                      'priv     0))
+       (return true))))
+ 
++; Does a `defn` of this unit implement the C declaration? Its `define` will carry
++; the symbol, so the header must not also `declare` it: an imported file's
++; signature is registered before its header is read, and its key bound later.
++(defn generic-implements-c-fn? (fname:Symbol ret:?&Type ptypes:ptr nparams:i32 variadic:i32):bool
++  (when-some (g (generic-lookup-exact fname))
++    (let (cpfx:Symbol (ns-ir-prefix g-ns-user))
++      (doseq (m (g 'methods) (VecIter &Method))
++        (when (and (= (m 'ir-fixed) 0) (= (m 'kind) METHOD-USER) (= (m 'origin-template) null)
++                   (= (method-ir-prefix g m) cpfx)
++                   (c-implements? m ret ptypes nparams variadic))
++          (return true)))))
++  (return false))
++
+ ; Does `m` implement the C declaration? Its slots must be the C ones as a Nucleus
+ ; program writes them, and only a bare `ptr` writes `void *`: `free (self:&Box)` is
+ ; a method of `Box`, though it links as `void (ptr)` too.
+diff --git a/src/nucleusc.nuc b/src/nucleusc.nuc
+index b4ae4f9..bd04980 100644
+--- a/src/nucleusc.nuc
++++ b/src/nucleusc.nuc
+@@ -20767,7 +20767,8 @@
+                     has-rest:i32 (defn-params-has-rest params-node))
+                 (when (= g-layout-defer 0)
+                   (let (pm:ptr (generic-register-method fname ret ptypes nparams
+-                                 has-rest 0 (as ptr f)))
++                                 has-rest (if (>= (varargs-marker-at params-node) 0) 1 0)
++                                 (as ptr f)))
+                     (defn-params-set-opt (as ?&Node params-node)
+                       (unsafe/cast &Type ((unsafe/cast &Method pm) 'fn-type)))))))))))
+       (set! g-defining-private save-priv))))))
+diff --git a/tests/fixtures/lua-impl.h b/tests/fixtures/lua-impl.h
+new file mode 100644
+index 0000000..a076ba4
+--- /dev/null
++++ b/tests/fixtures/lua-impl.h
+@@ -0,0 +1,4 @@
++/* A header whose functions a Nucleus file defines (nuc-lua ISSUE-013): the
++   defining file is imported, not the entry, and one function is variadic. */
++int li_add(int a, int b);
++int li_sum(int n, ...);
+diff --git a/tests/suite-cimport.nuc b/tests/suite-cimport.nuc
+index 6c18c39..f5fe96b 100644
+--- a/tests/suite-cimport.nuc
++++ b/tests/suite-cimport.nuc
+@@ -920,3 +920,32 @@ int main(void){
+     (drop &got)
+     (drop &p)
+     (return (ok))))
++
++; nuc-lua ISSUE-013: a `defn` in an IMPORTED file implementing its header's
++; declaration got a `declare` beside its `define` (invalid IR), and a `:varargs`
++; one was prescanned as non-variadic, so the C declaration joined it as an overload.
++(deftest lua-imported-file-implements-header
++  (let (impl:String (try (test-write-file "limpl.nuc"
++                            "(ns limpl)
++(set-ir-prefix \"\")
++(import-use \"tests/fixtures/lua-impl.h\")
++(defn li_add (a:i32 b:i32):i32 (return (+ a b)))
++(defn li_sum (n:i32 :varargs ap):i32
++  (let (s:i32 0)
++    (dotimes (i n) (set! s (+ s (unsafe/va-arg ap i32))))
++    (return s)))
++"))
++        p:String (try (test-write-file "lmain.nuc"
++                         "(import-use \"tests/fixtures/lua-impl.h\")
++(import limpl)
++(import-use \"stdio.h\")
++(defn main ():i32
++  (printf \"%d %d\\n\" (li_add 2 3) (li_sum 3 10 20 30))
++  (return 0))
++"))
++        got:String (try (build-run-file "" "" (string-as-view &p))))
++    (try (check-golden (string-as-view &got) "5 60\n"))
++    (drop &got)
++    (drop &p)
++    (drop &impl)
++    (return (ok))))
+diff --git a/tests/suite-varargs.nuc b/tests/suite-varargs.nuc
+index e794f99..bcacc6b 100644
+--- a/tests/suite-varargs.nuc
++++ b/tests/suite-varargs.nuc
+@@ -133,3 +133,21 @@
+     (drop &hdr)
+     (drop &lp)
+     (return (ok))))
++
++; nuc-lua ISSUE-013: the signature prescan left a :varargs defn's type
++; non-variadic, so a call written above the definition failed its arity check.
++(deftest varargs-called-before-its-definition
++  (let (p:String (try (test-write-file "vfwd.nuc"
++                         "(import-use \"stdio.h\")
++(defn caller ():i32 (return (vsum 3 1 2 3)))
++(defn vsum (n:i32 :varargs ap):i32
++  (let (s:i32 0)
++    (dotimes (i n) (set! s (+ s (unsafe/va-arg ap i32))))
++    (return s)))
++(defn main ():i32 (printf \"%d\\n\" (caller)) (return 0))
++"))
++        got:String (try (build-run-file "" "" (string-as-view &p))))
++    (try (check-golden (string-as-view &got) "6\n"))
++    (drop &got)
++    (drop &p)
++    (return (ok))))
+-- 
+2.47.3
+

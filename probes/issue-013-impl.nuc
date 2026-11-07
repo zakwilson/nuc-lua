@@ -1,0 +1,9 @@
+; Part of the ISSUE-013 probe: an imported file defining its header's functions.
+(ns issue-013-impl)
+(set-ir-prefix "")
+(import-use "issue-013.h")
+(defn bar (x:i32):i32 (return (+ x 2)))
+(defn sum (n:i32 :varargs ap):i32
+  (let (s:i32 0)
+    (dotimes (i n) (set! s (+ s (unsafe/va-arg ap i32))))
+    (return s)))
