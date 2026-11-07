@@ -43,8 +43,9 @@ Compiler: `.nucleus-work` on `lua-bugfixes` (see CLAUDE.md).
 - `5dab7cb` an imported file defines a function its header declares (ISSUE-013)
 - `0081d2a` an array field of a nested place decays into the place (ISSUE-023)
 - uncommitted in `.nucleus-work`: `cheader.nuc` skips an attribute after a return type
-  (ISSUE-026), and `C-MAX-PARAMS` is 64. The first gate failed only `w3b-sdl`; the rerun
-  with the limit raised was in flight. Once it passes: commit, fast-forward `../nucleus`,
+  (ISSUE-026), and `C-MAX-PARAMS` is 64. Gate reruns failed `w3b-sdl`, then `w3b-skip`;
+  both are fixed (the `w3b-skip` fixture now has 65 parameters) and pass alone. The full
+  gate needs one more run. Once it passes: commit, fast-forward `../nucleus`,
   format-patch as 0006, and set ISSUE-026's sha in ISSUES.md.
 
 ### Still stock
