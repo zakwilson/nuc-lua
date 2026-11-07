@@ -5,5 +5,4 @@
  :cflags ["-Iinclude" "-Ireference/build/src" "-DLUA_USE_LINUX"]
  :link-args ["-Wl,--dynamic-list=src/lua.dynlist"]
  :libs ["m" "dl"]
- :deps {luacapi {:path "capi"}}
- :c-sources ["reference/build/src/lvm.c"]}
+ :deps {luacapi {:path "capi"}}}

@@ -2,9 +2,10 @@
 
 ## The migration decision
 
-**Hybrid, one module at a time.** The root `build.edn` builds `build/lua` from the
-Nucleus sources in `src/` plus every stock module not yet ported, listed in
-`:c-sources` and compiled from `reference/build/src/` (an unmodified copy of
+**Hybrid, one module at a time** (complete at M7: no stock object is linked now).
+The root `build.edn` built `build/lua` from the Nucleus sources in `src/` plus every
+stock module not yet ported, listed in `:c-sources` and compiled from
+`reference/build/src/` (an unmodified copy of
 `../lua-5.5.1` that `scripts/setup.sh` makes). Porting a module means writing its
 Nucleus namespace and deleting its line from `:c-sources`; the suite must pass after
 each one.
@@ -19,8 +20,8 @@ is that the remaining C is compiled by the build tool with `-O2` and
 reference is only meaningful at the end.
 
 `luac` is a second project, `luac/build.edn`, whose entry is `src/luac.nuc` and whose
-source root is the port's `src/`: a `build.edn` makes one program (ISSUE-039). It
-lists the same stock `:c-sources`, and its paths warn at every build.
+source root is the port's `src/`: a `build.edn` makes one program (ISSUE-039). Its
+entry and source root warn at every build.
 
 Order: `lua.c`, `lauxlib.c` and the libraries first (public API only), then the
 object model, the compiler, execution state, the collector and the VM (§10).
@@ -36,7 +37,8 @@ object model, the compiler, execution state, the collector and the VM (§10).
 | 4 Compiler | done: `lopcodes`, `llex`, `lcode`, `lparser`, `ldump`, `lundump`, `luac.c` |
 | 5 Execution state | done: `lstate`, `ldebug`, `ldo`, `lapi` |
 | 6 The collector | done: `lgc`; the suite passes collecting as often as it can, in both modes |
-| 7–11 | not started |
+| 7 The VM | done: `lvm`, threaded dispatch; no stock object linked; benchmarked; user test request below |
+| 8–11 | not started |
 
 ### Nucleus
 
@@ -58,8 +60,10 @@ Compiler: `.nucleus-work` on `lua-bugfixes` (see CLAUDE.md).
 
 ### Still stock
 
-The VM: every module in `build.edn`'s
-`:c-sources` (`lvm`). `lstate`, `ldebug`, `ldo`, `lapi` and `lgc` are `state.nuc`,
+None: `build.edn` has no `:c-sources`, and `scripts/check-nm.sh` finds no stock
+definition in `lua` or `luac`. `lvm` is `vm.nuc`: dispatch is threaded, each opcode a
+`label` ending in a `goto-ptr` through a global table filled on the first call
+(ISSUE-045). `lstate`, `ldebug`, `ldo`, `lapi` and `lgc` are `state.nuc`,
 `debug.nuc`, `do.nuc`, `api.nuc` and `gc.nuc`; `api.nuc`'s `lua_ident` is spelled out in bytes
 (ISSUE-044); `do.nuc`'s `LongJmp` is C's `lua_longjmp` (ISSUE-037), its
 `jmp_buf` a struct field, `_setjmp`/`_longjmp` by name. The object model is in `src/lua/`
@@ -102,6 +106,9 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
   takes 2.28 s against stock `luac`'s 2.21 s.
 - M6: with `lgc` in Nucleus, both stressed runs pass, as on stock. A script counting
   `__gc` sentinels sees the same number of cycles as stock in each mode.
+- M7: with `lvm` in Nucleus, every gate passes (suite, both stressed runs, matrix,
+  bytecode, tables, probes) and `check-nm.sh` finds no stock object in either program.
+  The benchmark below runs at 0.92 to 1.14 times stock.
 - The spike: a Nucleus `luaopen_` module whose function raises with `luaL_error`
   (a real C variadic call) is caught by `pcall` in stock `lua`.
 
@@ -122,6 +129,8 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
   `luac/`; `PLUAC=` picks another) must dump as `string.dump`, list as stock `luac`, and
   answer its options as stock does.
 - `scripts/check-tables.sh`: `luaP_opmodes` and `luai_ctype_` byte-identical to stock's.
+- `scripts/check-nm.sh [binary]`: no global a stock object defines is strong in the
+  port (Nucleus's public `defn`s are weak, C's are not).
 - `scripts/check-suite.sh` runs the official suite (`LUA=` picks the binary).
 - `scripts/check-gcstress.sh` runs it once per collector mode with the collector
   busy: incremental with `pause` 0 (a cycle always in progress), generational with
@@ -132,8 +141,9 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
 
 ## Next
 
-M7, the VM: `lvm` as `src/lua/vm.nuc`, its dispatch threaded with `label-addr` and
-`goto-ptr`; then no stock object in the link (`nm`), and the benchmark (§7.5). `code.nuc` holds `lcode.h`'s macros and the `expdesc`
+M8, the Nucleus libraries complete: `libs/nucdemo`, the Nucleus side of
+`tests/capi/`, and `docs/writing-libraries.md`; the full matrix, with two Nucleus
+libraries loaded at once into each host, and the unload path (PROMPT §10, §6.5). `code.nuc` holds `lcode.h`'s macros and the `expdesc`
 union accessors (`u`, `set-u`, `ind`, `set-ind`, `uvar`, `set-uvar`) that `parser.nuc`
 uses; `parser.nuc`'s `Block` is C's `BlockCnt` (ISSUE-037). `opcodes.nuc` generates `luaP_opmodes` from one
 opcode row table (`with-opcodes`); `luac`'s `opnames` come from the same rows.
@@ -150,3 +160,61 @@ overload and the C caller then binds to nothing.
 ## Open questions
 
 None.
+
+## User test request (M7)
+
+The whole interpreter is now Nucleus; please try it on your machine. Nothing waits on
+this.
+
+Build:
+
+```sh
+# Nucleus at lua-bugfixes d2c75f7 (main 1e0fbb3 plus nucleus-patches/0001-0010)
+git -C ../nucleus checkout lua-bugfixes   # or: git am nuc-lua/nucleus-patches/*.patch
+make -C ../nucleus -j"$(nproc)"
+export NUCLEUS_HOME=$(realpath ../nucleus)
+
+# the port, on nuc-lua's main
+scripts/setup.sh       # stock reference and suite; fetches them if ../lua-5.5.1* are absent
+$NUCLEUS_HOME/build/nucleus build
+(cd luac && $NUCLEUS_HOME/build/nucleus build)
+scripts/build-libs.sh  # libs/mayi
+```
+
+Try:
+
+- `build/lua` interactively, and on your own scripts; `luac/build/luac -l -l x.lua`.
+- The gates: `scripts/check-suite.sh`, `scripts/check-gcstress.sh`,
+  `scripts/check-capi.sh`, `scripts/check-bytecode.sh`, `scripts/check-nm.sh`.
+- `NOAPPEND=1 scripts/bench.sh`, to see whether the ratios hold on your CPU.
+- `scratch/mayi.c` (built by `setup.sh` into `build/so/c/`) and `libs/mayi` (into
+  `build/so/n/`), each in each host:
+  `sleep 1 | build/lua tests/capi/mayi.lua build/so/c idle` should print `table
+  function` then `false` four times; `echo x | build/lua tests/capi/mayi.lua build/so/n
+  ready` prints `true`. The same with `reference/build/src/lua`.
+
+Known problems:
+
+- Building `luac` warns twice that its entry and source root leave the project
+  (ISSUE-039).
+- `check-probes.sh` reports 16 probes that reproduce: those are open findings, not
+  failures.
+- `bench.sh`'s `calls` and `patterns` run about 1.13 times stock, not yet looked into.
+
+## Benchmarks
+
+`scripts/bench.sh` (PROMPT §7.5) appends each run here: best of three wall times, both
+at `-O2`; a ratio above 1 is the port slower.
+
+### Benchmark, 2026-11-07, Nucleus d2c75f7
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 420 | 479 | 1.14 |
+| closures | 422 | 415 | 0.98 |
+| floats | 274 | 260 | 0.95 |
+| gc | 599 | 586 | 0.98 |
+| metamethods | 369 | 368 | 1.00 |
+| patterns | 291 | 330 | 1.13 |
+| strings | 194 | 187 | 0.96 |
+| tables | 367 | 339 | 0.92 |

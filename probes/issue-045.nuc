@@ -1,0 +1,15 @@
+; ISSUE-045: a computed goto's table, C's `static const void *const t[] = {&&a, &&b}`, has no home.
+; expect: prints `12`; actual: a local array is refused, and a global can't name a label
+; run: $NUCLEUSC $P -o $W/p && $W/p
+; fixed-when-output: 12
+(import-use "stdio.h")
+(defn f (k:i32):i32
+  (let (tab:(array ptr 2) (array ptr (label-addr A) (label-addr B)))
+    (goto-ptr (aref tab k))
+    (label A)
+    (return 1)
+    (label B)
+    (return 2)))
+(defn main ():i32
+  (printf "%d%d\n" (f 0) (f 1))
+  (return 0))

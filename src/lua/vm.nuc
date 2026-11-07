@@ -1,0 +1,1270 @@
+; The virtual machine: conversions, comparisons, concatenation and length,
+; integer division and shifts, and the interpreter loop.
+;
+; lvm.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.vm)
+(set-ir-prefix "")
+(import-use "lstate.h")
+(import-use "lapi.h")
+(import-use "ldebug.h")
+(import-use "ldo.h")
+(import-use "lfunc.h")
+(import-use "lgc.h")
+(import-use "lobject.h")
+(import-use "lopcodes.h")
+(import-use "lstring.h")
+(import-use "ltable.h")
+(import-use "ltm.h")
+(import-use "lvm.h")
+(import-use "math.h")
+(import-use "string.h")
+(import-use lua.util)
+(import-use lua.core)
+(import-use lua.opcodes)
+(import-ct nucleus.node)
+(import-ct nucleus.intern)
+
+(defconst MAXTAGLOOP 2000)  ; the longest metamethod chain
+(defconst NBITS 64)         ; bits in a lua_Integer
+(defconst HOK 0)
+(defconst HNOTATABLE 2)
+(defconst MAXARG_vC 1023)   ; (1 << SIZE_vC) - 1
+(defconst LUAI_MAXSHORTLEN 40)
+
+; Whether integer 'i' converts to a float exactly: |i| <= 2^53.
+(defmacro l_intfitsf (i)
+  `(<= (+ (as lua_Unsigned 0x20000000000000) (l_castS2U ~i)) (as lua_Unsigned 0x40000000000000)))
+(defmacro cvt2num (o) `(ttisstring ~o))
+(defmacro tonumber (o n)
+  (let (a (gensym))
+    `(let ((~a (ptr TValue)) ~o)
+       (if (ttisfloat ~a) (do (set! (deref ~n) (fltvalue ~a)) true) (!= (luaV_tonumber_ ~a ~n) 0)))))
+(defmacro fastget (t k res f tag)
+  `(set! ~tag (if (not (ttistable ~t)) LUA_VNOTABLE (~f (hvalue ~t) ~k ~res))))
+(defmacro fastgeti (t k res tag)
+  `(if (not (ttistable ~t))
+     (set! ~tag LUA_VNOTABLE)
+     (luaH_fastgeti (hvalue ~t) ~k ~res ~tag)))
+(defmacro fastset (t k val hres f)
+  `(set! ~hres (if (not (ttistable ~t)) HNOTATABLE (~f (hvalue ~t) ~k ~val))))
+(defmacro fastseti (t k val hres)
+  `(if (not (ttistable ~t))
+     (set! ~hres HNOTATABLE)
+     (luaH_fastseti (hvalue ~t) ~k ~val ~hres)))
+(defmacro finishfastset (L t v) `(luaC_barrierback ~L (gcvalue ~t) ~v))
+(defmacro setclLvalue2s (L o cl)
+  `(let (a:(ptr TValue) (s2v ~o))
+     (set! ((a 'value_) 'gc) (obj2gco ~cl))
+     (set! (a 'tt_) (ctb LUA_VLCL))))
+(defmacro get_nresults (cs) `(- (cast_int (bit-and ~cs 0xff)) 1))
+; luai_nummod: C's fmod, corrected toward minus infinity.
+(defmacro nummod (a b)
+  (let (x (gensym) y (gensym) m (gensym))
+    `(let ((~x lua_Number) ~a
+           (~y lua_Number) ~b
+           (~m lua_Number) (fmod ~x ~y))
+       (when (if (> ~m 0.0) (< ~y 0.0) (and (< ~m 0.0) (> ~y 0.0)))
+         (set! ~m (+ ~m ~y)))
+       ~m)))
+(defmacro numpow (a b)
+  (let (x (gensym) y (gensym))
+    `(let ((~x lua_Number) ~a (~y lua_Number) ~b)
+       (if (= ~y 2.0) (* ~x ~x) (pow ~x ~y)))))
+
+; ---- conversions ----
+
+; A string's number, into 'result'; false when it isn't a numeral.
+(defn- l_strton (obj:(ptr TValue) result:(ptr TValue)):bool
+  (when (not (cvt2num obj))
+    (return false))
+  (let (st:(ptr TString) (tsvalue obj))
+    (return (= (luaO_str2num (cstr (getstr st)) result) (+ (tsslen st) 1)))))
+
+; A value as a float; tonumber handles a float itself.
+(defn luaV_tonumber_ (obj:(ptr TValue) n:(ptr lua_Number)):i32
+  (let (v:(ptr TValue) (alloca TValue))
+    (cond (ttisinteger obj) (do (set! (deref n) (cast_num (ivalue obj))) (return 1))
+          (l_strton obj v) (do (set! (deref n) (if (ttisinteger v) (cast_num (ivalue v)) (fltvalue v)))
+                               (return 1))
+          true (return 0))))
+
+; A float as an integer, rounded by 'mode'.
+(defn luaV_flttointeger (n:lua_Number p:(ptr lua_Integer) mode:F2Imod):i32
+  (let (f:lua_Number (floor n))
+    (when (!= n f)  ; not integral
+      (cond (= mode F2Ieq) (return 0)
+            (= mode F2Iceil) (set! f (+ f 1.0))  ; the floor's ceiling
+            true 0))
+    (return (if (lua_numbertointeger f (deref p)) 1 0))))
+
+; A value as an integer, without string coercion.
+(defn luaV_tointegerns (obj:(ptr TValue) p:(ptr lua_Integer) mode:F2Imod):i32
+  (cond (ttisfloat obj) (return (luaV_flttointeger (fltvalue obj) p mode))
+        (ttisinteger obj) (do (set! (deref p) (ivalue obj)) (return 1))
+        true (return 0)))
+
+(defn luaV_tointeger (obj0:(ptr TValue) p:(ptr lua_Integer) mode:F2Imod):i32
+  (let (v:(ptr TValue) (alloca TValue)
+        obj:(ptr TValue) obj0)
+    (when (l_strton obj v)  ; a numeral: use its number
+      (set! obj v))
+    (return (luaV_tointegerns obj p mode))))
+
+; A 'for' limit as an integer, keeping the loop's meaning; true when the loop
+; must not run. A float past the integers is clipped, or, too far the other
+; way, skips the loop: no integer limit would be right for it.
+(defn- forlimit (L:(ptr lua_State) init:lua_Integer lim:(ptr TValue) p:(ptr lua_Integer) step:lua_Integer):bool
+  (when (= (luaV_tointeger lim p (if (< step 0) F2Iceil F2Ifloor)) 0)
+    (let (flim:(ptr lua_Number) (alloca lua_Number))  ; not an integer: a float?
+      (when (not (tonumber lim flim))
+        (luaG_forerror L lim "limit"))
+      (if (< 0.0 (deref flim))  ; positive: too large
+        (do (when (< step 0) (return true))
+            (set! (deref p) LUA_MAXINTEGER))
+        (do (when (> step 0) (return true))  ; below the smallest integer
+            (set! (deref p) LUA_MININTEGER)))))
+  (return (if (> step 0) (> init (deref p)) (< init (deref p)))))
+
+; Prepares a numeric loop. The stack holds init, limit, step at 'ra'; after,
+; the count (integer loop) or limit (float loop), the step, the control
+; variable. True skips the loop.
+(defn- forprep (L:(ptr lua_State) ra:StkId):bool
+  (let (pinit:(ptr TValue) (s2v ra)
+        plimit:(ptr TValue) (s2v (p+ ra 1))
+        pstep:(ptr TValue) (s2v (p+ ra 2)))
+    (if (and (ttisinteger pinit) (ttisinteger pstep))  ; an integer loop
+      (let (init:lua_Integer (ivalue pinit)
+            step:lua_Integer (ivalue pstep)
+            limit:(ptr lua_Integer) (alloca lua_Integer))
+        (when (= step 0)
+          (luaG_runerror L "'for' step is zero"))
+        (when (forlimit L init plimit limit step)
+          (return true))
+        (let (count:lua_Unsigned 0)
+          (if (> step 0)
+            (do (set! count (- (l_castS2U (deref limit)) (l_castS2U init)))
+                (when (!= step 1)  ; no division in the common case
+                  (set! count (/ count (l_castS2U step)))))
+            ; 'step+1' keeps mininteger from being negated
+            (do (set! count (- (l_castS2U init) (l_castS2U (deref limit))))
+                (set! count (/ count (+ (l_castS2U (- 0 (+ step 1))) 1)))))
+          (chgivalue (s2v ra) (l_castU2S count))  ; init becomes the count
+          (setivalue (s2v (p+ ra 1)) step)  ; limit becomes the step
+          (chgivalue (s2v (p+ ra 2)) init)))  ; step becomes init
+      (let (init:(ptr lua_Number) (alloca lua_Number)  ; floats throughout
+            limit:(ptr lua_Number) (alloca lua_Number)
+            step:(ptr lua_Number) (alloca lua_Number))
+        (when (not (tonumber plimit limit))
+          (luaG_forerror L plimit "limit"))
+        (when (not (tonumber pstep step))
+          (luaG_forerror L pstep "step"))
+        (when (not (tonumber pinit init))
+          (luaG_forerror L pinit "initial value"))
+        (when (= (deref step) 0.0)
+          (luaG_runerror L "'for' step is zero"))
+        (when (if (< 0.0 (deref step)) (< (deref limit) (deref init)) (< (deref init) (deref limit)))
+          (return true))
+        (setfltvalue (s2v ra) (deref limit))
+        (setfltvalue (s2v (p+ ra 1)) (deref step))
+        (setfltvalue (s2v (p+ ra 2)) (deref init))))  ; the control variable
+    (return false)))
+
+; One step of a float loop; true to go round again. OP_FORLOOP does the
+; integer loop inline.
+(defn- floatforloop (L:(ptr lua_State) ra:StkId):bool
+  (let (step:lua_Number (fltvalue (s2v (p+ ra 1)))
+        limit:lua_Number (fltvalue (s2v ra))
+        idx:lua_Number (+ (fltvalue (s2v (p+ ra 2))) step))
+    (when (if (< 0.0 step) (<= idx limit) (<= limit idx))
+      (chgfltvalue (s2v (p+ ra 2)) idx)
+      (return true))
+    (return false)))
+
+; ---- tables ----
+
+; Finishes 'val = t[key]'; the tag of the result.
+(defn luaV_finishget (L:(ptr lua_State) t0:(ptr TValue) key:(ptr TValue) val:StkId tag0:lu_byte):lu_byte
+  (let (t:(ptr TValue) t0
+        tag:lu_byte tag0)
+    (for (loop:i32 0) (< loop MAXTAGLOOP) (set! loop (+ loop 1))
+      (let (tm:(ptr TValue) null)
+        (if (= tag LUA_VNOTABLE)  ; not a table
+          (do (set! tm (luaT_gettmbyobj L t TM_INDEX))
+              (when (notm tm)
+                (luaG_typeerror L t "index")))
+          (do (set! tm (fasttm L ((hvalue t) 'metatable) TM_INDEX))
+              (when (= (as ptr tm) null)  ; no metamethod: nil
+                (setnilvalue2s val)
+                (return LUA_VNIL))))
+        (when (ttisfunction tm)
+          (return (luaT_callTMres L tm t key val)))
+        (set! t tm)  ; else 'tm[key]'
+        (fastget t key (s2v val) luaH_get tag)
+        (when (not (tagisempty tag))
+          (return tag))))
+    (luaG_runerror L "'__index' chain too long; possible loop")
+    (return 0)))
+
+; Finishes 't[key] = val'. The table is anchored before luaH_finishset: past
+; the first round it is a metatable's field, and a weak metatable would let an
+; emergency collection take it mid-update.
+(defn luaV_finishset (L:(ptr lua_State) t0:(ptr TValue) key:(ptr TValue) val:(ptr TValue) hres0:i32):void
+  (let (t:(ptr TValue) t0
+        hres:i32 hres0)
+    (for (loop:i32 0) (< loop MAXTAGLOOP) (set! loop (+ loop 1))
+      (let (tm:(ptr TValue) null)
+        (if (!= hres HNOTATABLE)  ; a table
+          (let (h:(ptr Table) (hvalue t))
+            (set! tm (fasttm L (h 'metatable) TM_NEWINDEX))
+            (when (= (as ptr tm) null)  ; no metamethod
+              (sethvalue2s L ((L 'top) 'p) h)  ; anchor it
+              (set! ((L 'top) 'p) (p+ ((L 'top) 'p) 1))  ; EXTRA_STACK has room
+              (luaH_finishset L h key val hres)
+              (set! ((L 'top) 'p) (p+ ((L 'top) 'p) -1))
+              (invalidateTMcache h)
+              (luaC_barrierback L (obj2gco h) val)
+              (return)))
+          (do (set! tm (luaT_gettmbyobj L t TM_NEWINDEX))
+              (when (notm tm)
+                (luaG_typeerror L t "index"))))
+        (when (ttisfunction tm)
+          (luaT_callTM L tm t key val)
+          (return))
+        (set! t tm)  ; else assign over 'tm', keeping 'h'
+        (if (not (ttistable t))
+          (set! hres HNOTATABLE)
+          (let (h:(ptr Table) (hvalue t))  ; the next call may change 't'
+            (set! hres (luaH_pset h key val))
+            (when (= hres HOK)
+              (luaC_barrierback L (obj2gco h) val)
+              (return))))))
+    (luaG_runerror L "'__newindex' chain too long; possible loop")))
+
+; ---- comparisons ----
+
+; Compares two strings, '\0's included, with strcoll on each segment so the
+; locale is respected; equal segments can still differ in length.
+(defn- l_strcmp (ts1:(ptr TString) ts2:(ptr TString)):i32
+  (let (s1:(ptr i8) (getstr ts1)
+        rl1:usize (tsslen ts1)
+        s2:(ptr i8) (getstr ts2)
+        rl2:usize (tsslen ts2))
+    (while true
+      (let (temp:i32 (strcoll (cstr s1) (cstr s2)))
+        (when (!= temp 0)
+          (return temp))
+        (let (zl1:usize (strlen (cstr s1))  ; the first '\0'
+              zl2:usize (strlen (cstr s2)))
+          (when (= zl2 rl2)  ; 's2' is done
+            (return (if (= zl1 rl1) 0 1)))
+          (when (= zl1 rl1)  ; 's1' is done, 's2' isn't
+            (return -1))
+          (set! zl1 (+ zl1 1))  ; on past the '\0'
+          (set! zl2 (+ zl2 1))
+          (set! s1 (p+ s1 zl1))
+          (set! rl1 (- rl1 zl1))
+          (set! s2 (p+ s2 zl2))
+          (set! rl2 (- rl2 zl2)))))
+    (return 0)))
+
+; 'i < f'. When 'i' converts exactly, as floats; else 'i < ceil(f)', and a
+; ceiling past the integers is above or below them all. NaN compares false.
+(defn- LTintfloat (i:lua_Integer f:lua_Number):bool
+  (if (l_intfitsf i)
+    (return (< (cast_num i) f))
+    (let (fi:(ptr lua_Integer) (alloca lua_Integer))
+      (if (!= (luaV_flttointeger f fi F2Iceil) 0)
+        (return (< i (deref fi)))
+        (return (> f 0.0))))))
+
+(defn- LEintfloat (i:lua_Integer f:lua_Number):bool
+  (if (l_intfitsf i)
+    (return (<= (cast_num i) f))
+    (let (fi:(ptr lua_Integer) (alloca lua_Integer))  ; i <= floor(f)
+      (if (!= (luaV_flttointeger f fi F2Ifloor) 0)
+        (return (<= i (deref fi)))
+        (return (> f 0.0))))))
+
+(defn- LTfloatint (f:lua_Number i:lua_Integer):bool
+  (if (l_intfitsf i)
+    (return (< f (cast_num i)))
+    (let (fi:(ptr lua_Integer) (alloca lua_Integer))  ; floor(f) < i
+      (if (!= (luaV_flttointeger f fi F2Ifloor) 0)
+        (return (< (deref fi) i))
+        (return (< f 0.0))))))
+
+(defn- LEfloatint (f:lua_Number i:lua_Integer):bool
+  (if (l_intfitsf i)
+    (return (<= f (cast_num i)))
+    (let (fi:(ptr lua_Integer) (alloca lua_Integer))  ; ceil(f) <= i
+      (if (!= (luaV_flttointeger f fi F2Iceil) 0)
+        (return (<= (deref fi) i))
+        (return (< f 0.0))))))
+
+(defn- LTnum (l:(ptr TValue) r:(ptr TValue)):bool
+  (if (ttisinteger l)
+    (let (li:lua_Integer (ivalue l))
+      (if (ttisinteger r)
+        (return (< li (ivalue r)))
+        (return (LTintfloat li (fltvalue r)))))
+    (let (lf:lua_Number (fltvalue l))
+      (if (ttisfloat r)
+        (return (< lf (fltvalue r)))
+        (return (LTfloatint lf (ivalue r)))))))
+
+(defn- LEnum (l:(ptr TValue) r:(ptr TValue)):bool
+  (if (ttisinteger l)
+    (let (li:lua_Integer (ivalue l))
+      (if (ttisinteger r)
+        (return (<= li (ivalue r)))
+        (return (LEintfloat li (fltvalue r)))))
+    (let (lf:lua_Number (fltvalue l))
+      (if (ttisfloat r)
+        (return (<= lf (fltvalue r)))
+        (return (LEfloatint lf (ivalue r)))))))
+
+(defn- lessthanothers (L:(ptr lua_State) l:(ptr TValue) r:(ptr TValue)):i32
+  (if (and (ttisstring l) (ttisstring r))
+    (return (if (< (l_strcmp (tsvalue l) (tsvalue r)) 0) 1 0))
+    (return (luaT_callorderTM L l r TM_LT))))
+
+(defn luaV_lessthan (L:(ptr lua_State) l:(ptr TValue) r:(ptr TValue)):i32
+  (if (and (ttisnumber l) (ttisnumber r))
+    (return (if (LTnum l r) 1 0))
+    (return (lessthanothers L l r))))
+
+(defn- lessequalothers (L:(ptr lua_State) l:(ptr TValue) r:(ptr TValue)):i32
+  (if (and (ttisstring l) (ttisstring r))
+    (return (if (<= (l_strcmp (tsvalue l) (tsvalue r)) 0) 1 0))
+    (return (luaT_callorderTM L l r TM_LE))))
+
+(defn luaV_lessequal (L:(ptr lua_State) l:(ptr TValue) r:(ptr TValue)):i32
+  (if (and (ttisnumber l) (ttisnumber r))
+    (return (if (LEnum l r) 1 0))
+    (return (lessequalothers L l r))))
+
+; 't1 == t2'; a null 'L' is raw equality, without metamethods.
+(defn luaV_equalobj (L:(ptr lua_State) t1:(ptr TValue) t2:(ptr TValue)):i32
+  (when (!= (ttype t1) (ttype t2))
+    (return 0))
+  (when (!= (ttypetag t1) (ttypetag t2))
+    ; only numbers, and strings when one is external, equal across variants
+    (case (as i32 (ttypetag t1))
+      LUA_VNUMINT (let (i2:(ptr lua_Integer) (alloca lua_Integer))
+                    (return (if (and (!= (luaV_flttointeger (fltvalue t2) i2 F2Ieq) 0)
+                                     (= (ivalue t1) (deref i2))) 1 0)))
+      LUA_VNUMFLT (let (i1:(ptr lua_Integer) (alloca lua_Integer))
+                    (return (if (and (!= (luaV_flttointeger (fltvalue t1) i1 F2Ieq) 0)
+                                     (= (deref i1) (ivalue t2))) 1 0)))
+      (:or LUA_VSHRSTR LUA_VLNGSTR) (return (luaS_eqstr (tsvalue t1) (tsvalue t2)))
+      (return 0)))
+  (let (tm:(ptr TValue) null)
+    (case (as i32 (ttypetag t1))
+      (:or LUA_VNIL LUA_VFALSE LUA_VTRUE) (return 1)
+      LUA_VNUMINT (return (if (= (ivalue t1) (ivalue t2)) 1 0))
+      LUA_VNUMFLT (return (if (= (fltvalue t1) (fltvalue t2)) 1 0))
+      LUA_VLIGHTUSERDATA (return (if (= (pvalue t1) (pvalue t2)) 1 0))
+      LUA_VSHRSTR (return (if (= (as ptr (tsvalue t1)) (as ptr (tsvalue t2))) 1 0))
+      LUA_VLNGSTR (return (luaS_eqstr (tsvalue t1) (tsvalue t2)))
+      LUA_VUSERDATA
+        (do (when (= (as ptr (uvalue t1)) (as ptr (uvalue t2))) (return 1))
+            (when (= (as ptr L) null) (return 0))
+            (set! tm (fasttm L ((uvalue t1) 'metatable) TM_EQ))
+            (when (= (as ptr tm) null)
+              (set! tm (fasttm L ((uvalue t2) 'metatable) TM_EQ))))
+      LUA_VTABLE
+        (do (when (= (as ptr (hvalue t1)) (as ptr (hvalue t2))) (return 1))
+            (when (= (as ptr L) null) (return 0))
+            (set! tm (fasttm L ((hvalue t1) 'metatable) TM_EQ))
+            (when (= (as ptr tm) null)
+              (set! tm (fasttm L ((hvalue t2) 'metatable) TM_EQ))))
+      LUA_VLCF (return (if (= (unsafe/cast ptr (fvalue t1)) (unsafe/cast ptr (fvalue t2))) 1 0))
+      (return (if (= (as ptr (gcvalue t1)) (as ptr (gcvalue t2))) 1 0)))  ; functions, threads
+    (when (= (as ptr tm) null)
+      (return 0))  ; different, with no metamethod
+    (let (tag:lu_byte (luaT_callTMres L tm t1 t2 ((L 'top) 'p)))
+      (return (if (tagisfalse tag) 0 1)))))
+
+; ---- concatenation and length ----
+
+; Makes the value at 'o' a string, if it can.
+(defmacro tostring (L o)
+  (let (a (gensym))
+    `(let ((~a (ptr TValue)) ~o)
+       (or (ttisstring ~a) (and (ttisnumber ~a) (do (luaO_tostring ~L ~a) true))))))
+; A short empty string; an external one can be empty too, and is concatenated.
+(defmacro isemptystr (o)
+  (let (a (gensym))
+    `(let ((~a (ptr TValue)) ~o) (and (ttisshrstring ~a) (= ((tsvalue ~a) 'shrlen) 0)))))
+
+; Copies the strings from 'top - n' to 'top - 1' into 'buff'.
+(defn- copy2buff (top:StkId n0:i32 buff:(ptr i8)):void
+  (let (tl:usize 0
+        n:i32 n0)
+    (while (> n 0)
+      (let (st:(ptr TString) (tsvalue (s2v (p+ top (- n))))
+            l:usize (tsslen st))
+        (memcpy (as ptr (p+ buff tl)) (as ptr (getstr st)) l)
+        (set! tl (+ tl l)))
+      (set! n (- n 1)))))
+
+; Concatenates the 'total' values from 'L->top - total' to 'L->top - 1'.
+(defn luaV_concat (L:(ptr lua_State) total0:i32):void
+  (let (total:i32 total0)
+    (when (= total 1)
+      (return))  ; done already
+    (while true
+      (let (top:StkId ((L 'top) 'p)
+            n:i32 2)  ; the values done in this pass, two at least
+        (cond (or (not (or (ttisstring (s2v (p+ top -2))) (ttisnumber (s2v (p+ top -2)))))
+                  (not (tostring L (s2v (p+ top -1)))))
+                (luaT_tryconcatTM L)  ; may move 'top'
+              (isemptystr (s2v (p+ top -1)))  ; the second is empty: the first is the result
+                (tostring L (s2v (p+ top -2)))
+              (isemptystr (s2v (p+ top -2)))  ; the first is empty: the second is
+                (setobjs2s L (p+ top -2) (p+ top -1))
+              true
+                ; two strings at least: take as many as there are
+                (let (tl:usize (tsslen (tsvalue (s2v (p+ top -1))))  ; the total length
+                      ts:(ptr TString) null)
+                  (set! n 1)
+                  (while (and (< n total) (tostring L (s2v (p+ top (- (- n) 1)))))
+                    (let (l:usize (tsslen (tsvalue (s2v (p+ top (- (- n) 1))))))
+                      (when (>= l (- (- (MAX_SIZE) (cast_sizet (sizeof TString))) tl))
+                        (set! ((L 'top) 'p) (p+ top (- total)))  ; pop them, not to waste stack
+                        (luaG_runerror L "string length overflow"))
+                      (set! tl (+ tl l)))
+                    (set! n (+ n 1)))
+                  (if (<= tl LUAI_MAXSHORTLEN)  ; a short string
+                    (let (buff:(ptr i8) (alloca i8 LUAI_MAXSHORTLEN))
+                      (copy2buff top n buff)
+                      (set! ts (luaS_newlstr L (cstr buff) tl)))
+                    (do (set! ts (luaS_createlngstrobj L tl))  ; long: copy straight into it
+                        (copy2buff top n (getlngstr ts))))
+                  (setsvalue2s L (p+ top (- n)) ts)))
+        (set! total (- total (- n 1)))  ; 'n' strings became one
+        (set! ((L 'top) 'p) (p+ ((L 'top) 'p) (- (- n 1)))))
+      (when (<= total 1)
+        (return)))))
+
+; 'ra = #rb'.
+(defn luaV_objlen (L:(ptr lua_State) ra:StkId rb:(ptr TValue)):void
+  (let (tm:(ptr TValue) null)
+    (case (as i32 (ttypetag rb))
+      LUA_VTABLE
+        (let (h:(ptr Table) (hvalue rb))
+          (set! tm (fasttm L (h 'metatable) TM_LEN))
+          (when (= (as ptr tm) null)  ; no metamethod: the primitive length
+            (setivalue (s2v ra) (l_castU2S (luaH_getn L h)))
+            (return)))
+      LUA_VSHRSTR (do (setivalue (s2v ra) (as lua_Integer ((tsvalue rb) 'shrlen)))
+                      (return))
+      LUA_VLNGSTR (do (setivalue (s2v ra) (cast_st2S (((tsvalue rb) 'u) 'lnglen)))
+                      (return))
+      (do (set! tm (luaT_gettmbyobj L rb TM_LEN))
+          (when (notm tm)
+            (luaG_typeerror L rb "get length of"))))
+    (luaT_callTMres L tm rb rb ra)))
+
+; ---- integer arithmetic ----
+
+; 'm // n', floor(m/n): C truncates, so a negative non-integral quotient is
+; one too high.
+(defn luaV_idiv (L:(ptr lua_State) m:lua_Integer n:lua_Integer):lua_Integer
+  (when (<= (+ (l_castS2U n) 1) 1)  ; -1 or 0
+    (when (= n 0)
+      (luaG_runerror L "attempt to divide by zero"))
+    (return (intop - 0 m)))  ; n == -1: no overflow on mininteger
+  (let (q:lua_Integer (/ m n))
+    (when (and (< (bit-xor m n) 0) (!= (% m n) 0))
+      (set! q (- q 1)))
+    (return q)))
+
+; 'm % n', rounding as luaV_idiv does.
+(defn luaV_mod (L:(ptr lua_State) m:lua_Integer n:lua_Integer):lua_Integer
+  (when (<= (+ (l_castS2U n) 1) 1)  ; -1 or 0
+    (when (= n 0)
+      (luaG_runerror L "attempt to perform 'n%%0'"))
+    (return 0))  ; m % -1 == 0, and no overflow on mininteger
+  (let (r:lua_Integer (% m n))
+    (when (and (!= r 0) (< (bit-xor r n) 0))
+      (set! r (+ r n)))
+    (return r)))
+
+(defn luaV_modf (L:(ptr lua_State) m:lua_Number n:lua_Number):lua_Number
+  (return (nummod m n)))
+
+; 'x << y'; a negative 'y' shifts right.
+(defn luaV_shiftl (x:lua_Integer y:lua_Integer):lua_Integer
+  (if (< y 0)
+    (if (<= y (- NBITS)) (return 0) (return (intop bit-shr x (- y))))
+    (if (>= y NBITS) (return 0) (return (intop bit-shl x y)))))
+(defmacro luaV_shiftr (x y) `(luaV_shiftl ~x (intop - 0 ~y)))
+
+; A new closure on the stack at 'ra', with its upvalues.
+(defn- pushclosure (L:(ptr lua_State) p:(ptr Proto) encup:(ptr (ptr UpVal)) base:StkId ra:StkId):void
+  (let (nup:i32 (p 'sizeupvalues)
+        uv:(ptr Upvaldesc) (p 'upvalues)
+        ncl:(ptr LClosure) (luaF_newLclosure L nup))
+    (set! (ncl 'p) p)
+    (setclLvalue2s L ra ncl)  ; anchored
+    (for (i:i32 0) (< i nup) (set! i (+ i 1))
+      (let (d:(ptr Upvaldesc) (p+ uv i))
+        (if (!= (d 'instack) 0)  ; a local of the enclosing function
+          (set! (aref (ncl 'upvals) i) (luaF_findupval L (p+ base (d 'idx))))
+          (set! (aref (ncl 'upvals) i) (deref (p+ encup (d 'idx))))))  ; its upvalue
+      (luaC_objbarrier L ncl (aref (ncl 'upvals) i)))))
+
+; Finishes an opcode a yield interrupted.
+(defn luaV_finishOp (L:(ptr lua_State)):void
+  (let (ci:(ptr CallInfo) (L 'ci)
+        base:StkId (p+ ((ci 'func) 'p) 1)
+        inst:Instruction (deref (p+ (((ci 'u) 'l) 'savedpc) -1))  ; the interrupted one
+        op:i32 (as i32 (GET_OPCODE inst)))
+    (case op
+      (:or OP_MMBIN OP_MMBINI OP_MMBINK)
+        (do (set! ((L 'top) 'p) (p+ ((L 'top) 'p) -1))
+            (setobjs2s L (p+ base (GETARG_A (deref (p+ (((ci 'u) 'l) 'savedpc) -2)))) ((L 'top) 'p)))
+      (:or OP_UNM OP_BNOT OP_LEN OP_GETTABUP OP_GETTABLE OP_GETI OP_GETFIELD OP_SELF)
+        (do (set! ((L 'top) 'p) (p+ ((L 'top) 'p) -1))
+            (setobjs2s L (p+ base (GETARG_A inst)) ((L 'top) 'p)))
+      (:or OP_LT OP_LE OP_LTI OP_LEI OP_GTI OP_GEI OP_EQ)  ; OP_EQI and OP_EQK can't yield
+        (let (res:i32 (if (l_isfalse (s2v (p+ ((L 'top) 'p) -1))) 0 1))
+          (set! ((L 'top) 'p) (p+ ((L 'top) 'p) -1))
+          (when (!= res (as i32 (GETARG_k inst)))  ; the condition failed
+            (set! (((ci 'u) 'l) 'savedpc) (p+ (((ci 'u) 'l) 'savedpc) 1))))  ; skip the jump
+      OP_CONCAT
+        (let (top:StkId (p+ ((L 'top) 'p) -1)  ; the top luaT_tryconcatTM saw
+              a:i32 (as i32 (GETARG_A inst))  ; the first value
+              total:i32 (cast_int (stack-diff (p+ top -1) (p+ base a))))  ; still to concatenate
+          (setobjs2s L (p+ top -2) top)  ; the metamethod's result in place
+          (set! ((L 'top) 'p) (p+ top -1))
+          (luaV_concat L total))  ; may yield again
+      OP_CLOSE  ; repeat it to close the other variables
+        (set! (((ci 'u) 'l) 'savedpc) (p+ (((ci 'u) 'l) 'savedpc) -1))
+      OP_RETURN  ; the top tells how many results, in case it is "up to top"
+        (let (ra:StkId (p+ base (GETARG_A inst)))
+          (set! ((L 'top) 'p) (p+ ra ((ci 'u2) 'nres)))
+          (set! (((ci 'u) 'l) 'savedpc) (p+ (((ci 'u) 'l) 'savedpc) -1)))
+      0)))  ; the other opcodes that can yield need nothing
+
+; ---- the interpreter loop ----
+; These macros read luaV_execute's locals (L, ci, i, pc, base, k, trap), as
+; lvm.c's do.
+
+(defmacro RA (i) `(p+ base (GETARG_A ~i)))
+(defmacro vRA (i) `(s2v (RA ~i)))
+(defmacro RB (i) `(p+ base (GETARG_B ~i)))
+(defmacro vRB (i) `(s2v (RB ~i)))
+(defmacro KB (i) `(p+ k (GETARG_B ~i)))
+(defmacro RC (i) `(p+ base (GETARG_C ~i)))
+(defmacro vRC (i) `(s2v (RC ~i)))
+(defmacro KC (i) `(p+ k (GETARG_C ~i)))
+(defmacro RKC (i) `(if (!= (TESTARG_k ~i) 0) (p+ k (GETARG_C ~i)) (s2v (p+ base (GETARG_C ~i)))))
+(defmacro updatetrap (ci) `(set! trap (((~ci 'u) 'l) 'trap)))
+(defmacro updatebase (ci) `(set! base (p+ ((~ci 'func) 'p) 1)))
+(defmacro savepc (ci) `(set! (((~ci 'u) 'l) 'savedpc) pc))
+(defmacro savestate (L ci) `(do (savepc ~ci) (set! ((~L 'top) 'p) ((~ci 'top) 'p))))
+; Around code that can raise errors, move the stack, or change hooks.
+(defmacro Protect (e) `(do (savestate L ci) ~e (updatetrap ci)))
+(defmacro ProtectNT (e) `(do (savepc ci) ~e (updatetrap ci)))  ; the top stays
+(defmacro halfProtect (e) `(do (savestate L ci) ~e))  ; errors only
+(defmacro dojump (ci i e) `(do (set! pc (p+ pc (+ (GETARG_sJ ~i) ~e))) (updatetrap ~ci)))
+(defmacro donextjump (ci) `(let (ni:Instruction (deref pc)) (dojump ~ci ni 1)))
+; Skips the next instruction, a jump, unless 'cond' is what 'k' expects.
+(defmacro docondjump ()
+  `(if (!= (if cond 1 0) (as i32 (GETARG_k i))) (set! pc (p+ pc 1)) (donextjump ci)))
+; 'c' is where the live values end.
+(defmacro checkGC (L c)
+  `(when (<= ((G ~L) 'GCdebt) 0)
+     (savepc ci)
+     (set! ((~L 'top) 'p) ~c)
+     (luaC_step ~L)
+     (updatetrap ci)))
+; Fetches the next instruction and jumps to its code: dispatch is threaded,
+; each opcode ending in its own indirect jump, as lvm.c's jump table does.
+(defmacro vmbreak ()
+  `(do (when (!= trap 0)  ; a moved stack, or hooks
+         (set! trap (luaG_traceexec L pc))
+         (updatebase ci))
+       (set! i (deref pc))
+       (set! pc (p+ pc 1))
+       (goto-ptr (deref (p+ disptab (as i32 (GET_OPCODE i)))))))
+
+(defmacro l_addi (L a b) `(intop + ~a ~b))
+(defmacro l_subi (L a b) `(intop - ~a ~b))
+(defmacro l_muli (L a b) `(intop * ~a ~b))
+(defmacro l_band (a b) `(intop bit-and ~a ~b))
+(defmacro l_bor (a b) `(intop bit-or ~a ~b))
+(defmacro l_bxor (a b) `(intop bit-xor ~a ~b))
+(defmacro l_lti (a b) `(< ~a ~b))
+(defmacro l_lei (a b) `(<= ~a ~b))
+(defmacro l_gti (a b) `(> ~a ~b))
+(defmacro l_gei (a b) `(>= ~a ~b))
+(defmacro numadd (L a b) `(+ ~a ~b))
+(defmacro numsub (L a b) `(- ~a ~b))
+(defmacro nummul (L a b) `(* ~a ~b))
+(defmacro numdiv (L a b) `(/ ~a ~b))
+(defmacro numidiv (L a b) `(floor (/ ~a ~b)))
+(defmacro numpowL (L a b) `(numpow ~a ~b))
+(defmacro nummodL (L a b) `(luaV_modf ~L ~a ~b))
+(defmacro numlt (a b) `(< ~a ~b))
+(defmacro numle (a b) `(<= ~a ~b))
+(defmacro numgt (a b) `(> ~a ~b))
+(defmacro numge (a b) `(>= ~a ~b))
+
+; Arithmetic with an immediate operand; on success the next instruction, the
+; metamethod fallback, is skipped.
+(defmacro op_arithI (L iop fop)
+  `(let (ra:(ptr TValue) (vRA i)
+         v1:(ptr TValue) (vRB i)
+         imm:i32 (GETARG_sC i))
+     (cond (ttisinteger v1)
+             (let (iv1:lua_Integer (ivalue v1))
+               (set! pc (p+ pc 1))
+               (setivalue ra (~iop ~L iv1 (as lua_Integer imm))))
+           (ttisfloat v1)
+             (let (nb:lua_Number (fltvalue v1))
+               (set! pc (p+ pc 1))
+               (setfltvalue ra (~fop ~L nb (cast_num imm))))
+           true 0)))
+(defmacro op_arithf_aux (L v1 v2 fop)
+  `(let (n1:lua_Number 0.0
+         n2:lua_Number 0.0)
+     (when (and (tonumberns ~v1 n1) (tonumberns ~v2 n2))
+       (set! pc (p+ pc 1))
+       (setfltvalue (s2v (RA i)) (~fop ~L n1 n2)))))
+(defmacro op_arithf (L fop)
+  `(let (v1:(ptr TValue) (vRB i)
+         v2:(ptr TValue) (vRC i))
+     (op_arithf_aux ~L v1 v2 ~fop)))
+(defmacro op_arithfK (L fop)
+  `(let (v1:(ptr TValue) (vRB i)
+         v2:(ptr TValue) (KC i))
+     (op_arithf_aux ~L v1 v2 ~fop)))
+(defmacro op_arith_aux (L v1 v2 iop fop)
+  `(if (and (ttisinteger ~v1) (ttisinteger ~v2))
+     (let (i1:lua_Integer (ivalue ~v1)
+           i2:lua_Integer (ivalue ~v2))
+       (set! pc (p+ pc 1))
+       (setivalue (s2v (RA i)) (~iop ~L i1 i2)))
+     (op_arithf_aux ~L ~v1 ~v2 ~fop)))
+(defmacro op_arith (L iop fop)
+  `(let (v1:(ptr TValue) (vRB i)
+         v2:(ptr TValue) (vRC i))
+     (op_arith_aux ~L v1 v2 ~iop ~fop)))
+(defmacro op_arithK (L iop fop)
+  `(let (v1:(ptr TValue) (vRB i)
+         v2:(ptr TValue) (KC i))
+     (op_arith_aux ~L v1 v2 ~iop ~fop)))
+(defmacro op_bitwiseK (L op)
+  `(let (v1:(ptr TValue) (vRB i)
+         i1:(ptr lua_Integer) (alloca lua_Integer)
+         i2:lua_Integer (ivalue (KC i)))
+     (when (tointegerns v1 i1)
+       (set! pc (p+ pc 1))
+       (setivalue (s2v (RA i)) (~op (deref i1) i2)))))
+(defmacro op_bitwise (L op)
+  `(let (v1:(ptr TValue) (vRB i)
+         v2:(ptr TValue) (vRC i)
+         i1:(ptr lua_Integer) (alloca lua_Integer)
+         i2:(ptr lua_Integer) (alloca lua_Integer))
+     (when (and (tointegerns v1 i1) (tointegerns v2 i2))
+       (set! pc (p+ pc 1))
+       (setivalue (s2v (RA i)) (~op (deref i1) (deref i2))))))
+; Order with register operands; 'opn' works for any numbers, 'opi' is the fast
+; track for integers.
+(defmacro op_order (L opi opn other)
+  `(let (ra:(ptr TValue) (vRA i)
+         rb:(ptr TValue) (vRB i)
+         cond:bool false)
+     (cond (and (ttisinteger ra) (ttisinteger rb)) (set! cond (~opi (ivalue ra) (ivalue rb)))
+           (and (ttisnumber ra) (ttisnumber rb)) (set! cond (~opn ra rb))
+           true (Protect (set! cond (!= (~other ~L ra rb) 0))))
+     (docondjump)))
+; Order with an immediate operand, which is always exact as a float.
+(defmacro op_orderI (L opi opf inv tm)
+  `(let (ra:(ptr TValue) (vRA i)
+         im:i32 (GETARG_sB i)
+         cond:bool false)
+     (cond (ttisinteger ra) (set! cond (~opi (ivalue ra) (as lua_Integer im)))
+           (ttisfloat ra) (set! cond (~opf (fltvalue ra) (cast_num im)))
+           true (let (isf:i32 (GETARG_C i))
+                  (Protect (set! cond (!= (luaT_callorderiTM ~L ra im ~inv isf ~tm) 0)))))
+     (docondjump)))
+
+; The jump table, one label per opcode in opcode order.
+(defmacro filldisptab (rows)
+  (let (body (node-list-new (rows 'line))
+        n (ast-len rows)
+        i 0)
+    (while (< i n)
+      (let (op (ast-at (ast-at rows i) 0))
+        (node-push body `(set! (deref (p+ disptab ~(node-int (as i64 i)))) (label-addr ~op))))
+      (set! i (+ i 1)))
+    `(do ~@body)))
+
+; The jump table: a function has no static local, and a global can't name a
+; label, so luaV_execute fills it on its first call.
+(defvar- vm-disptab:(array ptr 85))  ; NUM_OPCODES
+
+(defn luaV_execute (L:(ptr lua_State) ci0:(ptr CallInfo)):void
+  (let (ci:(ptr CallInfo) ci0
+        cl:(ptr LClosure) null
+        k:(ptr TValue) null
+        base:StkId null
+        pc:(ptr Instruction) null
+        trap:i32 0
+        i:Instruction 0
+        disptab:(ptr ptr) (as (ptr ptr) vm-disptab))
+    (when (= (deref disptab) null)  ; the first call fills it (ISSUE-045)
+      (with-opcodes filldisptab))
+    (label startfunc)
+    (set! trap (L 'hookmask))
+    (label returning)  ; 'trap' is set already
+    (set! cl (ci_func ci))
+    (set! k ((cl 'p) 'k))
+    (set! pc (((ci 'u) 'l) 'savedpc))
+    (when (!= trap 0)
+      (set! trap (luaG_tracecall L)))
+    (set! base (p+ ((ci 'func) 'p) 1))
+    (vmbreak)  ; the first instruction
+
+    (label OP_MOVE)
+    (setobjs2s L (RA i) (RB i))
+    (vmbreak)
+    (label OP_LOADI)
+    (setivalue (vRA i) (as lua_Integer (GETARG_sBx i)))
+    (vmbreak)
+    (label OP_LOADF)
+    (setfltvalue (vRA i) (cast_num (GETARG_sBx i)))
+    (vmbreak)
+    (label OP_LOADK)
+    (setobj2s L (RA i) (p+ k (GETARG_Bx i)))
+    (vmbreak)
+    (label OP_LOADKX)
+    (let (rb:(ptr TValue) (p+ k (GETARG_Ax (deref pc))))
+      (set! pc (p+ pc 1))
+      (setobj2s L (RA i) rb))
+    (vmbreak)
+    (label OP_LOADFALSE)
+    (setbfvalue (vRA i))
+    (vmbreak)
+    (label OP_LFALSESKIP)
+    (setbfvalue (vRA i))
+    (set! pc (p+ pc 1))  ; skip the next instruction
+    (vmbreak)
+    (label OP_LOADTRUE)
+    (setbtvalue (vRA i))
+    (vmbreak)
+    (label OP_LOADNIL)
+    (let (ra:StkId (RA i)
+          b:i32 (as i32 (GETARG_B i)))
+      (while (>= b 0)
+        (setnilvalue (s2v ra))
+        (set! ra (p+ ra 1))
+        (set! b (- b 1))))
+    (vmbreak)
+    (label OP_GETUPVAL)
+    (setobj2s L (RA i) (((aref (cl 'upvals) (GETARG_B i)) 'v) 'p))
+    (vmbreak)
+    (label OP_SETUPVAL)
+    (let (ra:StkId (RA i)
+          uv:(ptr UpVal) (aref (cl 'upvals) (GETARG_B i)))
+      (setobj L ((uv 'v) 'p) (s2v ra))
+      (luaC_barrier L uv (s2v ra)))
+    (vmbreak)
+    (label OP_GETTABUP)
+    (let (ra:StkId (RA i)
+          upval:(ptr TValue) (((aref (cl 'upvals) (GETARG_B i)) 'v) 'p)
+          rc:(ptr TValue) (KC i)
+          tag:lu_byte 0)
+      (fastget upval (tsvalue rc) (s2v ra) luaH_getshortstr tag)  ; the key is a short string
+      (when (tagisempty tag)
+        (Protect (luaV_finishget L upval rc ra tag))))
+    (vmbreak)
+    (label OP_GETTABLE)
+    (let (ra:StkId (RA i)
+          rb:(ptr TValue) (vRB i)
+          rc:(ptr TValue) (vRC i)
+          tag:lu_byte 0)
+      (if (ttisinteger rc)  ; the fast track for integers
+        (fastgeti rb (ivalue rc) (s2v ra) tag)
+        (fastget rb rc (s2v ra) luaH_get tag))
+      (when (tagisempty tag)
+        (Protect (luaV_finishget L rb rc ra tag))))
+    (vmbreak)
+    (label OP_GETI)
+    (let (ra:StkId (RA i)
+          rb:(ptr TValue) (vRB i)
+          c:i32 (as i32 (GETARG_C i))
+          tag:lu_byte 0)
+      (fastgeti rb c (s2v ra) tag)
+      (when (tagisempty tag)
+        (let (key:(ptr TValue) (alloca TValue))
+          (setivalue key (as lua_Integer c))
+          (Protect (luaV_finishget L rb key ra tag)))))
+    (vmbreak)
+    (label OP_GETFIELD)
+    (let (ra:StkId (RA i)
+          rb:(ptr TValue) (vRB i)
+          rc:(ptr TValue) (KC i)
+          tag:lu_byte 0)
+      (fastget rb (tsvalue rc) (s2v ra) luaH_getshortstr tag)
+      (when (tagisempty tag)
+        (Protect (luaV_finishget L rb rc ra tag))))
+    (vmbreak)
+    (label OP_SETTABUP)
+    (let (hres:i32 0
+          upval:(ptr TValue) (((aref (cl 'upvals) (GETARG_A i)) 'v) 'p)
+          rb:(ptr TValue) (KB i)
+          rc:(ptr TValue) (RKC i))
+      (fastset upval (tsvalue rb) rc hres luaH_psetshortstr)
+      (if (= hres HOK)
+        (finishfastset L upval rc)
+        (Protect (luaV_finishset L upval rb rc hres))))
+    (vmbreak)
+    (label OP_SETTABLE)
+    (let (ra:StkId (RA i)
+          hres:i32 0
+          rb:(ptr TValue) (vRB i)  ; the key; the table is at 'ra'
+          rc:(ptr TValue) (RKC i))  ; the value
+      (if (ttisinteger rb)
+        (fastseti (s2v ra) (ivalue rb) rc hres)
+        (fastset (s2v ra) rb rc hres luaH_pset))
+      (if (= hres HOK)
+        (finishfastset L (s2v ra) rc)
+        (Protect (luaV_finishset L (s2v ra) rb rc hres))))
+    (vmbreak)
+    (label OP_SETI)
+    (let (ra:StkId (RA i)
+          hres:i32 0
+          b:i32 (as i32 (GETARG_B i))
+          rc:(ptr TValue) (RKC i))
+      (fastseti (s2v ra) b rc hres)
+      (if (= hres HOK)
+        (finishfastset L (s2v ra) rc)
+        (let (key:(ptr TValue) (alloca TValue))
+          (setivalue key (as lua_Integer b))
+          (Protect (luaV_finishset L (s2v ra) key rc hres)))))
+    (vmbreak)
+    (label OP_SETFIELD)
+    (let (ra:StkId (RA i)
+          hres:i32 0
+          rb:(ptr TValue) (KB i)
+          rc:(ptr TValue) (RKC i))
+      (fastset (s2v ra) (tsvalue rb) rc hres luaH_psetshortstr)
+      (if (= hres HOK)
+        (finishfastset L (s2v ra) rc)
+        (Protect (luaV_finishset L (s2v ra) rb rc hres))))
+    (vmbreak)
+    (label OP_NEWTABLE)
+    (let (ra:StkId (RA i)
+          b:ui32 (cast_uint (GETARG_vB i))  ; log2(hash size) + 1
+          c:ui32 (cast_uint (GETARG_vC i)))  ; the array size
+      (when (> b 0)
+        (set! b (bit-shl (as ui32 1) (- b 1))))  ; the hash size
+      (when (!= (TESTARG_k i) 0)  ; an extra argument adds to the array size
+        (set! c (+ c (* (cast_uint (GETARG_Ax (deref pc))) (+ MAXARG_vC 1)))))
+      (set! pc (p+ pc 1))  ; skip it
+      (set! ((L 'top) 'p) (p+ ra 1))  ; right in case of an emergency collection
+      (let (t:(ptr Table) (luaH_new L))
+        (sethvalue2s L ra t)
+        (when (or (!= b 0) (!= c 0))
+          (luaH_resize L t c b)))
+      (checkGC L (p+ ra 1)))
+    (vmbreak)
+    (label OP_SELF)
+    (let (ra:StkId (RA i)
+          tag:lu_byte 0
+          rb:(ptr TValue) (vRB i)
+          rc:(ptr TValue) (KC i))
+      (setobj2s L (p+ ra 1) rb)
+      (fastget rb (tsvalue rc) (s2v ra) luaH_getshortstr tag)
+      (when (tagisempty tag)
+        (Protect (luaV_finishget L rb rc ra tag))))
+    (vmbreak)
+    (label OP_ADDI)
+    (op_arithI L l_addi numadd)
+    (vmbreak)
+    (label OP_ADDK)
+    (op_arithK L l_addi numadd)
+    (vmbreak)
+    (label OP_SUBK)
+    (op_arithK L l_subi numsub)
+    (vmbreak)
+    (label OP_MULK)
+    (op_arithK L l_muli nummul)
+    (vmbreak)
+    (label OP_MODK)
+    (savestate L ci)  ; division by 0
+    (op_arithK L luaV_mod nummodL)
+    (vmbreak)
+    (label OP_POWK)
+    (op_arithfK L numpowL)
+    (vmbreak)
+    (label OP_DIVK)
+    (op_arithfK L numdiv)
+    (vmbreak)
+    (label OP_IDIVK)
+    (savestate L ci)  ; division by 0
+    (op_arithK L luaV_idiv numidiv)
+    (vmbreak)
+    (label OP_BANDK)
+    (op_bitwiseK L l_band)
+    (vmbreak)
+    (label OP_BORK)
+    (op_bitwiseK L l_bor)
+    (vmbreak)
+    (label OP_BXORK)
+    (op_bitwiseK L l_bxor)
+    (vmbreak)
+    (label OP_SHLI)
+    (let (ib:(ptr lua_Integer) (alloca lua_Integer))
+      (when (tointegerns (vRB i) ib)
+        (set! pc (p+ pc 1))
+        (setivalue (vRA i) (luaV_shiftl (as lua_Integer (GETARG_sC i)) (deref ib)))))
+    (vmbreak)
+    (label OP_SHRI)
+    (let (ib:(ptr lua_Integer) (alloca lua_Integer))
+      (when (tointegerns (vRB i) ib)
+        (set! pc (p+ pc 1))
+        (setivalue (vRA i) (luaV_shiftl (deref ib) (as lua_Integer (- (GETARG_sC i)))))))
+    (vmbreak)
+    (label OP_ADD)
+    (op_arith L l_addi numadd)
+    (vmbreak)
+    (label OP_SUB)
+    (op_arith L l_subi numsub)
+    (vmbreak)
+    (label OP_MUL)
+    (op_arith L l_muli nummul)
+    (vmbreak)
+    (label OP_MOD)
+    (savestate L ci)  ; division by 0
+    (op_arith L luaV_mod nummodL)
+    (vmbreak)
+    (label OP_POW)
+    (op_arithf L numpowL)
+    (vmbreak)
+    (label OP_DIV)  ; always on floats
+    (op_arithf L numdiv)
+    (vmbreak)
+    (label OP_IDIV)  ; floor division
+    (savestate L ci)  ; division by 0
+    (op_arith L luaV_idiv numidiv)
+    (vmbreak)
+    (label OP_BAND)
+    (op_bitwise L l_band)
+    (vmbreak)
+    (label OP_BOR)
+    (op_bitwise L l_bor)
+    (vmbreak)
+    (label OP_BXOR)
+    (op_bitwise L l_bxor)
+    (vmbreak)
+    (label OP_SHL)
+    (op_bitwise L luaV_shiftl)
+    (vmbreak)
+    (label OP_SHR)
+    (op_bitwise L luaV_shiftr)
+    (vmbreak)
+    (label OP_MMBIN)
+    (let (ra:StkId (RA i)
+          pi:Instruction (deref (p+ pc -2))  ; the arithmetic instruction
+          result:StkId (RA pi))
+      (Protect (luaT_trybinTM L (s2v ra) (vRB i) result (unsafe/cast TMS (GETARG_C i)))))
+    (vmbreak)
+    (label OP_MMBINI)
+    (let (ra:StkId (RA i)
+          pi:Instruction (deref (p+ pc -2))
+          result:StkId (RA pi))
+      (Protect (luaT_trybiniTM L (s2v ra) (GETARG_sB i) (as i32 (GETARG_k i)) result
+                               (unsafe/cast TMS (GETARG_C i)))))
+    (vmbreak)
+    (label OP_MMBINK)
+    (let (ra:StkId (RA i)
+          pi:Instruction (deref (p+ pc -2))
+          result:StkId (RA pi))
+      (Protect (luaT_trybinassocTM L (s2v ra) (KB i) (as i32 (GETARG_k i)) result
+                                   (unsafe/cast TMS (GETARG_C i)))))
+    (vmbreak)
+    (label OP_UNM)
+    (let (ra:StkId (RA i)
+          rb:(ptr TValue) (vRB i)
+          nb:lua_Number 0.0)
+      (cond (ttisinteger rb) (setivalue (s2v ra) (intop - 0 (ivalue rb)))
+            (tonumberns rb nb) (setfltvalue (s2v ra) (* -1.0 nb))  ; not (- nb): (- 0.0) is 0.0 (ISSUE-027)
+            true (Protect (luaT_trybinTM L rb rb ra TM_UNM))))
+    (vmbreak)
+    (label OP_BNOT)
+    (let (ra:StkId (RA i)
+          rb:(ptr TValue) (vRB i)
+          ib:(ptr lua_Integer) (alloca lua_Integer))
+      (if (tointegerns rb ib)
+        (setivalue (s2v ra) (intop bit-xor -1 (deref ib)))  ; ~0 ^ ib
+        (Protect (luaT_trybinTM L rb rb ra TM_BNOT))))
+    (vmbreak)
+    (label OP_NOT)
+    (if (l_isfalse (vRB i))
+      (setbtvalue (vRA i))
+      (setbfvalue (vRA i)))
+    (vmbreak)
+    (label OP_LEN)
+    (Protect (luaV_objlen L (RA i) (vRB i)))
+    (vmbreak)
+    (label OP_CONCAT)
+    (let (ra:StkId (RA i)
+          n:i32 (as i32 (GETARG_B i)))  ; how many to concatenate
+      (set! ((L 'top) 'p) (p+ ra n))  ; the operands' end
+      (ProtectNT (luaV_concat L n))
+      (checkGC L ((L 'top) 'p)))  ; luaV_concat leaves the top right
+    (vmbreak)
+    (label OP_CLOSE)
+    (Protect (luaF_close L (RA i) LUA_OK 1))
+    (vmbreak)
+    (label OP_TBC)
+    (halfProtect (luaF_newtbcupval L (RA i)))  ; a new to-be-closed upvalue
+    (vmbreak)
+    (label OP_JMP)
+    (dojump ci i 0)
+    (vmbreak)
+    (label OP_EQ)
+    (let (ra:StkId (RA i)
+          rb:(ptr TValue) (vRB i)
+          cond:bool false)
+      (Protect (set! cond (!= (luaV_equalobj L (s2v ra) rb) 0)))
+      (docondjump))
+    (vmbreak)
+    (label OP_LT)
+    (op_order L l_lti LTnum lessthanothers)
+    (vmbreak)
+    (label OP_LE)
+    (op_order L l_lei LEnum lessequalothers)
+    (vmbreak)
+    (label OP_EQK)
+    ; basic types have no '__eq': raw equality will do
+    (let (cond:bool (!= (luaV_equalobj null (vRA i) (KB i)) 0))
+      (docondjump))
+    (vmbreak)
+    (label OP_EQI)
+    (let (ra:StkId (RA i)
+          im:i32 (GETARG_sB i)
+          cond:bool (cond (ttisinteger (s2v ra)) (= (ivalue (s2v ra)) (as lua_Integer im))
+                          (ttisfloat (s2v ra)) (= (fltvalue (s2v ra)) (cast_num im))
+                          true false))  ; no other type equals a number
+      (docondjump))
+    (vmbreak)
+    (label OP_LTI)
+    (op_orderI L l_lti numlt 0 TM_LT)
+    (vmbreak)
+    (label OP_LEI)
+    (op_orderI L l_lei numle 0 TM_LE)
+    (vmbreak)
+    (label OP_GTI)
+    (op_orderI L l_gti numgt 1 TM_LT)
+    (vmbreak)
+    (label OP_GEI)
+    (op_orderI L l_gei numge 1 TM_LE)
+    (vmbreak)
+    (label OP_TEST)
+    (let (cond:bool (not (l_isfalse (vRA i))))
+      (docondjump))
+    (vmbreak)
+    (label OP_TESTSET)
+    (let (rb:(ptr TValue) (vRB i))
+      (if (= (if (l_isfalse rb) 1 0) (as i32 (GETARG_k i)))
+        (set! pc (p+ pc 1))
+        (do (setobj2s L (RA i) rb)
+            (donextjump ci))))
+    (vmbreak)
+    (label OP_CALL)
+    (let (ra:StkId (RA i)
+          b:i32 (as i32 (GETARG_B i))
+          nresults:i32 (- (as i32 (GETARG_C i)) 1))
+      (when (!= b 0)  ; a fixed number of arguments
+        (set! ((L 'top) 'p) (p+ ra b)))  ; else the last instruction set the top
+      (savepc ci)  ; for errors
+      (let (newci:(ptr CallInfo) (luaD_precall L ra nresults))
+        (when (!= (as ptr newci) null)  ; a Lua call: run it in this C frame
+          (set! ci newci)
+          (goto startfunc)))
+      (updatetrap ci))  ; a C call is done
+    (vmbreak)
+    (label OP_TAILCALL)
+    (let (ra:StkId (RA i)
+          b:i32 (as i32 (GETARG_B i))  ; arguments + 1 (the function)
+          nparams1:i32 (as i32 (GETARG_C i))
+          ; the virtual 'func' minus the real one, for a vararg function
+          delta:i32 (if (!= nparams1 0) (+ (((ci 'u) 'l) 'nextraargs) nparams1) 0))
+      (if (!= b 0)
+        (set! ((L 'top) 'p) (p+ ra b))
+        (set! b (cast_int (stack-diff ((L 'top) 'p) ra))))  ; the last instruction set the top
+      (savepc ci)  ; several calls here can raise errors
+      (when (!= (TESTARG_k i) 0)
+        (luaF_closeupval L base))  ; this call's upvalues
+      (let (n:i32 (luaD_pretailcall L ci ra b delta))
+        (when (< n 0)  ; a Lua function: run it
+          (goto startfunc))
+        (set! ((ci 'func) 'p) (p+ ((ci 'func) 'p) (- delta)))  ; a C function: restore 'func'
+        (luaD_poscall L ci n)  ; and finish the caller
+        (updatetrap ci)  ; luaD_poscall can change hooks
+        (goto ret)))
+    (label OP_RETURN)
+    (let (ra:StkId (RA i)
+          n:i32 (- (as i32 (GETARG_B i)) 1)  ; the results
+          nparams1:i32 (as i32 (GETARG_C i)))
+      (when (< n 0)  ; not fixed: what's there
+        (set! n (cast_int (stack-diff ((L 'top) 'p) ra))))
+      (savepc ci)
+      (when (!= (TESTARG_k i) 0)  ; open upvalues, maybe
+        (set! ((ci 'u2) 'nres) n)
+        (when (< (as ptr ((L 'top) 'p)) (as ptr ((ci 'top) 'p)))
+          (set! ((L 'top) 'p) ((ci 'top) 'p)))
+        (luaF_close L base CLOSEKTOP 1)
+        (updatetrap ci)
+        (when (!= trap 0)  ; updatestack
+          (updatebase ci)
+          (set! ra (RA i))))
+      (when (!= nparams1 0)  ; a vararg function
+        (set! ((ci 'func) 'p) (p+ ((ci 'func) 'p) (- (+ (((ci 'u) 'l) 'nextraargs) nparams1)))))
+      (set! ((L 'top) 'p) (p+ ra n))  ; for luaD_poscall
+      (luaD_poscall L ci n)
+      (updatetrap ci)  ; luaD_poscall can change hooks
+      (goto ret))
+    (label OP_RETURN0)
+    (if (!= (L 'hookmask) 0)
+      (do (set! ((L 'top) 'p) (RA i))
+          (savepc ci)
+          (luaD_poscall L ci 0)  ; no hurry
+          (set! trap 1))
+      (let (nres:i32 (get_nresults (ci 'callstatus)))  ; luaD_poscall, here
+        (set! (L 'ci) (ci 'previous))  ; back to the caller
+        (set! ((L 'top) 'p) (p+ base -1))
+        (while (> nres 0)  ; every result is nil
+          (setnilvalue (s2v ((L 'top) 'p)))
+          (set! ((L 'top) 'p) (p+ ((L 'top) 'p) 1))
+          (set! nres (- nres 1)))))
+    (goto ret)
+    (label OP_RETURN1)
+    (if (!= (L 'hookmask) 0)
+      (do (set! ((L 'top) 'p) (p+ (RA i) 1))
+          (savepc ci)
+          (luaD_poscall L ci 1)  ; no hurry
+          (set! trap 1))
+      (let (nres:i32 (get_nresults (ci 'callstatus)))
+        (set! (L 'ci) (ci 'previous))
+        (if (= nres 0)
+          (set! ((L 'top) 'p) (p+ base -1))  ; no results wanted
+          (do (setobjs2s L (p+ base -1) (RA i))  ; this one at least
+              (set! ((L 'top) 'p) base)
+              (while (> nres 1)  ; the missing ones are nil
+                (setnilvalue (s2v ((L 'top) 'p)))
+                (set! ((L 'top) 'p) (p+ ((L 'top) 'p) 1))
+                (set! nres (- nres 1)))))))
+    (label ret)  ; a Lua function returns
+    (when (!= (bit-and (ci 'callstatus) CIST_FRESH) 0)
+      (return))  ; this frame ends
+    (set! ci (ci 'previous))
+    (goto returning)  ; the caller goes on in this frame
+    (label OP_FORLOOP)
+    (let (ra:StkId (RA i))
+      (if (ttisinteger (s2v (p+ ra 1)))  ; an integer loop
+        (let (count:lua_Unsigned (l_castS2U (ivalue (s2v ra))))
+          (when (> count 0)  ; more to go
+            (let (step:lua_Integer (ivalue (s2v (p+ ra 1)))
+                  idx:lua_Integer (ivalue (s2v (p+ ra 2))))  ; the control variable
+              (chgivalue (s2v ra) (l_castU2S (- count 1)))
+              (chgivalue (s2v (p+ ra 2)) (intop + idx step))
+              (set! pc (p+ pc (- (GETARG_Bx i)))))))  ; back
+        (when (floatforloop L ra)
+          (set! pc (p+ pc (- (GETARG_Bx i))))))
+      (updatetrap ci))  ; a signal can break the loop
+    (vmbreak)
+    (label OP_FORPREP)
+    (let (ra:StkId (RA i))
+      (savestate L ci)  ; for errors
+      (when (forprep L ra)
+        (set! pc (p+ pc (+ (GETARG_Bx i) 1)))))  ; skip the loop
+    (vmbreak)
+    (label OP_TFORPREP)
+    ; 'ra' has the iterator, 'ra+1' the state, 'ra+2' the control variable's
+    ; start, 'ra+3' the closing variable: swap the last two and mark it
+    (let (ra:StkId (RA i)
+          temp:(ptr TValue) (alloca TValue))
+      (setobj L temp (s2v (p+ ra 3)))
+      (setobjs2s L (p+ ra 3) (p+ ra 2))
+      (setobj2s L (p+ ra 2) temp)
+      (halfProtect (luaF_newtbcupval L (p+ ra 2)))  ; unless it is nil
+      (set! pc (p+ pc (GETARG_Bx i)))  ; the loop's end
+      (set! i (deref pc))  ; the OP_TFORCALL
+      (set! pc (p+ pc 1)))
+    (goto l_tforcall)
+    (label OP_TFORCALL)
+    (label l_tforcall)
+    ; the call starts at 'ra+3', keeping the first three values; its first
+    ; result is the control variable's next value
+    (let (ra:StkId (RA i))
+      (setobjs2s L (p+ ra 5) (p+ ra 3))  ; the control variable
+      (setobjs2s L (p+ ra 4) (p+ ra 1))  ; the state
+      (setobjs2s L (p+ ra 3) ra)  ; the function
+      (set! ((L 'top) 'p) (p+ ra 6))
+      (ProtectNT (luaD_call L (p+ ra 3) (as i32 (GETARG_C i))))
+      (when (!= trap 0)  ; updatestack: the stack may have moved
+        (updatebase ci))
+      (set! i (deref pc))  ; the OP_TFORLOOP
+      (set! pc (p+ pc 1)))
+    (goto l_tforloop)
+    (label OP_TFORLOOP)
+    (label l_tforloop)
+    (when (not (ttisnil (s2v (p+ (RA i) 3))))  ; go on
+      (set! pc (p+ pc (- (GETARG_Bx i)))))
+    (vmbreak)
+    (label OP_SETLIST)
+    (let (ra:StkId (RA i)
+          n:ui32 (cast_uint (GETARG_vB i))
+          last:ui32 (cast_uint (GETARG_vC i))
+          h:(ptr Table) (hvalue (s2v ra)))
+      (if (= n 0)
+        (set! n (- (cast_uint (stack-diff ((L 'top) 'p) ra)) 1))  ; up to the top
+        (set! ((L 'top) 'p) ((ci 'top) 'p)))  ; right for an emergency collection
+      (set! last (+ last n))
+      (when (!= (TESTARG_k i) 0)
+        (set! last (+ last (* (cast_uint (GETARG_Ax (deref pc))) (+ MAXARG_vC 1))))
+        (set! pc (p+ pc 1)))
+      (when (> last (h 'asize))  ; room needed, at once
+        (luaH_resizearray L h last))
+      (while (> n 0)
+        (let (val:(ptr TValue) (s2v (p+ ra n)))
+          (obj2arr h (- last 1) val)
+          (set! last (- last 1))
+          (luaC_barrierback L (obj2gco h) val))
+        (set! n (- n 1))))
+    (vmbreak)
+    (label OP_CLOSURE)
+    (let (ra:StkId (RA i)
+          p:(ptr Proto) (deref (p+ ((cl 'p) 'p) (GETARG_Bx i))))
+      (halfProtect (pushclosure L p (as (ptr (ptr UpVal)) (cl 'upvals)) base ra))
+      (checkGC L (p+ ra 1)))
+    (vmbreak)
+    (label OP_VARARG)
+    (let (n:i32 (- (as i32 (GETARG_C i)) 1)  ; the results wanted, -1 for all
+          vatab:i32 (if (!= (GETARG_k i) 0) (as i32 (GETARG_B i)) -1))
+      (Protect (luaT_getvarargs L ci (RA i) n vatab)))
+    (vmbreak)
+    (label OP_GETVARG)
+    (luaT_getvararg ci (RA i) (vRC i))
+    (vmbreak)
+    (label OP_ERRNNIL)
+    (when (not (ttisnil (vRA i)))
+      (halfProtect (luaG_errnnil L cl (as i32 (GETARG_Bx i)))))
+    (vmbreak)
+    (label OP_VARARGPREP)
+    (ProtectNT (luaT_adjustvarargs L ci (cl 'p)))
+    (when (!= trap 0)  ; the Protect updated it
+      (luaD_hookcall L ci)
+      (set! (L 'oldpc) 1))  ; the next opcode is on a "new" line
+    (updatebase ci)  ; the adjustment moved the base
+    (vmbreak)
+    (label OP_EXTRAARG)
+    (vmbreak)))

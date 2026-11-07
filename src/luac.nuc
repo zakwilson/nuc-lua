@@ -19,6 +19,7 @@
 (import lua.do)
 (import lua.api)
 (import lua.gc)
+(import lua.vm)
 (import-use lua.opcodes)  ; the compiler; its macros list the code
 (import lua.lex)
 (import-use lua.code)  ; isvararg
