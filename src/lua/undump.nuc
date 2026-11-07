@@ -14,6 +14,14 @@
 (import-use "string.h")
 (import-use lua.util)
 (import-use lua.core)
+(import-use lua.func)
+(import-use lua.mem)
+(import-use lua.string)
+(import-use lua.gc)
+(import-use lua.table)
+(import-use lua.zio)
+(import-use lua.do)
+(import-use lua.object)
 (import-use lua.dump)  ; LUAC_DATA
 (import-use luacapi)  ; LUA_SIGNATURE
 
@@ -32,227 +40,227 @@
 
 ; C calls it 'error'.
 (defn- loaderror (S:(ptr LoadState) why:CStr):void
-  (luaO_pushfstring (S 'L) "%s: bad binary format (%s)" (S 'name) why)
-  (luaD_throw (S 'L) LUA_ERRSYNTAX))
+  (obj-pushfstring (S 'L) "%s: bad binary format (%s)" (S 'name) why)
+  (do-throw (S 'L) LUA_ERRSYNTAX))
 
 ; Every read goes through here.
-(defn- loadBlock (S:(ptr LoadState) b:ptr size:usize):void
-  (when (!= (luaZ_read (S 'Z) b size) 0)
+(defn- load-block (S:(ptr LoadState) b:ptr size:usize):void
+  (when (!= (zio-read (S 'Z) b size) 0)
     (loaderror S "truncated chunk"))
   (set! (S 'offset) (+ (S 'offset) size)))
 
-(defn- loadAlign (S:(ptr LoadState) align:ui32):void
+(defn- load-align (S:(ptr LoadState) align:ui32):void
   (let (padding:ui32 (- align (cast_uint (% (S 'offset) (as usize align)))))
     (when (< padding align)  ; padding = align: none
       (let (paddingContent:lua_Integer 0)
-        (loadBlock S (as ptr &paddingContent) (as usize padding))))))
+        (load-block S (as ptr &paddingContent) (as usize padding))))))
 
 ; The next 'size' bytes of a fixed buffer, in place.
-(defn- getaddr_ (S:(ptr LoadState) size:usize):ptr
-  (let (block:ptr (luaZ_getaddr (S 'Z) size))
+(defn- getaddr- (S:(ptr LoadState) size:usize):ptr
+  (let (block:ptr (zio-getaddr (S 'Z) size))
     (set! (S 'offset) (+ (S 'offset) size))
     (when (= block null)
       (loaderror S "truncated fixed buffer"))
     (return block)))
 
-(defmacro getaddr (S n T) `(unsafe/cast (ptr ~T) (getaddr_ ~S (* (cast_sizet ~n) (cast_sizet (sizeof ~T))))))
+(defmacro getaddr (S n T) `(unsafe/cast (ptr ~T) (getaddr- ~S (* (cast_sizet ~n) (cast_sizet (sizeof ~T))))))
 
-(defn- loadByte (S:(ptr LoadState)):ui8
+(defn- load-byte (S:(ptr LoadState)):ui8
   (let (b:i32 (zgetc (S 'Z)))
     (when (= b EOZ)
       (loaderror S "truncated chunk"))
     (set! (S 'offset) (+ (S 'offset) 1))
     (return (cast_uchar b))))
 
-(defn- loadVarint (S:(ptr LoadState) limit0:lua_Unsigned):lua_Unsigned
+(defn- load-varint (S:(ptr LoadState) limit0:lua_Unsigned):lua_Unsigned
   (let (x:lua_Unsigned 0
         limit:lua_Unsigned (bit-shr limit0 7)
         b:i32 0x80)
     (while (!= (bit-and b 0x80) 0)
-      (set! b (as i32 (loadByte S)))
+      (set! b (as i32 (load-byte S)))
       (when (> x limit)
         (loaderror S "integer overflow"))
       (set! x (bit-or (bit-shl x 7) (as lua_Unsigned (bit-and b 0x7f)))))
     (return x)))
 
-(defn- loadSize (S:(ptr LoadState)):usize
-  (return (cast_sizet (loadVarint S (unsafe/cast lua_Unsigned (MAX_SIZE))))))
+(defn- load-size (S:(ptr LoadState)):usize
+  (return (cast_sizet (load-varint S (unsafe/cast lua_Unsigned (MAX_SIZE))))))
 
-(defn- loadInt (S:(ptr LoadState)):i32
-  (return (cast_int (loadVarint S (as lua_Unsigned INT_MAX)))))
+(defn- load-int (S:(ptr LoadState)):i32
+  (return (cast_int (load-varint S (as lua_Unsigned INT_MAX)))))
 
-(defn- loadNumber (S:(ptr LoadState)):lua_Number
+(defn- load-number (S:(ptr LoadState)):lua_Number
   (let (x:lua_Number 0.0)
-    (loadBlock S (as ptr &x) (cast_sizet (sizeof lua_Number)))
+    (load-block S (as ptr &x) (cast_sizet (sizeof lua_Number)))
     (return x)))
 
 ; ldump's coding: 2x for x >= 0, -2x - 1 for a negative x.
-(defn- loadInteger (S:(ptr LoadState)):lua_Integer
-  (let (cx:lua_Unsigned (loadVarint S (l_castS2U -1)))  ; LUA_MAXUNSIGNED
+(defn- load-integer (S:(ptr LoadState)):lua_Integer
+  (let (cx:lua_Unsigned (load-varint S (l_castS2U -1)))  ; LUA_MAXUNSIGNED
     (if (!= (bit-and cx 1) 0)
       (return (l_castU2S (bit-xor (bit-shr cx 1) (l_castS2U -1))))
       (return (l_castU2S (bit-shr cx 1))))))
 
 ; A nullable string into slot 'sl' of 'p'. The slot and the barrier come
-; before anything that may collect (loadBlock, luaH_setint), to anchor it.
-(defn- loadString (S:(ptr LoadState) p:(ptr Proto) sl:(ptr (ptr TString))):void
+; before anything that may collect (load-block, table-setint), to anchor it.
+(defn- load-string (S:(ptr LoadState) p:(ptr Proto) sl:(ptr (ptr TString))):void
   (let (L:(ptr lua_State) (S 'L)
         ts:(ptr TString) null
         sv:(ptr TValue) (alloca TValue)
-        size:usize (loadSize S))
+        size:usize (load-size S))
     (cond (= size 0)  ; a string saved before
-            (let (idx:lua_Unsigned (loadVarint S (l_castS2U -1))
+            (let (idx:lua_Unsigned (load-varint S (l_castS2U -1))
                   stv:(ptr TValue) (alloca TValue))
               (when (= idx 0)  ; no string: the slot is prefilled
                 (return))
-              (when (!= (novariant (as i32 (luaH_getint (S 'h) (l_castU2S idx) stv))) LUA_TSTRING)
+              (when (!= (novariant (as i32 (table-getint (S 'h) (l_castU2S idx) stv))) LUA_TSTRING)
                 (loaderror S "invalid string index"))
               (set! ts (tsvalue stv))
               (set! (deref sl) ts)
-              (luaC_objbarrier L p ts)
+              (gc-objbarrier L p ts)
               (return))  ; not saved again
           (<= (- size 1) LUAI_MAXSHORTLEN)  ; a short string
             (let (buff:(ptr i8) (alloca i8 (+ LUAI_MAXSHORTLEN 1)))  ; and its '\0'
               (set! size (- size 1))
-              (loadBlock S (as ptr buff) (+ size 1))
-              (set! ts (luaS_newlstr L (cstr buff) size))
+              (load-block S (as ptr buff) (+ size 1))
+              (set! ts (string-newlstr L (cstr buff) size))
               (set! (deref sl) ts)
-              (luaC_objbarrier L p ts))
+              (gc-objbarrier L p ts))
           (!= (S 'fixed) 0)  ; a fixed buffer's string stays in it
             (let (s:(ptr i8) (getaddr S size i8))
               (set! size (- size 1))
-              (set! ts (luaS_newextlstr L (cstr s) size null null))
+              (set! ts (string-newextlstr L (cstr s) size null null))
               (set! (deref sl) ts)
-              (luaC_objbarrier L p ts))
+              (gc-objbarrier L p ts))
           true  ; read straight into a new string
             (do (set! size (- size 1))
-                (set! ts (luaS_createlngstrobj L size))
+                (set! ts (string-createlngstrobj L size))
                 (set! (deref sl) ts)
-                (luaC_objbarrier L p ts)
-                (loadBlock S (as ptr (getlngstr ts)) (+ size 1))))
+                (gc-objbarrier L p ts)
+                (load-block S (as ptr (getlngstr ts)) (+ size 1))))
     (set! (S 'nstr) (+ (S 'nstr) 1))  ; saved for reuse
     (setsvalue L sv ts)
-    (luaH_setint L (S 'h) (l_castU2S (S 'nstr)) sv)
-    (luaC_objbarrierback L (obj2gco (S 'h)) ts)))
+    (table-setint L (S 'h) (l_castU2S (S 'nstr)) sv)
+    (gc-objbarrierback L (obj2gco (S 'h)) ts)))
 
-(defn- loadCode (S:(ptr LoadState) f:(ptr Proto)):void
-  (let (n:i32 (loadInt S))
-    (loadAlign S (cast_uint (sizeof Instruction)))
+(defn- load-code (S:(ptr LoadState) f:(ptr Proto)):void
+  (let (n:i32 (load-int S))
+    (load-align S (cast_uint (sizeof Instruction)))
     (if (!= (S 'fixed) 0)
       (do (set! (f 'code) (getaddr S n Instruction))
           (set! (f 'sizecode) n))
-      (do (set! (f 'code) (luaM_newvectorchecked (S 'L) n Instruction))
+      (do (set! (f 'code) (mem-newvectorchecked (S 'L) n Instruction))
           (set! (f 'sizecode) n)
-          (loadBlock S (as ptr (f 'code)) (* (cast_sizet n) (cast_sizet (sizeof Instruction))))))))
+          (load-block S (as ptr (f 'code)) (* (cast_sizet n) (cast_sizet (sizeof Instruction))))))))
 
-(defn- loadConstants (S:(ptr LoadState) f:(ptr Proto)):void
-  (let (n:i32 (loadInt S))
-    (set! (f 'k) (luaM_newvectorchecked (S 'L) n TValue))
+(defn- load-constants (S:(ptr LoadState) f:(ptr Proto)):void
+  (let (n:i32 (load-int S))
+    (set! (f 'k) (mem-newvectorchecked (S 'L) n TValue))
     (set! (f 'sizek) n)
     (for (i:i32 0) (< i n) (inc! i)
       (setnilvalue (p+ (f 'k) i)))
     (for (i:i32 0) (< i n) (inc! i)
       (let (o:(ptr TValue) (p+ (f 'k) i)
-            t:i32 (as i32 (loadByte S)))
+            t:i32 (as i32 (load-byte S)))
         (case t
           LUA_VNIL (setnilvalue o)
           LUA_VFALSE (setbfvalue o)
           LUA_VTRUE (setbtvalue o)
-          LUA_VNUMFLT (setfltvalue o (loadNumber S))
-          LUA_VNUMINT (setivalue o (loadInteger S))
+          LUA_VNUMFLT (setfltvalue o (load-number S))
+          LUA_VNUMINT (setivalue o (load-integer S))
           (:or LUA_VSHRSTR LUA_VLNGSTR)
-            (do (loadString S f (ref (f 'source)))  ; 'source' anchors it
+            (do (load-string S f (ref (f 'source)))  ; 'source' anchors it
                 (when (= (as ptr (f 'source)) null)
                   (loaderror S "bad format for constant string"))
                 (setsvalue2n (S 'L) o (f 'source))
                 (set! (f 'source) null))
           (loaderror S "invalid constant"))))))
 
-(defn- loadProtos (S:(ptr LoadState) f:(ptr Proto)):void
-  (let (n:i32 (loadInt S))
-    (set! (f 'p) (luaM_newvectorchecked (S 'L) n (ptr Proto)))
+(defn- load-protos (S:(ptr LoadState) f:(ptr Proto)):void
+  (let (n:i32 (load-int S))
+    (set! (f 'p) (mem-newvectorchecked (S 'L) n (ptr Proto)))
     (set! (f 'sizep) n)
     (for (i:i32 0) (< i n) (inc! i)
       (set! (deref (p+ (f 'p) i)) null))
     (for (i:i32 0) (< i n) (inc! i)
-      (let (np:(ptr Proto) (luaF_newproto (S 'L)))
+      (let (np:(ptr Proto) (func-newproto (S 'L)))
         (set! (deref (p+ (f 'p) i)) np)
-        (luaC_objbarrier (S 'L) f np)
-        (loadFunction S np)))))
+        (gc-objbarrier (S 'L) f np)
+        (load-function S np)))))
 
 ; The names are filled first: a read error's message may run an emergency
 ; collection, which needs every prototype consistent.
-(defn- loadUpvalues (S:(ptr LoadState) f:(ptr Proto)):void
-  (let (n:i32 (loadInt S))
-    (set! (f 'upvalues) (luaM_newvectorchecked (S 'L) n Upvaldesc))
+(defn- load-upvalues (S:(ptr LoadState) f:(ptr Proto)):void
+  (let (n:i32 (load-int S))
+    (set! (f 'upvalues) (mem-newvectorchecked (S 'L) n Upvaldesc))
     (set! (f 'sizeupvalues) n)
     (for (i:i32 0) (< i n) (inc! i)
       (set! ((p+ (f 'upvalues) i) 'name) null))
     (for (i:i32 0) (< i n) (inc! i)
       (let (up:(ptr Upvaldesc) (p+ (f 'upvalues) i))
-        (set! (up 'instack) (loadByte S))
-        (set! (up 'idx) (loadByte S))
-        (set! (up 'kind) (loadByte S))))))
+        (set! (up 'instack) (load-byte S))
+        (set! (up 'idx) (load-byte S))
+        (set! (up 'kind) (load-byte S))))))
 
-(defn- loadDebug (S:(ptr LoadState) f:(ptr Proto)):void
-  (let (n:i32 (loadInt S))
+(defn- load-debug (S:(ptr LoadState) f:(ptr Proto)):void
+  (let (n:i32 (load-int S))
     (if (!= (S 'fixed) 0)
       (do (set! (f 'lineinfo) (getaddr S n ls_byte))
           (set! (f 'sizelineinfo) n))
-      (do (set! (f 'lineinfo) (luaM_newvectorchecked (S 'L) n ls_byte))
+      (do (set! (f 'lineinfo) (mem-newvectorchecked (S 'L) n ls_byte))
           (set! (f 'sizelineinfo) n)
-          (loadBlock S (as ptr (f 'lineinfo)) (cast_sizet n))))
-    (set! n (loadInt S))
+          (load-block S (as ptr (f 'lineinfo)) (cast_sizet n))))
+    (set! n (load-int S))
     (when (> n 0)
-      (loadAlign S (cast_uint (sizeof i32)))
+      (load-align S (cast_uint (sizeof i32)))
       (if (!= (S 'fixed) 0)
         (do (set! (f 'abslineinfo) (getaddr S n AbsLineInfo))
             (set! (f 'sizeabslineinfo) n))
-        (do (set! (f 'abslineinfo) (luaM_newvectorchecked (S 'L) n AbsLineInfo))
+        (do (set! (f 'abslineinfo) (mem-newvectorchecked (S 'L) n AbsLineInfo))
             (set! (f 'sizeabslineinfo) n)
-            (loadBlock S (as ptr (f 'abslineinfo)) (* (cast_sizet n) (cast_sizet (sizeof AbsLineInfo)))))))
-    (set! n (loadInt S))
-    (set! (f 'locvars) (luaM_newvectorchecked (S 'L) n LocVar))
+            (load-block S (as ptr (f 'abslineinfo)) (* (cast_sizet n) (cast_sizet (sizeof AbsLineInfo)))))))
+    (set! n (load-int S))
+    (set! (f 'locvars) (mem-newvectorchecked (S 'L) n LocVar))
     (set! (f 'sizelocvars) n)
     (for (i:i32 0) (< i n) (inc! i)
       (set! ((p+ (f 'locvars) i) 'varname) null))
     (for (i:i32 0) (< i n) (inc! i)
       (let (lv:(ptr LocVar) (p+ (f 'locvars) i))
-        (loadString S f (ref (lv 'varname)))
-        (set! (lv 'startpc) (loadInt S))
-        (set! (lv 'endpc) (loadInt S))))
-    (set! n (loadInt S))
+        (load-string S f (ref (lv 'varname)))
+        (set! (lv 'startpc) (load-int S))
+        (set! (lv 'endpc) (load-int S))))
+    (set! n (load-int S))
     (when (!= n 0)  ; with debug information, there are this many
       (set! n (f 'sizeupvalues)))
     (for (i:i32 0) (< i n) (inc! i)
-      (loadString S f (ref ((p+ (f 'upvalues) i) 'name))))))
+      (load-string S f (ref ((p+ (f 'upvalues) i) 'name))))))
 
-(defn- loadFunction (S:(ptr LoadState) f:(ptr Proto)):void
-  (set! (f 'linedefined) (loadInt S))
-  (set! (f 'lastlinedefined) (loadInt S))
-  (set! (f 'numparams) (loadByte S))
-  (set! (f 'flag) (cast_uchar (bit-and (as i32 (loadByte S)) NOT_PF_FIXED)))  ; the meaningful flags
+(defn- load-function (S:(ptr LoadState) f:(ptr Proto)):void
+  (set! (f 'linedefined) (load-int S))
+  (set! (f 'lastlinedefined) (load-int S))
+  (set! (f 'numparams) (load-byte S))
+  (set! (f 'flag) (cast_uchar (bit-and (as i32 (load-byte S)) NOT_PF_FIXED)))  ; the meaningful flags
   (when (!= (S 'fixed) 0)
     (set! (f 'flag) (cast_uchar (bit-or (f 'flag) PF_FIXED))))  ; the code stays in the buffer
-  (set! (f 'maxstacksize) (loadByte S))
-  (loadCode S f)
-  (loadConstants S f)
-  (loadUpvalues S f)
-  (loadProtos S f)
-  (loadString S f (ref (f 'source)))
-  (loadDebug S f))
+  (set! (f 'maxstacksize) (load-byte S))
+  (load-code S f)
+  (load-constants S f)
+  (load-upvalues S f)
+  (load-protos S f)
+  (load-string S f (ref (f 'source)))
+  (load-debug S f))
 
 (defn- checkliteral (S:(ptr LoadState) s:ptr len:usize msg:CStr):void
   (let (buff:(ptr i8) (alloca i8 16))  ; more than either literal
-    (loadBlock S (as ptr buff) len)
+    (load-block S (as ptr buff) len)
     (when (!= (memcmp s (as ptr buff) len) 0)
       (loaderror S msg))))
 
 (defn- numerror (S:(ptr LoadState) what:CStr tname:CStr):void
-  (loaderror S (cstr (luaO_pushfstring (S 'L) "%s %s mismatch" tname what))))
+  (loaderror S (cstr (obj-pushfstring (S 'L) "%s %s mismatch" tname what))))
 
 (defn- checknumsize (S:(ptr LoadState) size:i32 tname:CStr):void
-  (when (!= size (as i32 (loadByte S)))
+  (when (!= size (as i32 (load-byte S)))
     (numerror S "size" tname)))
 
 (defn- checknumformat (S:(ptr LoadState) eq:bool tname:CStr):void
@@ -264,14 +272,14 @@
   (let (x (gensym))
     `(let ((~x ~T) ~value)
        (checknumsize ~S (cast_int (sizeof ~T)) ~tname)
-       (loadBlock ~S (as ptr (ref ~x)) (cast_sizet (sizeof ~T)))
+       (load-block ~S (as ptr (ref ~x)) (cast_sizet (sizeof ~T)))
        (checknumformat ~S (= ~x ~value) ~tname))))
 
-(defn- checkHeader (S:(ptr LoadState)):void
+(defn- check-header (S:(ptr LoadState)):void
   (checkliteral S (as ptr (p+ (bytes LUA_SIGNATURE) 1)) 3 "not a binary chunk")  ; the first byte is read
-  (when (!= (as i32 (loadByte S)) LUAC_VERSION)
+  (when (!= (as i32 (load-byte S)) LUAC_VERSION)
     (loaderror S "version mismatch"))
-  (when (!= (as i32 (loadByte S)) LUAC_FORMAT)
+  (when (!= (as i32 (load-byte S)) LUAC_FORMAT)
     (loaderror S "format mismatch"))
   (checkliteral S (as ptr LUAC_DATA) 6 "corrupted chunk")
   (checknum S i32 LUAC_INT "int")
@@ -279,7 +287,7 @@
   (checknum S lua_Integer LUAC_INT "Lua integer")
   (checknum S lua_Number LUAC_NUM "Lua number"))
 
-(defn luaU_undump (L:(ptr lua_State) Z:(ptr ZIO) anchor:(ptr Table) name0:CStr fixed:i32):(ptr LClosure)
+(defn undump-chunk (L:(ptr lua_State) Z:(ptr ZIO) anchor:(ptr Table) name0:CStr fixed:i32):(ptr LClosure)
   (let (S:(ptr LoadState) (alloca LoadState)
         c:i32 (as i32 (deref (bytes name0)))
         name:CStr (cond (or (= c (ch \@)) (= c (ch \=))) (cstr (p+ (bytes name0) 1))
@@ -290,14 +298,14 @@
     (set! (S 'Z) Z)
     (set! (S 'fixed) (cast_uchar fixed))
     (set! (S 'offset) 1)  ; the first byte was read
-    (checkHeader S)
+    (check-header S)
     (set! (S 'h) anchor)
     (set! (S 'nstr) 0)
-    (let (cl:(ptr LClosure) (luaF_newLclosure L (as i32 (loadByte S))))
-      (luaD_anchorobj L anchor (obj2gco cl))
-      (set! (cl 'p) (luaF_newproto L))
-      (luaC_objbarrier L cl (cl 'p))
-      (loadFunction S (cl 'p))
+    (let (cl:(ptr LClosure) (func-new-lclosure L (as i32 (load-byte S))))
+      (do-anchorobj L anchor (obj2gco cl))
+      (set! (cl 'p) (func-newproto L))
+      (gc-objbarrier L cl (cl 'p))
+      (load-function S (cl 'p))
       (when (!= (as i32 (cl 'nupvalues)) ((cl 'p) 'sizeupvalues))
         (loaderror S "corrupted chunk"))
       (return cl))))

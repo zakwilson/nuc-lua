@@ -10,6 +10,9 @@
 (import-use "lgc.h")
 (import-use lua.util)
 (import-use lua.core)
+(import-use lua.do)
+(import-use lua.gc)
+(import-use lua.debug)
 
 ; The allocator: frealloc(ud, p, os, 0) frees p; frealloc(ud, NULL, x, s) makes
 ; a block of s bytes; else it resizes. A failure returns NULL.
@@ -21,20 +24,20 @@
 
 (defconst MINSIZEARRAY 4)  ; the parser's arrays start here, not at 1, 2, 4
 
-(defn luaM_growaux_ (L:(ptr lua_State) block:ptr nelems:i32 psize:(ptr i32)
+(defn mem-growaux (L:(ptr lua_State) block:ptr nelems:i32 psize:(ptr i32)
                      size_elems:ui32 limit:i32 what:CStr):ptr
   (let (size:i32 (deref psize))
     (when (<= (+ nelems 1) size)  ; one more still fits?
       (return block))
     (if (>= size (/ limit 2))  ; it can't double?
       (do (when (>= size limit)  ; it can't grow at all?
-            (luaG_runerror L "too many %s (limit is %d)" what limit))
+            (debug-runerror L "too many %s (limit is %d)" what limit))
           (set! size limit))  ; at least one free place left
       (do (set! size (* size 2))
           (when (< size MINSIZEARRAY)
             (set! size MINSIZEARRAY))))
     ; 'limit' keeps the multiplication from overflowing
-    (let (newblock:ptr (luaM_saferealloc_ L block
+    (let (newblock:ptr (mem-saferealloc L block
                                           (* (cast_sizet (deref psize)) (as usize size_elems))
                                           (* (cast_sizet size) (as usize size_elems))))
       (set! (deref psize) size)  ; only once all else is done
@@ -42,18 +45,18 @@
 
 ; A prototype's array size is its element count, so failing to shrink one is
 ; an error.
-(defn luaM_shrinkvector_ (L:(ptr lua_State) block:ptr size:(ptr i32) final_n:i32
+(defn mem-shrinkvector-fn (L:(ptr lua_State) block:ptr size:(ptr i32) final_n:i32
                           size_elem:ui32):ptr
   (let (oldsize:usize (* (cast_sizet (deref size)) (as usize size_elem))
         newsize:usize (* (cast_sizet final_n) (as usize size_elem))
-        newblock:ptr (luaM_saferealloc_ L block oldsize newsize))
+        newblock:ptr (mem-saferealloc L block oldsize newsize))
     (set! (deref size) final_n)
     (return newblock)))
 
-(defn luaM_toobig (L:(ptr lua_State)):void
-  (luaG_runerror L "memory allocation error: block too big"))
+(defn mem-toobig (L:(ptr lua_State)):void
+  (debug-runerror L "memory allocation error: block too big"))
 
-(defn luaM_free_ (L:(ptr lua_State) block:ptr osize:usize):void
+(defn mem-free-fn (L:(ptr lua_State) block:ptr osize:usize):void
   (let (g:(ptr global_State) (G L))
     (callfrealloc g block osize 0)
     (set! (g 'GCdebt) (+ (g 'GCdebt) (unsafe/cast l_mem osize)))))
@@ -63,10 +66,10 @@
   (let (g:(ptr global_State) (G L))
     (when (not (cantryagain g))
       (return null))
-    (luaC_fullgc L 1)  ; free some memory
+    (gc-fullgc L 1)  ; free some memory
     (return (callfrealloc g block osize nsize))))
 
-(defn luaM_realloc_ (L:(ptr lua_State) block:ptr osize:usize nsize:usize):ptr
+(defn mem-realloc (L:(ptr lua_State) block:ptr osize:usize nsize:usize):ptr
   (let (g:(ptr global_State) (G L)
         newblock:ptr (callfrealloc g block osize nsize))
     (when (and (= newblock null) (> nsize 0))
@@ -76,14 +79,14 @@
     (set! (g 'GCdebt) (- (g 'GCdebt) (- (unsafe/cast l_mem nsize) (unsafe/cast l_mem osize))))
     (return newblock)))
 
-(defn luaM_saferealloc_ (L:(ptr lua_State) block:ptr osize:usize nsize:usize):ptr
-  (let (newblock:ptr (luaM_realloc_ L block osize nsize))
+(defn mem-saferealloc (L:(ptr lua_State) block:ptr osize:usize nsize:usize):ptr
+  (let (newblock:ptr (mem-realloc L block osize nsize))
     (when (and (= newblock null) (> nsize 0))
-      (luaM_error L))
+      (mem-error L))
     (return newblock)))
 
 ; 'tag' goes to the allocator as the old size: the type of object being made.
-(defn luaM_malloc_ (L:(ptr lua_State) size:usize tag:i32):ptr
+(defn mem-malloc (L:(ptr lua_State) size:usize tag:i32):ptr
   (when (= size 0)
     (return null))
   (let (g:(ptr global_State) (G L)
@@ -91,6 +94,6 @@
     (when (= newblock null)
       (set! newblock (tryagain L null (cast_sizet tag) size))
       (when (= newblock null)
-        (luaM_error L)))
+        (mem-error L)))
     (set! (g 'GCdebt) (- (g 'GCdebt) (unsafe/cast l_mem size)))
     (return newblock)))

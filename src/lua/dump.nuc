@@ -9,6 +9,7 @@
 (import-use "lundump.h")
 (import-use lua.util)
 (import-use lua.core)
+(import-use lua.table)
 (import-use luacapi)  ; LUA_SIGNATURE
 
 (defconst DIBS 10)  ; (64 + 6) / 7: a varint byte holds 7 bits
@@ -29,23 +30,23 @@
 
 ; Every write goes through here; 'b' is null only for the last, which ends
 ; the dump. Nothing is written after an error.
-(defn- dumpBlock (D:(ptr DumpState) b:ptr size:usize):void
+(defn- dump-block (D:(ptr DumpState) b:ptr size:usize):void
   (when (= (D 'status) 0)
     (set! (D 'status) ((D 'writer) (D 'L) b size (D 'data)))
     (set! (D 'offset) (+ (D 'offset) size))))
 
 ; Zeros up to a multiple of 'align'.
-(defn- dumpAlign (D:(ptr DumpState) align:ui32):void
+(defn- dump-align (D:(ptr DumpState) align:ui32):void
   (let (padding:ui32 (- align (cast_uint (% (D 'offset) (as usize align)))))
     (when (< padding align)  ; padding = align: none
-      (dumpBlock D (as ptr &paddingContent) (as usize padding)))))
+      (dump-block D (as ptr &paddingContent) (as usize padding)))))
 
-(defn- dumpByte (D:(ptr DumpState) y:i32):void
+(defn- dump-byte (D:(ptr DumpState) y:i32):void
   (let (x:ui8 (cast_uchar y))
-    (dumpBlock D (as ptr &x) 1)))
+    (dump-block D (as ptr &x) 1)))
 
 ; MSB varint.
-(defn- dumpVarint (D:(ptr DumpState) x0:lua_Unsigned):void
+(defn- dump-varint (D:(ptr DumpState) x0:lua_Unsigned):void
   (let (buff:(ptr ui8) (alloca ui8 DIBS)
         x:lua_Unsigned x0
         n:i32 1)
@@ -55,140 +56,140 @@
       (set! n (+ n 1))
       (set! (deref (p+ buff (- DIBS n))) (cast_uchar (bit-or (bit-and x 0x7f) 0x80)))
       (set! x (bit-shr x 7)))
-    (dumpBlock D (as ptr (p+ buff (- DIBS n))) (as usize n))))
+    (dump-block D (as ptr (p+ buff (- DIBS n))) (as usize n))))
 
-(defn- dumpSize (D:(ptr DumpState) sz:usize):void
-  (dumpVarint D (unsafe/cast lua_Unsigned sz)))
+(defn- dump-size (D:(ptr DumpState) sz:usize):void
+  (dump-varint D (unsafe/cast lua_Unsigned sz)))
 
-(defn- dumpInt (D:(ptr DumpState) x:i32):void
-  (dumpVarint D (as lua_Unsigned (cast_uint x))))
+(defn- dump-int (D:(ptr DumpState) x:i32):void
+  (dump-varint D (as lua_Unsigned (cast_uint x))))
 
-(defn- dumpNumber (D:(ptr DumpState) x:lua_Number):void
+(defn- dump-number (D:(ptr DumpState) x:lua_Number):void
   (let (v:lua_Number x)
-    (dumpBlock D (as ptr &v) (cast_sizet (sizeof lua_Number)))))
+    (dump-block D (as ptr &v) (cast_sizet (sizeof lua_Number)))))
 
 ; Small values stay small: x >= 0 is 2x, a negative x is -2x - 1.
-(defn- dumpInteger (D:(ptr DumpState) x:lua_Integer):void
+(defn- dump-integer (D:(ptr DumpState) x:lua_Integer):void
   (let (two:lua_Unsigned 2
         cx:lua_Unsigned (if (>= x 0)
                           (* two (l_castS2U x))
                           (+ (* two (bit-xor (l_castS2U x) (l_castS2U -1))) 1)))
-    (dumpVarint D cx)))
+    (dump-varint D cx)))
 
 ; A string is its size plus one and its bytes, or, if saved before, a zero
 ; size and its index; index 0 is NULL. The ending '\0' isn't counted.
-(defn- dumpString (D:(ptr DumpState) ts:(ptr TString)):void
+(defn- dump-string (D:(ptr DumpState) ts:(ptr TString)):void
   (when (= (as ptr ts) null)
-    (dumpVarint D 0)
-    (dumpVarint D 0)
+    (dump-varint D 0)
+    (dump-varint D 0)
     (return))
   (let (idx:(ptr TValue) (alloca TValue)
-        tag:i32 (as i32 (luaH_getstr (D 'h) ts idx)))
+        tag:i32 (as i32 (table-getstr (D 'h) ts idx)))
     (when (not (tagisempty tag))  ; saved already?
-      (dumpVarint D 0)
-      (dumpVarint D (l_castS2U (ivalue idx)))
+      (dump-varint D 0)
+      (dump-varint D (l_castS2U (ivalue idx)))
       (return))
     (let (key:(ptr TValue) (alloca TValue)
           value:(ptr TValue) (alloca TValue)
           size:usize (tsslen ts))
-      (dumpSize D (+ size 1))
-      (dumpBlock D (as ptr (getstr ts)) (+ size 1))  ; with the ending '\0'
+      (dump-size D (+ size 1))
+      (dump-block D (as ptr (getstr ts)) (+ size 1))  ; with the ending '\0'
       (set! (D 'nstr) (+ (D 'nstr) 1))
       (setsvalue (D 'L) key ts)
       (setivalue value (l_castU2S (D 'nstr)))  ; h[ts] = nstr; an integer needs no barrier
-      (luaH_set (D 'L) (D 'h) key value))))
+      (table-set (D 'L) (D 'h) key value))))
 
-(defn- dumpCode (D:(ptr DumpState) f:(ptr Proto)):void
-  (dumpInt D (f 'sizecode))
-  (dumpAlign D (cast_uint (sizeof Instruction)))
-  (dumpBlock D (as ptr (f 'code)) (* (cast_sizet (f 'sizecode)) (cast_sizet (sizeof Instruction)))))
+(defn- dump-code (D:(ptr DumpState) f:(ptr Proto)):void
+  (dump-int D (f 'sizecode))
+  (dump-align D (cast_uint (sizeof Instruction)))
+  (dump-block D (as ptr (f 'code)) (* (cast_sizet (f 'sizecode)) (cast_sizet (sizeof Instruction)))))
 
-(defn- dumpConstants (D:(ptr DumpState) f:(ptr Proto)):void
+(defn- dump-constants (D:(ptr DumpState) f:(ptr Proto)):void
   (let (n:i32 (f 'sizek))
-    (dumpInt D n)
+    (dump-int D n)
     (for (i:i32 0) (< i n) (inc! i)
       (let (o:(ptr TValue) (p+ (f 'k) i)
             tt:i32 (as i32 (ttypetag o)))
-        (dumpByte D tt)
+        (dump-byte D tt)
         (case tt
-          LUA_VNUMFLT (dumpNumber D (fltvalue o))
-          LUA_VNUMINT (dumpInteger D (ivalue o))
-          (:or LUA_VSHRSTR LUA_VLNGSTR) (dumpString D (tsvalue o))
+          LUA_VNUMFLT (dump-number D (fltvalue o))
+          LUA_VNUMINT (dump-integer D (ivalue o))
+          (:or LUA_VSHRSTR LUA_VLNGSTR) (dump-string D (tsvalue o))
           (do))))))  ; nil, false, true: the tag says it all
 
-(defn- dumpProtos (D:(ptr DumpState) f:(ptr Proto)):void
+(defn- dump-protos (D:(ptr DumpState) f:(ptr Proto)):void
   (let (n:i32 (f 'sizep))
-    (dumpInt D n)
+    (dump-int D n)
     (for (i:i32 0) (< i n) (inc! i)
-      (dumpFunction D (deref (p+ (f 'p) i))))))
+      (dump-function D (deref (p+ (f 'p) i))))))
 
-(defn- dumpUpvalues (D:(ptr DumpState) f:(ptr Proto)):void
+(defn- dump-upvalues (D:(ptr DumpState) f:(ptr Proto)):void
   (let (n:i32 (f 'sizeupvalues))
-    (dumpInt D n)
+    (dump-int D n)
     (for (i:i32 0) (< i n) (inc! i)
       (let (up:(ptr Upvaldesc) (p+ (f 'upvalues) i))
-        (dumpByte D (up 'instack))
-        (dumpByte D (up 'idx))
-        (dumpByte D (up 'kind))))))
+        (dump-byte D (up 'instack))
+        (dump-byte D (up 'idx))
+        (dump-byte D (up 'kind))))))
 
-(defn- dumpDebug (D:(ptr DumpState) f:(ptr Proto)):void
+(defn- dump-debug (D:(ptr DumpState) f:(ptr Proto)):void
   (let (strip:bool (!= (D 'strip) 0)
         n:i32 (if strip 0 (f 'sizelineinfo)))
-    (dumpInt D n)
+    (dump-int D n)
     (when (!= (as ptr (f 'lineinfo)) null)
-      (dumpBlock D (as ptr (f 'lineinfo)) (cast_sizet n)))
+      (dump-block D (as ptr (f 'lineinfo)) (cast_sizet n)))
     (set! n (if strip 0 (f 'sizeabslineinfo)))
-    (dumpInt D n)
+    (dump-int D n)
     (when (> n 0)
-      (dumpAlign D (cast_uint (sizeof i32)))  ; an array of structs of ints
-      (dumpBlock D (as ptr (f 'abslineinfo)) (* (cast_sizet n) (cast_sizet (sizeof AbsLineInfo)))))
+      (dump-align D (cast_uint (sizeof i32)))  ; an array of structs of ints
+      (dump-block D (as ptr (f 'abslineinfo)) (* (cast_sizet n) (cast_sizet (sizeof AbsLineInfo)))))
     (set! n (if strip 0 (f 'sizelocvars)))
-    (dumpInt D n)
+    (dump-int D n)
     (for (i:i32 0) (< i n) (inc! i)
       (let (lv:(ptr LocVar) (p+ (f 'locvars) i))
-        (dumpString D (lv 'varname))
-        (dumpInt D (lv 'startpc))
-        (dumpInt D (lv 'endpc))))
+        (dump-string D (lv 'varname))
+        (dump-int D (lv 'startpc))
+        (dump-int D (lv 'endpc))))
     (set! n (if strip 0 (f 'sizeupvalues)))
-    (dumpInt D n)
+    (dump-int D n)
     (for (i:i32 0) (< i n) (inc! i)
-      (dumpString D ((p+ (f 'upvalues) i) 'name)))))
+      (dump-string D ((p+ (f 'upvalues) i) 'name)))))
 
-(defn- dumpFunction (D:(ptr DumpState) f:(ptr Proto)):void
-  (dumpInt D (f 'linedefined))
-  (dumpInt D (f 'lastlinedefined))
-  (dumpByte D (f 'numparams))
-  (dumpByte D (f 'flag))
-  (dumpByte D (f 'maxstacksize))
-  (dumpCode D f)
-  (dumpConstants D f)
-  (dumpUpvalues D f)
-  (dumpProtos D f)
+(defn- dump-function (D:(ptr DumpState) f:(ptr Proto)):void
+  (dump-int D (f 'linedefined))
+  (dump-int D (f 'lastlinedefined))
+  (dump-byte D (f 'numparams))
+  (dump-byte D (f 'flag))
+  (dump-byte D (f 'maxstacksize))
+  (dump-code D f)
+  (dump-constants D f)
+  (dump-upvalues D f)
+  (dump-protos D f)
   (if (!= (D 'strip) 0)
-    (dumpString D null)
-    (dumpString D (f 'source)))
-  (dumpDebug D f))
+    (dump-string D null)
+    (dump-string D (f 'source)))
+  (dump-debug D f))
 
 ; A type's size, then a value of it, to check the loader's.
 (defmacro dumpNumInfo (D T v)
   (let (x (gensym))
     `(let ((~x ~T) ~v)
-       (dumpByte ~D (cast_int (sizeof ~T)))
-       (dumpBlock ~D (as ptr (ref ~x)) (cast_sizet (sizeof ~T))))))
+       (dump-byte ~D (cast_int (sizeof ~T)))
+       (dump-block ~D (as ptr (ref ~x)) (cast_sizet (sizeof ~T))))))
 
-(defn- dumpHeader (D:(ptr DumpState)):void
-  (dumpBlock D (as ptr LUA_SIGNATURE) 4)
-  (dumpByte D LUAC_VERSION)
-  (dumpByte D LUAC_FORMAT)
-  (dumpBlock D (as ptr LUAC_DATA) 6)
+(defn- dump-header (D:(ptr DumpState)):void
+  (dump-block D (as ptr LUA_SIGNATURE) 4)
+  (dump-byte D LUAC_VERSION)
+  (dump-byte D LUAC_FORMAT)
+  (dump-block D (as ptr LUAC_DATA) 6)
   (dumpNumInfo D i32 LUAC_INT)
   (dumpNumInfo D Instruction LUAC_INST)
   (dumpNumInfo D lua_Integer LUAC_INT)
   (dumpNumInfo D lua_Number LUAC_NUM))
 
-(defn luaU_dump (L:(ptr lua_State) f:(ptr Proto) w:lua_Writer data:ptr strip:i32):i32
+(defn dump-chunk (L:(ptr lua_State) f:(ptr Proto) w:lua_Writer data:ptr strip:i32):i32
   (let (D:(ptr DumpState) (alloca DumpState))
-    (set! (D 'h) (luaH_new L))  ; the strings dumped so far
+    (set! (D 'h) (table-new L))  ; the strings dumped so far
     (sethvalue2s L ((L 'top) 'p) (D 'h))  ; anchored
     (set! ((L 'top) 'p) (p+ ((L 'top) 'p) 1))
     (set! (D 'L) L)
@@ -198,8 +199,8 @@
     (set! (D 'strip) strip)
     (set! (D 'status) 0)
     (set! (D 'nstr) 0)
-    (dumpHeader D)
-    (dumpByte D (f 'sizeupvalues))
-    (dumpFunction D f)
-    (dumpBlock D null 0)  ; the end
+    (dump-header D)
+    (dump-byte D (f 'sizeupvalues))
+    (dump-function D f)
+    (dump-block D null 0)  ; the end
     (return (D 'status))))

@@ -16,7 +16,7 @@
 (defmacro- iscontp (p) `(= (bit-and (as i32 (cast_uchar (deref ~p))) 0xC0) 0x80))
 
 ; A relative string position: a negative one counts back from the end.
-(defn- u_posrelat (pos:lua_Integer len:usize):lua_Integer
+(defn- u-posrelat (pos:lua_Integer len:usize):lua_Integer
   (cond
     (>= pos 0) (return pos)
     (> (- 0 (l_castS2U pos)) len) (return 0)
@@ -28,7 +28,7 @@
 
 ; Decodes one sequence into 'val' (when given) and returns what follows it, or
 ; null when it's invalid.
-(defn- utf8_decode (s:(ptr i8) val:(ptr ui32) strict:bool):(ptr i8)
+(defn- utf8-decode (s:(ptr i8) val:(ptr ui32) strict:bool):(ptr i8)
   (let (c:ui32 (as ui32 (cast_uchar (aref s 0)))
         res:ui32 0)
     (cond
@@ -58,14 +58,14 @@
   (let (n:lua_Integer 0
         len:usize 0
         s:(ptr i8) (bytes (luaL_checklstring L 1 &len))
-        posi:lua_Integer (u_posrelat (luaL_optinteger L 2 1) len)
-        posj:lua_Integer (u_posrelat (luaL_optinteger L 3 -1) len)
+        posi:lua_Integer (u-posrelat (luaL_optinteger L 2 1) len)
+        posj:lua_Integer (u-posrelat (luaL_optinteger L 3 -1) len)
         lax:bool (!= (lua_toboolean L 4) 0))
     (luaL_argcheck L (and (<= 1 posi) (<= (dec! posi) (l_castU2S len))) 2
                    "initial position out of bounds")
     (luaL_argcheck L (< (dec! posj) (l_castU2S len)) 3 "final position out of bounds")
     (while (<= posi posj)
-      (let (s1:(ptr i8) (utf8_decode (unsafe/ptr+ s posi) null (not lax)))
+      (let (s1:(ptr i8) (utf8-decode (unsafe/ptr+ s posi) null (not lax)))
         (when (= s1 null)  ; a bad sequence
           (luaL_pushfail L)
           (lua_pushinteger L (+ posi 1))
@@ -80,8 +80,8 @@
 (defn- codepoint (L:(ptr lua_State)):i32
   (let (len:usize 0
         s:(ptr i8) (bytes (luaL_checklstring L 1 &len))
-        posi:lua_Integer (u_posrelat (luaL_optinteger L 2 1) len)
-        pose:lua_Integer (u_posrelat (luaL_optinteger L 3 posi) len)
+        posi:lua_Integer (u-posrelat (luaL_optinteger L 2 1) len)
+        pose:lua_Integer (u-posrelat (luaL_optinteger L 3 posi) len)
         lax:bool (!= (lua_toboolean L 4) 0)
         n:i32 0)
     (luaL_argcheck L (>= posi 1) 2 "out of bounds")
@@ -94,7 +94,7 @@
           code:ui32 0)
       (set! s (unsafe/ptr+ s (- posi 1)))
       (while (< (byte-diff s se) 0)
-        (set! s (utf8_decode s &code (not lax)))
+        (set! s (utf8-decode s &code (not lax)))
         (when (= s null)
           (return (luaL_error L MSGInvalid)))
         (lua_pushinteger L (as lua_Integer code))
@@ -125,7 +125,7 @@
   (let (len:usize 0
         s:(ptr i8) (bytes (luaL_checklstring L 1 &len))
         n:lua_Integer (luaL_checkinteger L 2)
-        posi:lua_Integer (u_posrelat (luaL_optinteger L 3 (if (>= n 0) 1 (+ (l_castU2S len) 1)))
+        posi:lua_Integer (u-posrelat (luaL_optinteger L 3 (if (>= n 0) 1 (+ (l_castU2S len) 1)))
                                      len))
     (luaL_argcheck L (and (<= 1 posi) (<= (dec! posi) (l_castU2S len))) 3
                    "position out of bounds")
@@ -161,7 +161,7 @@
     (lua_pushinteger L (+ posi 1))  ; where it ends
     (return 2)))
 
-(defn- iter_aux (L:(ptr lua_State) strict:bool):i32
+(defn- iter-aux (L:(ptr lua_State) strict:bool):i32
   (let (len:usize 0
         s:(ptr i8) (bytes (luaL_checklstring L 1 &len))
         n:lua_Unsigned (l_castS2U (lua_tointeger L 2)))
@@ -171,26 +171,26 @@
     (when (>= n len)  ; also when 'n' started negative
       (return 0))  ; no more code points
     (let (code:ui32 0
-          next:(ptr i8) (utf8_decode (unsafe/ptr+ s (l_castU2S n)) &code strict))
+          next:(ptr i8) (utf8-decode (unsafe/ptr+ s (l_castU2S n)) &code strict))
       (when (or (= next null) (iscontp next))
         (return (luaL_error L MSGInvalid)))
       (lua_pushinteger L (l_castU2S (+ n 1)))
       (lua_pushinteger L (as lua_Integer code))
       (return 2))))
 
-(defn- iter_auxstrict (L:(ptr lua_State)):i32
-  (return (iter_aux L true)))
+(defn- iter-auxstrict (L:(ptr lua_State)):i32
+  (return (iter-aux L true)))
 
-(defn- iter_auxlax (L:(ptr lua_State)):i32
-  (return (iter_aux L false)))
+(defn- iter-auxlax (L:(ptr lua_State)):i32
+  (return (iter-aux L false)))
 
-(defn- iter_codes (L:(ptr lua_State)):i32
+(defn- iter-codes (L:(ptr lua_State)):i32
   (let (lax:bool (!= (lua_toboolean L 2) 0)
         s:(ptr i8) (bytes (luaL_checkstring L 1)))
     (luaL_argcheck L (not (iscontp s)) 1 MSGInvalid)
     (if lax
-      (lua_pushcfunction L iter_auxlax)
-      (lua_pushcfunction L iter_auxstrict))
+      (lua_pushcfunction L iter-auxlax)
+      (lua_pushcfunction L iter-auxstrict))
     (lua_pushvalue L 1)
     (lua_pushinteger L 0)
     (return 3)))
@@ -202,7 +202,7 @@
 (defn luaopen_utf8 (L:(ptr lua_State)):i32
   (lua-newlib L
     ("offset" byteoffset) ("codepoint" codepoint) ("char" utfchar) ("len" utflen)
-    ("codes" iter_codes) ("charpattern" null))  ; a placeholder
+    ("codes" iter-codes) ("charpattern" null))  ; a placeholder
   (lua_pushlstring L UTF8PATT UTF8PATT_LEN)
   (lua_setfield L -2 "charpattern")
   (return 1))

@@ -33,7 +33,7 @@
           (lua_pop L n)  ; the metatable and the metamethods
           (luaL_checktype L arg LUA_TTABLE))))))  ; raise the error
 
-(defn- aux_getn (L:(ptr lua_State) n:i32 w:i32):lua_Integer
+(defn- aux-getn (L:(ptr lua_State) n:i32 w:i32):lua_Integer
   (checktab L n (bit-or w TAB_L))
   (return (luaL_len L n)))
 
@@ -46,7 +46,7 @@
     (return 1)))
 
 (defn- tinsert (L:(ptr lua_State)):i32
-  (let (e:lua_Integer (luaL_intop + (aux_getn L 1 TAB_RW) 1)  ; the first empty slot
+  (let (e:lua_Integer (luaL_intop + (aux-getn L 1 TAB_RW) 1)  ; the first empty slot
         pos:lua_Integer 0
         nargs:i32 (lua_gettop L))
     (cond
@@ -63,7 +63,7 @@
     (return 0)))
 
 (defn- tremove (L:(ptr lua_State)):i32
-  (let (size:lua_Integer (aux_getn L 1 TAB_RW)
+  (let (size:lua_Integer (aux-getn L 1 TAB_RW)
         pos:lua_Integer (luaL_optinteger L 2 size))
     (when (!= pos size)  ; a given position must be in [1, size + 1]
       (luaL_argcheck L (<= (- (l_castS2U pos) 1) (l_castS2U size)) 2
@@ -109,7 +109,7 @@
 
 (defn- tconcat (L:(ptr lua_State)):i32
   (let (b:&luaL_Buffer (alloca luaL_Buffer)
-        last:lua_Integer (aux_getn L 1 TAB_R)
+        last:lua_Integer (aux-getn L 1 TAB_R)
         lsep:usize 0
         sep:CStr (luaL_optlstring L 2 "" &lsep)
         i:lua_Integer (luaL_optinteger L 3 1))
@@ -137,7 +137,7 @@
     (return 1)))
 
 (defn- tunpack (L:(ptr lua_State)):i32
-  (let (len:lua_Integer (aux_getn L 1 TAB_R)
+  (let (len:lua_Integer (aux-getn L 1 TAB_R)
         i:lua_Integer (luaL_optinteger L 2 1)
         e:lua_Integer (luaL_opt L luaL_checkinteger 3 len))
     (when (> i e) (return 0))  ; an empty range
@@ -165,7 +165,7 @@
   (seti L 1 j))
 
 ; Whether the value at 'a' sorts before the one at 'b'.
-(defn- sort_comp (L:(ptr lua_State) a:i32 b:i32):bool
+(defn- sort-comp (L:(ptr lua_State) a:i32 b:i32):bool
   (when (lua_isnil L 2)  ; no function?
     (return (!= (lua_compare L a b LUA_OPLT) 0)))
   (lua_pushvalue L 2)
@@ -182,12 +182,12 @@
   (let (i:IdxT lo  ; incremented before its first use
         j:IdxT (- up 1))  ; decremented before its first use
     (while true  ; invariant: a[lo..i] <= P <= a[j..up]
-      (while (do (geti L 1 (inc! i)) (sort_comp L -1 -2))  ; while a[i] < P
+      (while (do (geti L 1 (inc! i)) (sort-comp L -1 -2))  ; while a[i] < P
         (when (= i (- up 1))  ; a[up-1] < P == a[up-1]
           (luaL_error L "invalid order function for sorting"))
         (lua_pop L 1))
       ; a[i] >= P and a[lo..i-1] < P
-      (while (do (geti L 1 (dec! j)) (sort_comp L -3 -1))  ; while P < a[j]
+      (while (do (geti L 1 (dec! j)) (sort-comp L -3 -1))  ; while P < a[j]
         (when (< j i)  ; contradicts the line above
           (luaL_error L "invalid order function for sorting"))
         (lua_pop L 1))
@@ -200,7 +200,7 @@
   (return 0))
 
 ; A pivot in the middle half of [lo,up], "randomized" by 'rnd'.
-(defn- choosePivot (lo:IdxT up:IdxT rnd:ui32):IdxT
+(defn- choose-pivot (lo:IdxT up:IdxT rnd:ui32):IdxT
   (let (r4:IdxT (/ (- up lo) 4))
     (return (+ (% (bit-xor rnd lo up) (* r4 2)) (+ lo r4)))))
 
@@ -211,21 +211,21 @@
       ; sort a[lo], a[p] and a[up]
       (geti L 1 lo)
       (geti L 1 up)
-      (if (sort_comp L -1 -2)  ; a[up] < a[lo]?
+      (if (sort-comp L -1 -2)  ; a[up] < a[lo]?
         (set2 L lo up)
         (lua_pop L 2))
       (when (= (- up lo) 1)  ; two elements: sorted
         (return))
       (if (or (< (- up lo) RANLIMIT) (= rnd 0))
         (set! p (/ (+ lo up) 2))  ; the middle is a good pivot
-        (set! p (choosePivot lo up rnd)))  ; a large interval: randomize
+        (set! p (choose-pivot lo up rnd)))  ; a large interval: randomize
       (geti L 1 p)
       (geti L 1 lo)
-      (if (sort_comp L -2 -1)  ; a[p] < a[lo]?
+      (if (sort-comp L -2 -1)  ; a[p] < a[lo]?
         (set2 L p lo)
         (do (lua_pop L 1)  ; a[lo]
             (geti L 1 up)
-            (if (sort_comp L -1 -2)  ; a[up] < a[p]?
+            (if (sort-comp L -1 -2)  ; a[up] < a[p]?
               (set2 L p up)
               (lua_pop L 2))))
       (when (= (- up lo) 2)  ; three elements: sorted
@@ -247,7 +247,7 @@
         (set! rnd (luaL_makeseed L))))))  ; randomize from now on
 
 (defn- tsort (L:(ptr lua_State)):i32
-  (let (n:lua_Integer (aux_getn L 1 TAB_RW))
+  (let (n:lua_Integer (aux-getn L 1 TAB_RW))
     (when (> n 1)  ; anything to sort?
       (luaL_argcheck L (< n INT_MAX) 1 "array too big")
       (when (not (lua_isnoneornil L 2))

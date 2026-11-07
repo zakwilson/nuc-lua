@@ -19,6 +19,15 @@
 (import-use "string.h")
 (import-use lua.util)
 (import-use lua.core)
+(import-use lua.string)
+(import-use lua.state)
+(import-use lua.do)
+(import-use lua.table)
+(import-use lua.func)
+(import-use lua.gc)
+(import-use lua.mem)
+(import-use lua.object)
+(import-use lua.lex)
 (import-use lua.opcodes)
 (import-use lua.code)
 
@@ -67,78 +76,77 @@
 (defmacro set-vdf (v f x) `(set! ((~v 'vd) ~f) ~x))
 (defmacro varinreg (v) `(<= (vdf ~v 'kind) RDKTOCLOSE))
 (defmacro varglobal (v) `(>= (vdf ~v 'kind) GDKREG))
-(defmacro enterlevel (ls) `(luaE_incCstack (~ls 'L)))
+(defmacro enterlevel (ls) `(state-inc-cstack (~ls 'L)))
 (defmacro leavelevel (ls) `(set! ((~ls 'L) 'nCcalls) (- ((~ls 'L) 'nCcalls) 1)))
-(defmacro check_condition (ls c msg) `(when (not ~c) (luaX_syntaxerror ~ls ~msg)))
-(defmacro new_localvarliteral (ls s) `(new_localvar ~ls (luaX_newstring ~ls ~s (strlen ~s))))
+(defmacro check_condition (ls c msg) `(when (not ~c) (lex-syntaxerror ~ls ~msg)))
+(defmacro new_localvarliteral (ls s) `(new-localvar ~ls (lex-newstring ~ls ~s (strlen ~s))))
 (defmacro token (ls) `((~ls 't) 'token))
-(defmacro seminfo (ls f) `(((~ls 't) 'seminfo) ~f))
 (defmacro actvar (ls i) `(p+ (((~ls 'dyd) 'actvar) 'arr) ~i))
 (defmacro fs-bl (fs) `(unsafe/cast (ptr Block) (~fs 'bl)))
 (defmacro null? (p) `(= (as ptr ~p) null))
 
-(defn- error_expected (ls:(ptr LexState) tok:i32):void
-  (luaX_syntaxerror ls (luaO_pushfstring (ls 'L) "%s expected" (luaX_token2str ls tok))))
+(defn- error-expected (ls:(ptr LexState) tok:i32):void
+  (lex-syntaxerror ls (obj-pushfstring (ls 'L) "%s expected" (lex-token2str ls tok))))
 
 (defn- errorlimit (fs:(ptr FuncState) limit:i32 what:CStr):void
   (let (L:(ptr lua_State) ((fs 'ls) 'L)
         line:i32 ((fs 'f) 'linedefined)
-        where:CStr (if (= line 0) "main function" (cstr (luaO_pushfstring L "function at line %d" line))))
-    (luaX_syntaxerror (fs 'ls) (luaO_pushfstring L "too many %s (limit is %d) in %s" what limit where))))
+        where:CStr (if (= line 0) "main function" (cstr (obj-pushfstring L "function at line %d" line))))
+    (lex-syntaxerror (fs 'ls) (obj-pushfstring L "too many %s (limit is %d) in %s" what limit where))))
 
-(defn luaY_checklimit (fs:(ptr FuncState) v:i32 l:i32 what:CStr):void
+(defn parser-checklimit (fs:(ptr FuncState) v:i32 l:i32 what:CStr):void
   (when (> v l)
     (errorlimit fs l what)))
 
 ; Skips the next token if it is 'c'.
 (defn- testnext (ls:(ptr LexState) c:i32):bool
   (when (= (token ls) c)
-    (luaX_next ls)
+    (lex-next ls)
     (return true))
   (return false))
 
 (defn- check (ls:(ptr LexState) c:i32):void
   (when (!= (token ls) c)
-    (error_expected ls c)))
+    (error-expected ls c)))
 
 (defn- checknext (ls:(ptr LexState) c:i32):void
   (check ls c)
-  (luaX_next ls))
+  (lex-next ls))
 
 ; Skips 'what', else complains it should close 'who' from line 'where'.
-(defn- check_match (ls:(ptr LexState) what:i32 who:i32 where:i32):void
+(defn- check-match (ls:(ptr LexState) what:i32 who:i32 where:i32):void
   (when (not (testnext ls what))
     (if (= where (ls 'linenumber))  ; all on one line: a simple message
-      (error_expected ls what)
-      (luaX_syntaxerror ls (luaO_pushfstring (ls 'L) "%s expected (to close %s at line %d)"
-                                             (luaX_token2str ls what) (luaX_token2str ls who) where)))))
+      (error-expected ls what)
+      (lex-syntaxerror ls (obj-pushfstring (ls 'L) "%s expected (to close %s at line %d)"
+                                             (lex-token2str ls what) (lex-token2str ls who) where)))))
 
-(defn- str_checkname (ls:(ptr LexState)):(ptr TString)
+(defn- str-checkname (ls:(ptr LexState)):(ptr TString)
   (check ls TK_NAME)
   (let (ts:(ptr TString) (seminfo ls 'ts))
-    (luaX_next ls)
+    (lex-next ls)
     (return ts)))
 
-(defn- init_exp (e:(ptr expdesc) k:expkind i:i32):void
+(defn- init-exp (e:(ptr expdesc) k:expkind i:i32):void
   (set! (e 'f) NO_JUMP)
   (set! (e 't) NO_JUMP)
   (set! (e 'k) k)
-  (set-u e 'info i))
+  (set-exp-u e 'info i))
 
 (defn- codestring (e:(ptr expdesc) s:(ptr TString)):void
   (set! (e 'f) NO_JUMP)
   (set! (e 't) NO_JUMP)
   (set! (e 'k) VKSTR)
-  (set-u e 'strval s))
+  (set-exp-u e 'strval s))
 
 (defn- codename (ls:(ptr LexState) e:(ptr expdesc)):void
-  (codestring e (str_checkname ls)))
+  (codestring e (str-checkname ls)))
 
 ; A local variable's debug information.
 (defn- registerlocalvar (ls:(ptr LexState) fs:(ptr FuncState) varname:(ptr TString)):i16
   (let (f:(ptr Proto) (fs 'f)
         oldsize:i32 (f 'sizelocvars))
-    (luaM_growvector (ls 'L) (f 'locvars) (as i32 (fs 'ndebugvars)) (f 'sizelocvars)
+    (mem-growvector (ls 'L) (f 'locvars) (as i32 (fs 'ndebugvars)) (f 'sizelocvars)
                      LocVar SHRT_MAX "local variables")
     (while (< oldsize (f 'sizelocvars))
       (set! ((p+ (f 'locvars) oldsize) 'varname) null)
@@ -146,16 +154,16 @@
     (let (lv:(ptr LocVar) (p+ (f 'locvars) (fs 'ndebugvars)))
       (set! (lv 'varname) varname)
       (set! (lv 'startpc) (fs 'pc)))
-    (luaC_objbarrier (ls 'L) f varname)
+    (gc-objbarrier (ls 'L) f varname)
     (let (n:i16 (fs 'ndebugvars))
       (set! (fs 'ndebugvars) (cast_short (+ (as i32 n) 1)))
       (return n))))
 
 ; A new variable of 'kind'; its index in the function.
-(defn- new_varkind (ls:(ptr LexState) name:(ptr TString) kind:ui8):i32
+(defn- new-varkind (ls:(ptr LexState) name:(ptr TString) kind:ui8):i32
   (let (fs:(ptr FuncState) (ls 'fs)
         dyd:(ptr Dyndata) (ls 'dyd))
-    (luaM_growvector (ls 'L) ((dyd 'actvar) 'arr) (+ ((dyd 'actvar) 'n) 1) ((dyd 'actvar) 'size)
+    (mem-growvector (ls 'L) ((dyd 'actvar) 'arr) (+ ((dyd 'actvar) 'n) 1) ((dyd 'actvar) 'size)
                      Vardesc SHRT_MAX "variable declarations")
     (let (var:(ptr Vardesc) (p+ ((dyd 'actvar) 'arr) ((dyd 'actvar) 'n)))
       (set! ((dyd 'actvar) 'n) (+ ((dyd 'actvar) 'n) 1))
@@ -163,8 +171,8 @@
       (set-vdf var 'name name)
       (return (- (- ((dyd 'actvar) 'n) 1) (fs 'firstlocal))))))
 
-(defn- new_localvar (ls:(ptr LexState) name:(ptr TString)):i32
-  (return (new_varkind ls name VDKREG)))
+(defn- new-localvar (ls:(ptr LexState) name:(ptr TString)):i32
+  (return (new-varkind ls name VDKREG)))
 
 ; Variables are named by their compiler indices unless noted.
 (defn- getlocalvardesc (fs:(ptr FuncState) vidx:i32):(ptr Vardesc)
@@ -180,7 +188,7 @@
   (return 0))
 
 ; How many variables the function keeps in its register stack.
-(defn luaY_nvarstack (fs:(ptr FuncState)):ui8
+(defn parser-nvarstack (fs:(ptr FuncState)):ui8
   (return (reglevel fs (as i32 (fs 'nactvar)))))
 
 ; Constants have no debug information.
@@ -190,42 +198,42 @@
       (return null)
       (return (p+ ((fs 'f) 'locvars) (vdf vd 'pidx))))))
 
-(defn- init_var (fs:(ptr FuncState) e:(ptr expdesc) vidx:i32):void
+(defn- init-var (fs:(ptr FuncState) e:(ptr expdesc) vidx:i32):void
   (set! (e 'f) NO_JUMP)
   (set! (e 't) NO_JUMP)
   (set! (e 'k) VLOCAL)
-  (set-uvar e 'vidx (cast_short vidx))
-  (set-uvar e 'ridx (vdf (getlocalvardesc fs vidx) 'ridx)))
+  (set-exp-var e 'vidx (cast_short vidx))
+  (set-exp-var e 'ridx (vdf (getlocalvardesc fs vidx) 'ridx)))
 
 ; A store to a read-only variable is an error. A store into the vararg
 ; parameter makes it a real table: a virtual one can't change.
-(defn- check_readonly (ls:(ptr LexState) e:(ptr expdesc)):void
+(defn- check-readonly (ls:(ptr LexState) e:(ptr expdesc)):void
   (let (fs:(ptr FuncState) (ls 'fs)
         varname:(ptr TString) null)  ; set for a const
     (case (e 'k)
-      VCONST (set! varname (vdf (actvar ls (u e 'info)) 'name))
+      VCONST (set! varname (vdf (actvar ls (exp-u e 'info)) 'name))
       (:or VLOCAL VVARGVAR)
-        (let (vardesc:(ptr Vardesc) (getlocalvardesc fs (uvar e 'vidx)))
+        (let (vardesc:(ptr Vardesc) (getlocalvardesc fs (exp-var e 'vidx)))
           (when (!= (vdf vardesc 'kind) VDKREG)  ; not a regular variable?
             (set! varname (vdf vardesc 'name))))
       VUPVAL
-        (let (up:(ptr Upvaldesc) (p+ ((fs 'f) 'upvalues) (u e 'info)))
+        (let (up:(ptr Upvaldesc) (p+ ((fs 'f) 'upvalues) (exp-u e 'info)))
           (when (!= (up 'kind) VDKREG)
             (set! varname (up 'name))))
       (:or VVARGIND VINDEXUP VINDEXSTR VINDEXED)  ; a global
         (do (when (= (e 'k) VVARGIND)
               (needvatab (fs 'f))
               (set! (e 'k) VINDEXED))
-            (when (!= (ind e 'ro) 0)
-              (set! varname (tsvalue (p+ ((fs 'f) 'k) (ind e 'keystr))))))
+            (when (!= (exp-ind e 'ro) 0)
+              (set! varname (tsvalue (p+ ((fs 'f) 'k) (exp-ind e 'keystr))))))
       (return))  ; VINDEXI: an integer index is never read-only
     (when (not (null? varname))
-      (luaK_semerror ls "attempt to assign to const variable '%s'" (getstr varname)))))
+      (code-semerror ls "attempt to assign to const variable '%s'" (getstr varname)))))
 
 ; Starts the scope of the last 'nvars' variables created.
 (defn- adjustlocalvars (ls:(ptr LexState) nvars:i32):void
   (let (fs:(ptr FuncState) (ls 'fs)
-        rl:i32 (as i32 (luaY_nvarstack fs)))
+        rl:i32 (as i32 (parser-nvarstack fs)))
     (for (i:i32 0) (< i nvars) (inc! i)
       (let (vidx:i32 (fs 'nactvar))
         (set! (fs 'nactvar) (cast_short (+ vidx 1)))
@@ -233,7 +241,7 @@
           (set-vdf var 'ridx (cast_uchar rl))
           (set! rl (+ rl 1))
           (set-vdf var 'pidx (registerlocalvar ls fs (vdf var 'name)))
-          (luaY_checklimit fs rl MAXVARS "local variables"))))))
+          (parser-checklimit fs rl MAXVARS "local variables"))))))
 
 ; Closes the scope of the variables down to 'tolevel' (debug information).
 (defn- removevars (fs:(ptr FuncState) tolevel:i32):void
@@ -255,8 +263,8 @@
 (defn- allocupvalue (fs:(ptr FuncState)):(ptr Upvaldesc)
   (let (f:(ptr Proto) (fs 'f)
         oldsize:i32 (f 'sizeupvalues))
-    (luaY_checklimit fs (+ (as i32 (fs 'nups)) 1) MAXUPVAL "upvalues")
-    (luaM_growvector ((fs 'ls) 'L) (f 'upvalues) (as i32 (fs 'nups)) (f 'sizeupvalues)
+    (parser-checklimit fs (+ (as i32 (fs 'nups)) 1) MAXUPVAL "upvalues")
+    (mem-growvector ((fs 'ls) 'L) (f 'upvalues) (as i32 (fs 'nups)) (f 'sizeupvalues)
                      Upvaldesc MAXUPVAL "upvalues")
     (while (< oldsize (f 'sizeupvalues))
       (set! ((p+ (f 'upvalues) oldsize) 'name) null)
@@ -270,13 +278,13 @@
         prev:(ptr FuncState) (fs 'prev))
     (if (= (v 'k) VLOCAL)
       (do (set! (up 'instack) 1)
-          (set! (up 'idx) (uvar v 'ridx))
-          (set! (up 'kind) (vdf (getlocalvardesc prev (uvar v 'vidx)) 'kind)))
+          (set! (up 'idx) (exp-var v 'ridx))
+          (set! (up 'kind) (vdf (getlocalvardesc prev (exp-var v 'vidx)) 'kind)))
       (do (set! (up 'instack) 0)
-          (set! (up 'idx) (cast_uchar (u v 'info)))
-          (set! (up 'kind) ((p+ ((prev 'f) 'upvalues) (u v 'info)) 'kind))))
+          (set! (up 'idx) (cast_uchar (exp-u v 'info)))
+          (set! (up 'kind) ((p+ ((prev 'f) 'upvalues) (exp-u v 'info)) 'kind))))
     (set! (up 'name) name)
-    (luaC_objbarrier ((fs 'ls) 'L) (fs 'f) name)
+    (gc-objbarrier ((fs 'ls) 'L) (fs 'f) name)
     (return (- (as i32 (fs 'nups)) 1))))
 
 ; Looks for an active variable named 'n'; its kind, or -1. On the way,
@@ -289,17 +297,17 @@
       (let (vd:(ptr Vardesc) (getlocalvardesc fs i))
         (if (varglobal vd)
           (if (null? (vdf vd 'name))  ; a collective declaration
-            (when (< (u var 'info) 0)  ; the first one found
-              (set-u var 'info (+ (fs 'firstlocal) i)))
+            (when (< (exp-u var 'info) 0)  ; the first one found
+              (set-exp-u var 'info (+ (fs 'firstlocal) i)))
             (cond (eqstr n (vdf vd 'name))
-                    (do (init_exp var VGLOBAL (+ (fs 'firstlocal) i))
+                    (do (init-exp var VGLOBAL (+ (fs 'firstlocal) i))
                         (return VGLOBAL))
-                  (= (u var 'info) -1)  ; the preambular declaration is active
-                    (set-u var 'info -2)))
+                  (= (exp-u var 'info) -1)  ; the preambular declaration is active
+                    (set-exp-u var 'info -2)))
           (when (eqstr n (vdf vd 'name))
             (if (= (vdf vd 'kind) RDKCTC)  ; a compile-time constant
-              (init_exp var VCONST (+ (fs 'firstlocal) i))
-              (do (init_var fs var i)
+              (init-exp var VCONST (+ (fs 'firstlocal) i))
+              (do (init-var fs var i)
                   (when (= (vdf vd 'kind) RDKVAVAR)
                     (set! (var 'k) VVARGVAR))))
             (return (cast_int (var 'k))))))
@@ -326,9 +334,9 @@
   (if (>= (searchvar fs n var) 0)
     (when (= base 0)
       (when (= (var 'k) VVARGVAR)
-        (luaK_vapar2local fs var))  ; it becomes a plain local
+        (code-vapar2local fs var))  ; it becomes a plain local
       (when (= (var 'k) VLOCAL)
-        (markupval fs (uvar var 'vidx))))  ; used as an upvalue
+        (markupval fs (exp-var var 'vidx))))  ; used as an upvalue
     (let (idx:i32 (searchupvalue fs n))
       (when (< idx 0)
         (when (not (null? (fs 'prev)))
@@ -336,56 +344,56 @@
         (if (or (= (var 'k) VLOCAL) (= (var 'k) VUPVAL))
           (set! idx (newupvalue fs n var))
           (return)))  ; a global or a constant: nothing to do at this level
-      (init_exp var VUPVAL idx))))
+      (init-exp var VUPVAL idx))))
 
 ; _ENV[varname].
 (defn- buildglobal (ls:(ptr LexState) varname:(ptr TString) var:(ptr expdesc)):void
   (let (fs:(ptr FuncState) (ls 'fs)
         key:(ptr expdesc) (alloca expdesc))
-    (init_exp var VGLOBAL -1)
+    (init-exp var VGLOBAL -1)
     (singlevaraux fs (ls 'envn) var 1)
     (when (= (var 'k) VGLOBAL)
-      (luaK_semerror ls "%s is global when accessing variable '%s'" LUA_ENV (getstr varname)))
-    (luaK_exp2anyregup fs var)  ; _ENV could be a constant
+      (code-semerror ls "%s is global when accessing variable '%s'" LUA_ENV (getstr varname)))
+    (code-exp2anyregup fs var)  ; _ENV could be a constant
     (codestring key varname)
-    (luaK_indexed fs var key)))
+    (code-indexed fs var key)))
 
 (defn- buildvar (ls:(ptr LexState) varname:(ptr TString) var:(ptr expdesc)):void
-  (init_exp var VGLOBAL -1)
+  (init-exp var VGLOBAL -1)
   (singlevaraux (ls 'fs) varname var 1)
   (when (= (var 'k) VGLOBAL)
-    (let (info:i32 (u var 'info))
+    (let (info:i32 (exp-u var 'info))
       (when (= info -2)  ; in a global declaration's scope, undeclared
-        (luaK_semerror ls "variable '%s' not declared" (getstr varname)))
+        (code-semerror ls "variable '%s' not declared" (getstr varname)))
       (buildglobal ls varname var)
       (when (and (!= info -1) (= (vdf (actvar ls info) 'kind) GDKCONST))
-        (set-ind var 'ro 1)))))
+        (set-exp-ind var 'ro 1)))))
 
 (defn- singlevar (ls:(ptr LexState) var:(ptr expdesc)):void
-  (buildvar ls (str_checkname ls) var))
+  (buildvar ls (str-checkname ls) var))
 
 ; 'nexps' expressions, the last in 'e', adjusted to 'nvars' values.
-(defn- adjust_assign (ls:(ptr LexState) nvars:i32 nexps:i32 e:(ptr expdesc)):void
+(defn- adjust-assign (ls:(ptr LexState) nvars:i32 nexps:i32 e:(ptr expdesc)):void
   (let (fs:(ptr FuncState) (ls 'fs)
         needed:i32 (- nvars nexps))
-    (luaK_checkstack fs needed)
+    (code-checkstack fs needed)
     (if (hasmultret (e 'k))
       (let (extra:i32 (+ needed 1))  ; the last expression counts itself
         (when (< extra 0)
           (set! extra 0))
-        (luaK_setreturns fs e extra))
+        (code-setreturns fs e extra))
       (do (when (!= (e 'k) VVOID)
-            (luaK_exp2nextreg fs e))
+            (code-exp2nextreg fs e))
           (when (> needed 0)
-            (luaK_nil fs (as i32 (fs 'freereg)) needed))))
+            (code-nil fs (as i32 (fs 'freereg)) needed))))
     (if (> needed 0)
-      (luaK_reserveregs fs needed)
+      (code-reserveregs fs needed)
       (set! (fs 'freereg) (cast_uchar (+ (as i32 (fs 'freereg)) needed))))))
 
 (defn- jumpscopeerror (ls:(ptr LexState) gt:(ptr Labeldesc)):void
   (let (tsname:(ptr TString) (vdf (getlocalvardesc (ls 'fs) (gt 'nactvar)) 'name)
         varname:CStr (if (null? tsname) "*" (cstr (getstr tsname))))
-    (luaK_semerror ls "<goto %s> at line %d jumps into the scope of '%s'"
+    (code-semerror ls "<goto %s> at line %d jumps into the scope of '%s'"
                    (getstr (gt 'name)) (gt 'line) varname)))
 
 ; Resolves goto 'g' to 'label' and drops it from the pending list. It needs a
@@ -403,7 +411,7 @@
         (set! (deref (code-at fs (+ (gt 'pc) 1))) (deref (code-at fs (gt 'pc))))
         (set! (deref (code-at fs (gt 'pc))) (CREATE_ABCk OP_CLOSE stklevel 0 0 0))
         (set! (gt 'pc) (+ (gt 'pc) 1))))
-    (luaK_patchlist (ls 'fs) (gt 'pc) (lb 'pc))
+    (code-patchlist (ls 'fs) (gt 'pc) (lb 'pc))
     (for (i:i32 g) (< i (- (gl 'n) 1)) (inc! i)
       (memcpy (p+ (gl 'arr) i) (p+ (gl 'arr) (+ i 1)) (sizeof Labeldesc)))
     (set! (gl 'n) (- (gl 'n) 1))))
@@ -420,7 +428,7 @@
 
 (defn- newlabelentry (ls:(ptr LexState) l:(ptr Labellist) name:(ptr TString) line:i32 pc:i32):i32
   (let (n:i32 (l 'n))
-    (luaM_growvector (ls 'L) (l 'arr) n (l 'size) Labeldesc SHRT_MAX "labels/gotos")
+    (mem-growvector (ls 'L) (l 'arr) n (l 'size) Labeldesc SHRT_MAX "labels/gotos")
     (let (lb:(ptr Labeldesc) (p+ (l 'arr) n))
       (set! (lb 'name) name)
       (set! (lb 'line) line)
@@ -434,15 +442,15 @@
 ; the CLOSE, the two swap.
 (defn- newgotoentry (ls:(ptr LexState) name:(ptr TString) line:i32):i32
   (let (fs:(ptr FuncState) (ls 'fs)
-        pc:i32 (luaK_jump fs))
-    (luaK_codeABC fs OP_CLOSE 0 1 0)
+        pc:i32 (code-jump fs))
+    (code-abc fs OP_CLOSE 0 1 0)
     (return (newlabelentry ls (ref ((ls 'dyd) 'gt)) name line pc))))
 
 ; 'last': the label is its block's last non-op statement.
 (defn- createlabel (ls:(ptr LexState) name:(ptr TString) line:i32 last:i32):void
   (let (fs:(ptr FuncState) (ls 'fs)
         ll:(ptr Labellist) (ref ((ls 'dyd) 'label))
-        l:i32 (newlabelentry ls ll name line (luaK_getlabel fs)))
+        l:i32 (newlabelentry ls ll name line (code-getlabel fs)))
     (when (!= last 0)  ; the locals are out of scope already
       (set! ((p+ (ll 'arr) l) 'nactvar) ((fs-bl fs) 'nactvar)))))
 
@@ -475,14 +483,14 @@
   (set! (fs 'bl) (unsafe/cast (ptr BlockCnt) bl)))
 
 (defn- undefgoto (ls:(ptr LexState) gt:(ptr Labeldesc)):void
-  (luaK_semerror ls "no visible label '%s' for <goto> at line %d" (getstr (gt 'name)) (gt 'line)))
+  (code-semerror ls "no visible label '%s' for <goto> at line %d" (getstr (gt 'name)) (gt 'line)))
 
 (defn- leaveblock (fs:(ptr FuncState)):void
   (let (bl:(ptr Block) (fs-bl fs)
         ls:(ptr LexState) (fs 'ls)
         stklevel:ui8 (reglevel fs (bl 'nactvar)))  ; the level outside the block
     (when (and (not (null? (bl 'previous))) (!= (bl 'upval) 0))
-      (luaK_codeABC fs OP_CLOSE stklevel 0 0))
+      (code-abc fs OP_CLOSE stklevel 0 0))
     (set! (fs 'freereg) stklevel)
     (removevars fs (bl 'nactvar))
     (when (= (bl 'isloop) 2)  ; pending breaks
@@ -499,24 +507,24 @@
         f:(ptr Proto) (fs 'f))
     (when (>= (fs 'np) (f 'sizep))
       (let (oldsize:i32 (f 'sizep))
-        (luaM_growvector L (f 'p) (fs 'np) (f 'sizep) (ptr Proto) MAXARG_Bx "functions")
+        (mem-growvector L (f 'p) (fs 'np) (f 'sizep) (ptr Proto) MAXARG_Bx "functions")
         (while (< oldsize (f 'sizep))
           (set! (deref (p+ (f 'p) oldsize)) null)
           (set! oldsize (+ oldsize 1)))))
-    (let (clp:(ptr Proto) (luaF_newproto L))
+    (let (clp:(ptr Proto) (func-newproto L))
       (set! (deref (p+ (f 'p) (fs 'np))) clp)
       (set! (fs 'np) (+ (fs 'np) 1))
-      (luaC_objbarrier L f clp)
+      (gc-objbarrier L f clp)
       (return clp))))
 
 ; OP_CLOSURE takes the last register, so a collection it causes sees which
 ; registers are in use.
 (defn- codeclosure (ls:(ptr LexState) v:(ptr expdesc)):void
   (let (fs:(ptr FuncState) ((ls 'fs) 'prev))
-    (init_exp v VRELOC (luaK_codeABx fs OP_CLOSURE 0 (- (fs 'np) 1)))
-    (luaK_exp2nextreg fs v)))
+    (init-exp v VRELOC (code-abx fs OP_CLOSURE 0 (- (fs 'np) 1)))
+    (code-exp2nextreg fs v)))
 
-(defn- open_func (ls:(ptr LexState) fs:(ptr FuncState) bl:(ptr Block)):void
+(defn- open-func (ls:(ptr LexState) fs:(ptr FuncState) bl:(ptr Block)):void
   (let (L:(ptr lua_State) (ls 'L)
         f:(ptr Proto) (fs 'f))
     (set! (fs 'prev) (ls 'fs))
@@ -538,45 +546,45 @@
     (set! (fs 'firstlabel) (((ls 'dyd) 'label) 'n))
     (set! (fs 'bl) null)
     (set! (f 'source) (ls 'source))
-    (luaC_objbarrier L f (f 'source))
+    (gc-objbarrier L f (f 'source))
     (set! (f 'maxstacksize) 2)  ; registers 0 and 1 are always valid
-    (set! (fs 'kcache) (luaH_new L))
-    (luaD_anchorobj L (ls 'h) (obj2gco (fs 'kcache)))
+    (set! (fs 'kcache) (table-new L))
+    (do-anchorobj L (ls 'h) (obj2gco (fs 'kcache)))
     (enterblock fs bl 0)))
 
-(defn- close_func (ls:(ptr LexState)):void
+(defn- close-func (ls:(ptr LexState)):void
   (let (L:(ptr lua_State) (ls 'L)
         fs:(ptr FuncState) (ls 'fs)
         f:(ptr Proto) (fs 'f)
         temp:(ptr TValue) (alloca TValue))
-    (luaK_ret fs (as i32 (luaY_nvarstack fs)) 0)  ; the final return
+    (code-ret fs (as i32 (parser-nvarstack fs)) 0)  ; the final return
     (leaveblock fs)
-    (luaK_finish fs)
-    (luaM_shrinkvector L (f 'code) (f 'sizecode) (fs 'pc) Instruction)
-    (luaM_shrinkvector L (f 'lineinfo) (f 'sizelineinfo) (fs 'pc) ls_byte)
-    (luaM_shrinkvector L (f 'abslineinfo) (f 'sizeabslineinfo) (fs 'nabslineinfo) AbsLineInfo)
-    (luaM_shrinkvector L (f 'k) (f 'sizek) (fs 'nk) TValue)
-    (luaM_shrinkvector L (f 'p) (f 'sizep) (fs 'np) (ptr Proto))
-    (luaM_shrinkvector L (f 'locvars) (f 'sizelocvars) (as i32 (fs 'ndebugvars)) LocVar)
-    (luaM_shrinkvector L (f 'upvalues) (f 'sizeupvalues) (as i32 (fs 'nups)) Upvaldesc)
+    (code-finish fs)
+    (mem-shrinkvector L (f 'code) (f 'sizecode) (fs 'pc) Instruction)
+    (mem-shrinkvector L (f 'lineinfo) (f 'sizelineinfo) (fs 'pc) ls_byte)
+    (mem-shrinkvector L (f 'abslineinfo) (f 'sizeabslineinfo) (fs 'nabslineinfo) AbsLineInfo)
+    (mem-shrinkvector L (f 'k) (f 'sizek) (fs 'nk) TValue)
+    (mem-shrinkvector L (f 'p) (f 'sizep) (fs 'np) (ptr Proto))
+    (mem-shrinkvector L (f 'locvars) (f 'sizelocvars) (as i32 (fs 'ndebugvars)) LocVar)
+    (mem-shrinkvector L (f 'upvalues) (f 'sizeupvalues) (as i32 (fs 'nups)) Upvaldesc)
     ; the kcache leaves the scanner table, its anchor "weighed"
     (sethvalue L temp (fs 'kcache))
-    (luaH_set L (ls 'h) temp (ref ((G L) 'nilvalue)))
+    (table-set L (ls 'h) temp (ref ((G L) 'nilvalue)))
     (set! (ls 'fs) (fs 'prev))
-    (luaC_checkGC L)))
+    (gc-check L)))
 
 ; ---- grammar rules ----
 
 ; Whether the token follows a block. 'until' closes a block but not a
 ; scope, so it counts only when asked.
-(defn- block_follow (ls:(ptr LexState) withuntil:i32):bool
+(defn- block-follow (ls:(ptr LexState) withuntil:i32):bool
   (case (token ls)
     (:or TK_ELSE TK_ELSEIF TK_END TK_EOS) (return true)
     TK_UNTIL (return (!= withuntil 0))
     (return false)))
 
 (defn- statlist (ls:(ptr LexState)):void
-  (while (not (block_follow ls 1))
+  (while (not (block-follow ls 1))
     (when (= (token ls) TK_RETURN)
       (statement ls)
       (return))  ; 'return' is the last statement
@@ -586,16 +594,16 @@
 (defn- fieldsel (ls:(ptr LexState) v:(ptr expdesc)):void
   (let (fs:(ptr FuncState) (ls 'fs)
         key:(ptr expdesc) (alloca expdesc))
-    (luaK_exp2anyregup fs v)
-    (luaX_next ls)  ; the dot or colon
+    (code-exp2anyregup fs v)
+    (lex-next ls)  ; the dot or colon
     (codename ls key)
-    (luaK_indexed fs v key)))
+    (code-indexed fs v key)))
 
 ; '[' expr ']'
 (defn- yindex (ls:(ptr LexState) v:(ptr expdesc)):void
-  (luaX_next ls)
+  (lex-next ls)
   (expr ls v)
-  (luaK_exp2val (ls 'fs) v)
+  (code-exp2val (ls 'fs) v)
   (checknext ls (ch \])))
 
 ; ---- constructors ----
@@ -613,16 +621,16 @@
     (set! (cc 'nh) (+ (cc 'nh) 1))
     (checknext ls (ch \=))
     (copy-exp tab (cc 't))
-    (luaK_indexed fs tab key)
+    (code-indexed fs tab key)
     (expr ls val)
-    (luaK_storevar fs tab val)
+    (code-storevar fs tab val)
     (set! (fs 'freereg) reg)))
 
 (defn- closelistfield (fs:(ptr FuncState) cc:(ptr ConsControl)):void
-  (luaK_exp2nextreg fs (ref (cc 'v)))
+  (code-exp2nextreg fs (ref (cc 'v)))
   (set! ((cc 'v) 'k) VVOID)
   (when (>= (cc 'tostore) (cc 'maxtostore))
-    (luaK_setlist fs (u (cc 't) 'info) (cc 'na) (cc 'tostore))  ; flush
+    (code-setlist fs (exp-u (cc 't) 'info) (cc 'na) (cc 'tostore))  ; flush
     (set! (cc 'na) (+ (cc 'na) (cc 'tostore)))
     (set! (cc 'tostore) 0)))
 
@@ -630,12 +638,12 @@
   (when (= (cc 'tostore) 0)
     (return))
   (if (hasmultret ((cc 'v) 'k))
-    (do (luaK_setmultret fs (ref (cc 'v)))
-        (luaK_setlist fs (u (cc 't) 'info) (cc 'na) LUA_MULTRET)
+    (do (code-setmultret fs (ref (cc 'v)))
+        (code-setlist fs (exp-u (cc 't) 'info) (cc 'na) LUA_MULTRET)
         (set! (cc 'na) (- (cc 'na) 1)))  ; the last one's count is unknown
     (do (when (!= ((cc 'v) 'k) VVOID)
-          (luaK_exp2nextreg fs (ref (cc 'v))))
-        (luaK_setlist fs (u (cc 't) 'info) (cc 'na) (cc 'tostore))))
+          (code-exp2nextreg fs (ref (cc 'v))))
+        (code-setlist fs (exp-u (cc 't) 'info) (cc 'na) (cc 'tostore))))
   (set! (cc 'na) (+ (cc 'na) (cc 'tostore))))
 
 (defn- listfield (ls:(ptr LexState) cc:(ptr ConsControl)):void
@@ -645,7 +653,7 @@
 ; listfield | recfield. C calls it 'field', a special form here.
 (defn- fieldexp (ls:(ptr LexState) cc:(ptr ConsControl)):void
   (case (token ls)
-    TK_NAME (if (!= (luaX_lookahead ls) (ch \=))  ; an expression?
+    TK_NAME (if (!= (lex-lookahead ls) (ch \=))  ; an expression?
               (listfield ls cc)
               (recfield ls cc))
     (ch \[) (recfield ls cc)
@@ -661,17 +669,17 @@
 (defn- constructor (ls:(ptr LexState) t:(ptr expdesc)):void
   (let (fs:(ptr FuncState) (ls 'fs)
         line:i32 (ls 'linenumber)
-        pc:i32 (luaK_codevABCk fs OP_NEWTABLE 0 0 0 0)
+        pc:i32 (code-vabck fs OP_NEWTABLE 0 0 0 0)
         cc:(ptr ConsControl) (alloca ConsControl)
         more:bool true)
-    (luaK_code fs 0)  ; space for the extra argument
+    (code-instruction fs 0)  ; space for the extra argument
     (set! (cc 'na) 0)
     (set! (cc 'nh) 0)
     (set! (cc 'tostore) 0)
     (set! (cc 't) t)
-    (init_exp t VNONRELOC (as i32 (fs 'freereg)))  ; the table on top
-    (luaK_reserveregs fs 1)
-    (init_exp (ref (cc 'v)) VVOID 0)
+    (init-exp t VNONRELOC (as i32 (fs 'freereg)))  ; the table on top
+    (code-reserveregs fs 1)
+    (init-exp (ref (cc 'v)) VVOID 0)
     (checknext ls (ch \{))
     (set! (cc 'maxtostore) (maxtostore fs))
     (while more
@@ -680,15 +688,15 @@
         (do (when (!= ((cc 'v) 'k) VVOID)  ; close the previous item
               (closelistfield fs cc))
             (fieldexp ls cc)
-            (luaY_checklimit fs (+ (+ (cc 'tostore) (cc 'na)) (cc 'nh)) MAX_CNST "items in a constructor")
+            (parser-checklimit fs (+ (+ (cc 'tostore) (cc 'na)) (cc 'nh)) MAX_CNST "items in a constructor")
             (set! more (or (testnext ls COMMA) (testnext ls SEMI))))))
-    (check_match ls (ch \}) (ch \{) line)
+    (check-match ls (ch \}) (ch \{) line)
     (lastlistfield fs cc)
-    (luaK_settablesize fs pc (u t 'info) (cc 'na) (cc 'nh))))
+    (code-settablesize fs pc (exp-u t 'info) (cc 'na) (cc 'nh))))
 
 (defn- setvararg (fs:(ptr FuncState)):void
   (set! ((fs 'f) 'flag) (cast_uchar (bit-or ((fs 'f) 'flag) PF_VAHID)))  ; hidden by default
-  (luaK_codeABC fs OP_VARARGPREP 0 0 0))
+  (code-abc fs OP_VARARGPREP 0 0 0))
 
 ; [ {NAME ','} (NAME | '...') ]
 (defn- parlist (ls:(ptr LexState)):void
@@ -700,21 +708,21 @@
     (when (!= (token ls) RPAREN)
       (while more
         (case (token ls)
-          TK_NAME (do (new_localvar ls (str_checkname ls))
+          TK_NAME (do (new-localvar ls (str-checkname ls))
                       (set! nparams (+ nparams 1)))
           TK_DOTS (do (set! varargk true)
-                      (luaX_next ls)
+                      (lex-next ls)
                       (if (= (token ls) TK_NAME)
-                        (new_varkind ls (str_checkname ls) RDKVAVAR)
+                        (new-varkind ls (str-checkname ls) RDKVAVAR)
                         (new_localvarliteral ls "(vararg table)")))
-          (luaX_syntaxerror ls "<name> or '...' expected"))
+          (lex-syntaxerror ls "<name> or '...' expected"))
         (set! more (and (not varargk) (testnext ls COMMA)))))
     (adjustlocalvars ls nparams)
     (set! (f 'numparams) (cast_uchar (fs 'nactvar)))
     (when varargk
       (setvararg fs)
       (adjustlocalvars ls 1))  ; the vararg parameter
-    (luaK_reserveregs fs (as i32 (fs 'nactvar)))))  ; parameters' registers
+    (code-reserveregs fs (as i32 (fs 'nactvar)))))  ; parameters' registers
 
 ; '(' parlist ')' block END
 (defn- body (ls:(ptr LexState) e:(ptr expdesc) ismethod:i32 line:i32):void
@@ -722,7 +730,7 @@
         bl:(ptr Block) (alloca Block))
     (set! (new_fs 'f) (addprototype ls))
     (set! ((new_fs 'f) 'linedefined) line)
-    (open_func ls new_fs bl)
+    (open-func ls new_fs bl)
     (checknext ls LPAREN)
     (when (!= ismethod 0)
       (new_localvarliteral ls "self")
@@ -731,16 +739,16 @@
     (checknext ls RPAREN)
     (statlist ls)
     (set! ((new_fs 'f) 'lastlinedefined) (ls 'linenumber))
-    (check_match ls TK_END TK_FUNCTION line)
+    (check-match ls TK_END TK_FUNCTION line)
     (codeclosure ls e)
-    (close_func ls)))
+    (close-func ls)))
 
 ; expr { ',' expr }
 (defn- explist (ls:(ptr LexState) v:(ptr expdesc)):i32
   (let (n:i32 1)
     (expr ls v)
     (while (testnext ls COMMA)
-      (luaK_exp2nextreg (ls 'fs) v)
+      (code-exp2nextreg (ls 'fs) v)
       (expr ls v)
       (set! n (+ n 1)))
     (return n)))
@@ -751,27 +759,27 @@
         line:i32 (ls 'linenumber))
     (case (token ls)
       LPAREN
-        (do (luaX_next ls)
+        (do (lex-next ls)
             (if (= (token ls) RPAREN)  ; no arguments
               (set! (args 'k) VVOID)
               (do (explist ls args)
                   (when (hasmultret (args 'k))
-                    (luaK_setmultret fs args))))
-            (check_match ls RPAREN LPAREN line))
+                    (code-setmultret fs args))))
+            (check-match ls RPAREN LPAREN line))
       (ch \{) (constructor ls args)
       TK_STRING
         (do (codestring args (seminfo ls 'ts))
-            (luaX_next ls))  ; only after 'seminfo' is read
-      (do (luaX_syntaxerror ls "function arguments expected")
+            (lex-next ls))  ; only after 'seminfo' is read
+      (do (lex-syntaxerror ls "function arguments expected")
           (return)))
-    (let (base:i32 (u f 'info)  ; the call's base register
+    (let (base:i32 (exp-u f 'info)  ; the call's base register
           nparams:i32 LUA_MULTRET)  ; an open call
       (when (not (hasmultret (args 'k)))
         (when (!= (args 'k) VVOID)
-          (luaK_exp2nextreg fs args))  ; close the last argument
+          (code-exp2nextreg fs args))  ; close the last argument
         (set! nparams (- (as i32 (fs 'freereg)) (+ base 1))))
-      (init_exp f VCALL (luaK_codeABC fs OP_CALL base (+ nparams 1) 2))
-      (luaK_fixline fs line)
+      (init-exp f VCALL (code-abc fs OP_CALL base (+ nparams 1) 2))
+      (code-fixline fs line)
       ; the call leaves one result, unless changed later
       (set! (fs 'freereg) (cast_uchar (+ base 1))))))
 
@@ -782,12 +790,12 @@
   (case (token ls)
     LPAREN
       (let (line:i32 (ls 'linenumber))
-        (luaX_next ls)
+        (lex-next ls)
         (expr ls v)
-        (check_match ls RPAREN LPAREN line)
-        (luaK_dischargevars (ls 'fs) v))
+        (check-match ls RPAREN LPAREN line)
+        (code-dischargevars (ls 'fs) v))
     TK_NAME (singlevar ls v)
-    (luaX_syntaxerror ls "unexpected symbol")))
+    (lex-syntaxerror ls "unexpected symbol")))
 
 ; primaryexp { '.' NAME | '[' exp ']' | ':' NAME funcargs | funcargs }
 (defn- suffixedexp (ls:(ptr LexState) v:(ptr expdesc)):void
@@ -798,16 +806,16 @@
       (case (token ls)
         (ch \.) (fieldsel ls v)
         (ch \[)
-          (do (luaK_exp2anyregup fs v)
+          (do (code-exp2anyregup fs v)
               (yindex ls key)
-              (luaK_indexed fs v key))
+              (code-indexed fs v key))
         (ch \:)
-          (do (luaX_next ls)
+          (do (lex-next ls)
               (codename ls key)
-              (luaK_self fs v key)
+              (code-self fs v key)
               (funcargs ls v))
         (:or LPAREN TK_STRING (ch \{))
-          (do (luaK_exp2nextreg fs v)
+          (do (code-exp2nextreg fs v)
               (funcargs ls v))
         (return)))))
 
@@ -815,23 +823,23 @@
 ; | suffixedexp
 (defn- simpleexp (ls:(ptr LexState) v:(ptr expdesc)):void
   (case (token ls)
-    TK_FLT (do (init_exp v VKFLT 0) (set-u v 'nval (seminfo ls 'r)))
-    TK_INT (do (init_exp v VKINT 0) (set-u v 'ival (seminfo ls 'i)))
+    TK_FLT (do (init-exp v VKFLT 0) (set-exp-u v 'nval (seminfo ls 'r)))
+    TK_INT (do (init-exp v VKINT 0) (set-exp-u v 'ival (seminfo ls 'i)))
     TK_STRING (codestring v (seminfo ls 'ts))
-    TK_NIL (init_exp v VNIL 0)
-    TK_TRUE (init_exp v VTRUE 0)
-    TK_FALSE (init_exp v VFALSE 0)
+    TK_NIL (init-exp v VNIL 0)
+    TK_TRUE (init-exp v VTRUE 0)
+    TK_FALSE (init-exp v VFALSE 0)
     TK_DOTS
       (let (fs:(ptr FuncState) (ls 'fs))
         (check_condition ls (isvararg (fs 'f)) "cannot use '...' outside a vararg function")
-        (init_exp v VVARARG (luaK_codeABC fs OP_VARARG 0 ((fs 'f) 'numparams) 1)))
+        (init-exp v VVARARG (code-abc fs OP_VARARG 0 ((fs 'f) 'numparams) 1)))
     (ch \{) (do (constructor ls v) (return))
     TK_FUNCTION
-      (do (luaX_next ls)
+      (do (lex-next ls)
           (body ls v 0 (ls 'linenumber))
           (return))
     (do (suffixedexp ls v) (return)))
-  (luaX_next ls))
+  (lex-next ls))
 
 (defn- getunopr (op:i32):UnOpr
   (return (unsafe/cast UnOpr (case op
@@ -883,17 +891,17 @@
     (set! uop (getunopr (token ls)))
     (if (!= uop OPR_NOUNOPR)
       (let (line:i32 (ls 'linenumber))
-        (luaX_next ls)
+        (lex-next ls)
         (subexpr ls v UNARY_PRIORITY)
-        (luaK_prefix (ls 'fs) uop v line))
+        (code-prefix (ls 'fs) uop v line))
       (simpleexp ls v))
     (set! op (getbinopr (token ls)))
     (while (and (!= op OPR_NOBINOPR) (> (as i32 (aref priority-left (cast_int op))) limit))
       (let (line:i32 (ls 'linenumber))
-        (luaX_next ls)
-        (luaK_infix (ls 'fs) op v)
+        (lex-next ls)
+        (code-infix (ls 'fs) op v)
         (let (nextop:BinOpr (subexpr ls v2 (as i32 (aref priority-right (cast_int op)))))
-          (luaK_posfix (ls 'fs) op v v2 line)
+          (code-posfix (ls 'fs) op v v2 line)
           (set! op nextop))))
     (leavelevel ls)
     (return op)))
@@ -912,7 +920,7 @@
 
 ; In 'a, b = ...', an earlier table store may use the local or upvalue being
 ; assigned now; then it uses a copy saved first.
-(defn- check_conflict (ls:(ptr LexState) lh:(ptr LHS_assign) v:(ptr expdesc)):void
+(defn- check-conflict (ls:(ptr LexState) lh:(ptr LHS_assign) v:(ptr expdesc)):void
   (let (fs:(ptr FuncState) (ls 'fs)
         extra:ui8 (fs 'freereg)  ; where the copy goes
         conflict:bool false)
@@ -920,29 +928,29 @@
       (let (lv:(ptr expdesc) (ref (lh 'v)))
         (when (vkisindexed (lv 'k))  ; a store to a table field
           (if (= (lv 'k) VINDEXUP)  ; the table is an upvalue
-            (when (and (= (v 'k) VUPVAL) (= (as i32 (ind lv 't)) (u v 'info)))
+            (when (and (= (v 'k) VUPVAL) (= (as i32 (exp-ind lv 't)) (exp-u v 'info)))
               (set! conflict true)
               (set! (lv 'k) VINDEXSTR)
-              (set-ind lv 't extra))
-            (do (when (and (= (v 'k) VLOCAL) (= (ind lv 't) (uvar v 'ridx)))  ; the table is that local
+              (set-exp-ind lv 't extra))
+            (do (when (and (= (v 'k) VLOCAL) (= (exp-ind lv 't) (exp-var v 'ridx)))  ; the table is that local
                   (set! conflict true)
-                  (set-ind lv 't extra))
+                  (set-exp-ind lv 't extra))
                 (when (and (= (lv 'k) VINDEXED) (= (v 'k) VLOCAL)
-                           (= (as i32 (ind lv 'idx)) (as i32 (uvar v 'ridx))))  ; the key is
+                           (= (as i32 (exp-ind lv 'idx)) (as i32 (exp-var v 'ridx))))  ; the key is
                   (set! conflict true)
-                  (set-ind lv 'idx (as i16 extra)))))))
+                  (set-exp-ind lv 'idx (as i16 extra)))))))
       (set! lh (lh 'prev)))
     (when conflict
       (if (= (v 'k) VLOCAL)
-        (luaK_codeABC fs OP_MOVE extra (uvar v 'ridx) 0)
-        (luaK_codeABC fs OP_GETUPVAL extra (u v 'info) 0))
-      (luaK_reserveregs fs 1))))
+        (code-abc fs OP_MOVE extra (exp-var v 'ridx) 0)
+        (code-abc fs OP_GETUPVAL extra (exp-u v 'info) 0))
+      (code-reserveregs fs 1))))
 
 ; Stores the top register in 'var'.
 (defn- storevartop (fs:(ptr FuncState) var:(ptr expdesc)):void
   (let (e:(ptr expdesc) (alloca expdesc))
-    (init_exp e VNONRELOC (- (as i32 (fs 'freereg)) 1))
-    (luaK_storevar fs var e)))  ; which frees the register
+    (init-exp e VNONRELOC (- (as i32 (fs 'freereg)) 1))
+    (code-storevar fs var e)))  ; which frees the register
 
 ; The rest of a multiple assignment; the caller read the first variable.
 ; restassign -> ',' suffixedexp restassign | '=' explist
@@ -950,23 +958,23 @@
   (let (e:(ptr expdesc) (alloca expdesc)
         lv:(ptr expdesc) (ref (lh 'v)))
     (check_condition ls (vkisvar (lv 'k)) "syntax error")
-    (check_readonly ls lv)
+    (check-readonly ls lv)
     (if (testnext ls COMMA)
       (let (nv:(ptr LHS_assign) (alloca LHS_assign))
         (set! (nv 'prev) lh)
         (suffixedexp ls (ref (nv 'v)))
         (when (not (vkisindexed ((nv 'v) 'k)))
-          (check_conflict ls lh (ref (nv 'v))))
+          (check-conflict ls lh (ref (nv 'v))))
         (enterlevel ls)
         (restassign ls nv (+ nvars 1))
         (leavelevel ls))
       (do (checknext ls (ch \=))
           (let (nexps:i32 (explist ls e))
             (when (= nexps nvars)
-              (luaK_setoneret (ls 'fs) e)  ; close the last expression
-              (luaK_storevar (ls 'fs) lv e)
+              (code-setoneret (ls 'fs) e)  ; close the last expression
+              (code-storevar (ls 'fs) lv e)
               (return))
-            (adjust_assign ls nvars nexps e))))
+            (adjust-assign ls nvars nexps e))))
     (storevartop (ls 'fs) lv)))
 
 ; A condition: its false list. C calls it 'cond'.
@@ -975,11 +983,11 @@
     (expr ls v)
     (when (= (v 'k) VNIL)
       (set! (v 'k) VFALSE))  ; all 'falses' are equal here
-    (luaK_goiftrue (ls 'fs) v)
+    (code-goiftrue (ls 'fs) v)
     (return (v 'f))))
 
 (defn- gotostat (ls:(ptr LexState) line:i32):void
-  (newgotoentry ls (str_checkname ls) line))
+  (newgotoentry ls (str-checkname ls) line))
 
 ; 'goto break', in effect.
 (defn- breakstat (ls:(ptr LexState) line:i32):void
@@ -987,15 +995,15 @@
     (while (and (not (null? bl)) (= (bl 'isloop) 0))  ; the enclosing loop
       (set! bl (bl 'previous)))
     (when (null? bl)
-      (luaX_syntaxerror ls "break outside loop"))
+      (lex-syntaxerror ls "break outside loop"))
     (set! (bl 'isloop) 2)  ; it has pending breaks
-    (luaX_next ls)
+    (lex-next ls)
     (newgotoentry ls (ls 'brkn) line)))
 
 (defn- checkrepeated (ls:(ptr LexState) name:(ptr TString)):void
   (let (lb:(ptr Labeldesc) (findlabel ls name ((ls 'fs) 'firstlabel)))
     (when (not (null? lb))
-      (luaK_semerror ls "label '%s' already defined on line %d" (getstr name) (lb 'line)))))
+      (code-semerror ls "label '%s' already defined on line %d" (getstr name) (lb 'line)))))
 
 ; '::' NAME '::'
 (defn- labelstat (ls:(ptr LexState) name:(ptr TString) line:i32):void
@@ -1003,42 +1011,42 @@
   (while (or (= (token ls) SEMI) (= (token ls) TK_DBCOLON))
     (statement ls))  ; other no-op statements
   (checkrepeated ls name)
-  (createlabel ls name line (if (block_follow ls 0) 1 0)))
+  (createlabel ls name line (if (block-follow ls 0) 1 0)))
 
 ; WHILE cond DO block END
 (defn- whilestat (ls:(ptr LexState) line:i32):void
   (let (fs:(ptr FuncState) (ls 'fs)
         bl:(ptr Block) (alloca Block))
-    (luaX_next ls)
-    (let (whileinit:i32 (luaK_getlabel fs)
+    (lex-next ls)
+    (let (whileinit:i32 (code-getlabel fs)
           condexit:i32 (condexp ls))
       (enterblock fs bl 1)
       (checknext ls TK_DO)
       (block ls)
-      (luaK_jumpto fs whileinit)
-      (check_match ls TK_END TK_WHILE line)
+      (code-jumpto fs whileinit)
+      (check-match ls TK_END TK_WHILE line)
       (leaveblock fs)
-      (luaK_patchtohere fs condexit))))  ; false conditions end the loop
+      (code-patchtohere fs condexit))))  ; false conditions end the loop
 
 ; REPEAT block UNTIL cond
 (defn- repeatstat (ls:(ptr LexState) line:i32):void
   (let (fs:(ptr FuncState) (ls 'fs)
-        repeat_init:i32 (luaK_getlabel fs)
+        repeat_init:i32 (code-getlabel fs)
         bl1:(ptr Block) (alloca Block)
         bl2:(ptr Block) (alloca Block))
     (enterblock fs bl1 1)  ; the loop
     (enterblock fs bl2 0)  ; the scope
-    (luaX_next ls)
+    (lex-next ls)
     (statlist ls)
-    (check_match ls TK_UNTIL TK_REPEAT line)
+    (check-match ls TK_UNTIL TK_REPEAT line)
     (let (condexit:i32 (condexp ls))  ; read inside the scope
       (when (!= (bl2 'upval) 0)  ; repeating must close upvalues
-        (let (exit:i32 (luaK_jump fs))  ; the normal exit jumps over the fix
-          (luaK_patchtohere fs condexit)
-          (luaK_codeABC fs OP_CLOSE (reglevel fs (bl2 'nactvar)) 0 0)
-          (set! condexit (luaK_jump fs))
-          (luaK_patchtohere fs exit)))
-      (luaK_patchlist fs condexit repeat_init)
+        (let (exit:i32 (code-jump fs))  ; the normal exit jumps over the fix
+          (code-patchtohere fs condexit)
+          (code-abc fs OP_CLOSE (reglevel fs (bl2 'nactvar)) 0 0)
+          (set! condexit (code-jump fs))
+          (code-patchtohere fs exit)))
+      (code-patchlist fs condexit repeat_init)
       (leaveblock fs)
       (leaveblock fs))))
 
@@ -1046,7 +1054,7 @@
 (defn- exp1 (ls:(ptr LexState)):void
   (let (e:(ptr expdesc) (alloca expdesc))
     (expr ls e)
-    (luaK_exp2nextreg (ls 'fs) e)))
+    (code-exp2nextreg (ls 'fs) e)))
 
 ; 'back': the jump goes backward.
 (defn- fixforjump (fs:(ptr FuncState) pc:i32 dest:i32 back:i32):void
@@ -1055,7 +1063,7 @@
     (when (!= back 0)
       (set! offset (- 0 offset)))
     (when (> offset MAXARG_Bx)
-      (luaX_syntaxerror (fs 'ls) "control structure too long"))
+      (lex-syntaxerror (fs 'ls) "control structure too long"))
     (SETARG_Bx (deref jmp) offset)))
 
 ; DO block
@@ -1063,20 +1071,20 @@
   (let (bl:(ptr Block) (alloca Block)
         fs:(ptr FuncState) (ls 'fs))
     (checknext ls TK_DO)
-    (let (prep:i32 (luaK_codeABx fs (if (!= isgen 0) OP_TFORPREP OP_FORPREP) base 0))
+    (let (prep:i32 (code-abx fs (if (!= isgen 0) OP_TFORPREP OP_FORPREP) base 0))
       (set! (fs 'freereg) (cast_uchar (- (as i32 (fs 'freereg)) 1)))  ; each prep pops one
       (enterblock fs bl 0)  ; the declared variables' scope
       (adjustlocalvars ls nvars)
-      (luaK_reserveregs fs nvars)
+      (code-reserveregs fs nvars)
       (block ls)
       (leaveblock fs)
-      (fixforjump fs prep (luaK_getlabel fs) 0)
+      (fixforjump fs prep (code-getlabel fs) 0)
       (when (!= isgen 0)
-        (luaK_codeABC fs OP_TFORCALL base 0 nvars)
-        (luaK_fixline fs line))
-      (let (endfor:i32 (luaK_codeABx fs (if (!= isgen 0) OP_TFORLOOP OP_FORLOOP) base 0))
+        (code-abc fs OP_TFORCALL base 0 nvars)
+        (code-fixline fs line))
+      (let (endfor:i32 (code-abx fs (if (!= isgen 0) OP_TFORLOOP OP_FORLOOP) base 0))
         (fixforjump fs endfor (+ prep 1) 1)
-        (luaK_fixline fs line)))))
+        (code-fixline fs line)))))
 
 ; NAME = exp,exp[,exp] forbody
 (defn- fornum (ls:(ptr LexState) varname:(ptr TString) line:i32):void
@@ -1084,15 +1092,15 @@
         base:i32 (as i32 (fs 'freereg)))
     (new_localvarliteral ls "(for state)")
     (new_localvarliteral ls "(for state)")
-    (new_varkind ls varname RDKCONST)  ; the control variable
+    (new-varkind ls varname RDKCONST)  ; the control variable
     (checknext ls (ch \=))
     (exp1 ls)  ; the initial value
     (checknext ls COMMA)
     (exp1 ls)  ; the limit
     (if (testnext ls COMMA)
       (exp1 ls)  ; the step
-      (do (luaK_int fs (as i32 (fs 'freereg)) 1)  ; 1 by default
-          (luaK_reserveregs fs 1)))
+      (do (code-int fs (as i32 (fs 'freereg)) 1)  ; 1 by default
+          (code-reserveregs fs 1)))
     (adjustlocalvars ls 2)  ; the internal variables' scope
     (forbody ls base line 1 0)))
 
@@ -1105,16 +1113,16 @@
     (new_localvarliteral ls "(for state)")  ; the iterator function
     (new_localvarliteral ls "(for state)")  ; the state
     (new_localvarliteral ls "(for state)")  ; the closing variable (after a swap)
-    (new_varkind ls indexname RDKCONST)  ; the control variable
+    (new-varkind ls indexname RDKCONST)  ; the control variable
     (while (testnext ls COMMA)  ; the other declared variables
-      (new_localvar ls (str_checkname ls))
+      (new-localvar ls (str-checkname ls))
       (set! nvars (+ nvars 1)))
     (checknext ls TK_IN)
     (let (line:i32 (ls 'linenumber))
-      (adjust_assign ls 4 (explist ls e) e)
+      (adjust-assign ls 4 (explist ls e) e)
       (adjustlocalvars ls 3)  ; the internal variables' scope
       (marktobeclosed fs)  ; the last internal one is closed
-      (luaK_checkstack fs 2)  ; room to call the iterator
+      (code-checkstack fs 2)  ; room to call the iterator
       (forbody ls base line (- nvars 3) 1))))
 
 ; FOR (fornum | forlist) END
@@ -1122,44 +1130,44 @@
   (let (fs:(ptr FuncState) (ls 'fs)
         bl:(ptr Block) (alloca Block))
     (enterblock fs bl 1)  ; the loop's and control variables' scope
-    (luaX_next ls)
-    (let (varname:(ptr TString) (str_checkname ls))
+    (lex-next ls)
+    (let (varname:(ptr TString) (str-checkname ls))
       (case (token ls)
         (ch \=) (fornum ls varname line)
         (:or COMMA TK_IN) (forlist ls varname)
-        (luaX_syntaxerror ls "'=' or 'in' expected")))
-    (check_match ls TK_END TK_FOR line)
+        (lex-syntaxerror ls "'=' or 'in' expected")))
+    (check-match ls TK_END TK_FOR line)
     (leaveblock fs)))  ; 'break' jumps here
 
 ; [IF | ELSEIF] cond THEN block
-(defn- test_then_block (ls:(ptr LexState) escapelist:(ptr i32)):void
+(defn- test-then-block (ls:(ptr LexState) escapelist:(ptr i32)):void
   (let (fs:(ptr FuncState) (ls 'fs))
-    (luaX_next ls)
+    (lex-next ls)
     (let (condtrue:i32 (condexp ls))
       (checknext ls TK_THEN)
       (block ls)
       (when (or (= (token ls) TK_ELSE) (= (token ls) TK_ELSEIF))
-        (luaK_concat fs escapelist (luaK_jump fs)))  ; jump over the rest
-      (luaK_patchtohere fs condtrue))))
+        (code-concat fs escapelist (code-jump fs)))  ; jump over the rest
+      (code-patchtohere fs condtrue))))
 
 ; IF cond THEN block {ELSEIF cond THEN block} [ELSE block] END
 (defn- ifstat (ls:(ptr LexState) line:i32):void
   (let (fs:(ptr FuncState) (ls 'fs)
         escapelist:(ptr i32) (alloca i32))  ; the finished parts' exits
     (set! (deref escapelist) NO_JUMP)
-    (test_then_block ls escapelist)
+    (test-then-block ls escapelist)
     (while (= (token ls) TK_ELSEIF)
-      (test_then_block ls escapelist))
+      (test-then-block ls escapelist))
     (when (testnext ls TK_ELSE)
       (block ls))
-    (check_match ls TK_END TK_IF line)
-    (luaK_patchtohere fs (deref escapelist))))
+    (check-match ls TK_END TK_IF line)
+    (code-patchtohere fs (deref escapelist))))
 
 (defn- localfunc (ls:(ptr LexState)):void
   (let (b:(ptr expdesc) (alloca expdesc)
         fs:(ptr FuncState) (ls 'fs)
         fvar:i32 (fs 'nactvar))
-    (new_localvar ls (str_checkname ls))
+    (new-localvar ls (str-checkname ls))
     (adjustlocalvars ls 1)
     (body ls b 0 (ls 'linenumber))
     ; debug information sees the variable only from here
@@ -1168,17 +1176,17 @@
 ; ['<' NAME '>']
 (defn- getvarattribute (ls:(ptr LexState) df:ui8):ui8
   (when (testnext ls (ch \<))
-    (let (attr:CStr (cstr (getstr (str_checkname ls))))
+    (let (attr:CStr (cstr (getstr (str-checkname ls))))
       (checknext ls (ch \>))
       (cond (= (strcmp attr "const") 0) (return RDKCONST)
             (= (strcmp attr "close") 0) (return RDKTOCLOSE)
-            true (luaK_semerror ls "unknown attribute '%s'" attr))))
+            true (code-semerror ls "unknown attribute '%s'" attr))))
   (return df))
 
 (defn- checktoclose (fs:(ptr FuncState) level:i32):void
   (when (!= level -1)
     (marktobeclosed fs)
-    (luaK_codeABC fs OP_TBC (reglevel fs level) 0 0)))
+    (code-abc fs OP_TBC (reglevel fs level) 0 0)))
 
 ; LOCAL NAME attrib { ',' NAME attrib } ['=' explist]
 (defn- localstat (ls:(ptr LexState)):void
@@ -1191,12 +1199,12 @@
         defkind:ui8 (getvarattribute ls VDKREG)  ; a prefixed attribute
         more:bool true)
     (while more
-      (let (vname:(ptr TString) (str_checkname ls)
+      (let (vname:(ptr TString) (str-checkname ls)
             kind:ui8 (getvarattribute ls defkind))
-        (set! vidx (new_varkind ls vname kind))
+        (set! vidx (new-varkind ls vname kind))
         (when (= kind RDKTOCLOSE)
           (when (!= toclose -1)
-            (luaK_semerror ls "multiple to-be-closed variables in local list"))
+            (code-semerror ls "multiple to-be-closed variables in local list"))
           (set! toclose (+ (as i32 (fs 'nactvar)) nvars)))
         (set! nvars (+ nvars 1)))
       (set! more (testnext ls COMMA)))
@@ -1206,18 +1214,18 @@
     (let (var:(ptr Vardesc) (getlocalvardesc fs vidx))
       (if (and (= nvars nexps)  ; no adjustment, a const last variable,
                (= (vdf var 'kind) RDKCONST)
-               (!= (luaK_exp2const fs e (ref (var 'k))) 0))  ; a constant value
+               (!= (code-exp2const fs e (ref (var 'k))) 0))  ; a constant value
         (do (set-vdf var 'kind RDKCTC)  ; a compile-time constant
             (adjustlocalvars ls (- nvars 1))  ; not the last one,
             (set! (fs 'nactvar) (cast_short (+ (as i32 (fs 'nactvar)) 1))))  ; but it counts
-        (do (adjust_assign ls nvars nexps e)
+        (do (adjust-assign ls nvars nexps e)
             (adjustlocalvars ls nvars))))
     (checktoclose fs toclose)))
 
 (defn- getglobalattribute (ls:(ptr LexState) df:ui8):ui8
   (let (kind:ui8 (getvarattribute ls df))
     (case kind
-      RDKTOCLOSE (do (luaK_semerror ls "global variables cannot be to-be-closed")
+      RDKTOCLOSE (do (code-semerror ls "global variables cannot be to-be-closed")
                      (return kind))
       RDKCONST (return GDKCONST)
       (return kind))))
@@ -1225,14 +1233,14 @@
 (defn- checkglobal (ls:(ptr LexState) varname:(ptr TString) line:i32):void
   (let (var:(ptr expdesc) (alloca expdesc))
     (buildglobal ls varname var)
-    (luaK_codecheckglobal (ls 'fs) var (ind var 'keystr) line)))  ; the name's index in 'k'
+    (code-checkglobal (ls 'fs) var (exp-ind var 'keystr) line)))  ; the name's index in 'k'
 
 ; Goes down the globals being initialized building each one's index, reads
 ; the expressions at the bottom, and stores each value on the way back.
 (defn- initglobal (ls:(ptr LexState) nvars:i32 firstidx:i32 n:i32 line:i32):void
   (if (= n nvars)
     (let (e:(ptr expdesc) (alloca expdesc))
-      (adjust_assign ls nvars (explist ls e) e))
+      (adjust-assign ls nvars (explist ls e) e))
     (let (fs:(ptr FuncState) (ls 'fs)
           var:(ptr expdesc) (alloca expdesc)
           varname:(ptr TString) (vdf (getlocalvardesc fs (+ firstidx n)) 'name))
@@ -1249,9 +1257,9 @@
         lastidx:i32 0  ; the last variable registered
         more:bool true)
     (while more
-      (let (vname:(ptr TString) (str_checkname ls)
+      (let (vname:(ptr TString) (str-checkname ls)
             kind:ui8 (getglobalattribute ls defkind))
-        (set! lastidx (new_varkind ls vname kind))
+        (set! lastidx (new-varkind ls vname kind))
         (set! nvars (+ nvars 1)))
       (set! more (testnext ls COMMA)))
     (when (testnext ls (ch \=))
@@ -1264,7 +1272,7 @@
         defkind:ui8 (getglobalattribute ls GDKREG))
     (if (not (testnext ls (ch \*)))
       (globalnames ls defkind)
-      (do (new_varkind ls null defkind)  ; a null name stands for '*'
+      (do (new-varkind ls null defkind)  ; a null name stands for '*'
           (set! (fs 'nactvar) (cast_short (+ (as i32 (fs 'nactvar)) 1)))))))
 
 ; (GLOBAL FUNCTION) NAME body
@@ -1272,17 +1280,17 @@
   (let (var:(ptr expdesc) (alloca expdesc)
         b:(ptr expdesc) (alloca expdesc)
         fs:(ptr FuncState) (ls 'fs)
-        fname:(ptr TString) (str_checkname ls))
-    (new_varkind ls fname GDKREG)
+        fname:(ptr TString) (str-checkname ls))
+    (new-varkind ls fname GDKREG)
     (set! (fs 'nactvar) (cast_short (+ (as i32 (fs 'nactvar)) 1)))  ; its scope starts
     (buildglobal ls fname var)
     (body ls b 0 (ls 'linenumber))
     (checkglobal ls fname line)
-    (luaK_storevar fs var b)
-    (luaK_fixline fs line)))  ; the definition "happens" on the first line
+    (code-storevar fs var b)
+    (code-fixline fs line)))  ; the definition "happens" on the first line
 
 (defn- globalstatfunc (ls:(ptr LexState) line:i32):void
-  (luaX_next ls)  ; 'global'
+  (lex-next ls)  ; 'global'
   (if (testnext ls TK_FUNCTION)
     (globalfunc ls line)
     (globalstat ls)))
@@ -1302,12 +1310,12 @@
 (defn- funcstat (ls:(ptr LexState) line:i32):void
   (let (v:(ptr expdesc) (alloca expdesc)
         b:(ptr expdesc) (alloca expdesc))
-    (luaX_next ls)
+    (lex-next ls)
     (let (ismethod:i32 (funcname ls v))
-      (check_readonly ls v)
+      (check-readonly ls v)
       (body ls b ismethod line)
-      (luaK_storevar (ls 'fs) v b)
-      (luaK_fixline (ls 'fs) line))))  ; the definition "happens" on the first line
+      (code-storevar (ls 'fs) v b)
+      (code-fixline (ls 'fs) line))))  ; the definition "happens" on the first line
 
 ; func | assignment
 (defn- exprstat (ls:(ptr LexState)):void
@@ -1318,25 +1326,25 @@
       (do (set! (v 'prev) null)
           (restassign ls v 1))
       (do (check_condition ls (= ((v 'v) 'k) VCALL) "syntax error")
-          (SETARG_C (deref (instr fs (ref (v 'v)))) 1)))))  ; a call statement uses no results
+          (SETARG_C (deref (exp-instr fs (ref (v 'v)))) 1)))))  ; a call statement uses no results
 
 ; RETURN [explist] [';']
 (defn- retstat (ls:(ptr LexState)):void
   (let (fs:(ptr FuncState) (ls 'fs)
         e:(ptr expdesc) (alloca expdesc)
         nret:i32 0  ; how many values
-        first:i32 (as i32 (luaY_nvarstack fs)))  ; the first one's slot
-    (when (not (or (block_follow ls 1) (= (token ls) SEMI)))
+        first:i32 (as i32 (parser-nvarstack fs)))  ; the first one's slot
+    (when (not (or (block-follow ls 1) (= (token ls) SEMI)))
       (set! nret (explist ls e))
       (if (hasmultret (e 'k))
-        (do (luaK_setmultret fs e)
+        (do (code-setmultret fs e)
             (when (and (= (e 'k) VCALL) (= nret 1) (= ((fs-bl fs) 'insidetbc) 0))  ; a tail call?
-              (SET_OPCODE (deref (instr fs e)) OP_TAILCALL))
+              (SET_OPCODE (deref (exp-instr fs e)) OP_TAILCALL))
             (set! nret LUA_MULTRET))  ; all the values
         (if (= nret 1)
-          (set! first (luaK_exp2anyreg fs e))  ; it can stay in its slot
-          (luaK_exp2nextreg fs e))))  ; values go on top of the stack
-    (luaK_ret fs first nret)
+          (set! first (code-exp2anyreg fs e))  ; it can stay in its slot
+          (code-exp2nextreg fs e))))  ; values go on top of the stack
+    (code-ret fs first nret)
     (testnext ls SEMI)))
 
 ; LUA_COMPAT_GLOBAL: the name 'global' starts a declaration when it is
@@ -1344,74 +1352,74 @@
 (defn- globalname (ls:(ptr LexState)):bool
   (when (!= (seminfo ls 'ts) (ls 'glbn))
     (return false))
-  (let (lk:i32 (luaX_lookahead ls))
+  (let (lk:i32 (lex-lookahead ls))
     (return (or (= lk (ch \<)) (= lk TK_NAME) (= lk (ch \*)) (= lk TK_FUNCTION)))))
 
 (defn- statement (ls:(ptr LexState)):void
   (let (line:i32 (ls 'linenumber))  ; for error messages
     (enterlevel ls)
     (case (token ls)
-      SEMI (luaX_next ls)  ; an empty statement
+      SEMI (lex-next ls)  ; an empty statement
       TK_IF (ifstat ls line)
       TK_WHILE (whilestat ls line)
-      TK_DO (do (luaX_next ls)
+      TK_DO (do (lex-next ls)
                 (block ls)
-                (check_match ls TK_END TK_DO line))
+                (check-match ls TK_END TK_DO line))
       TK_FOR (forstat ls line)
       TK_REPEAT (repeatstat ls line)
       TK_FUNCTION (funcstat ls line)
-      TK_LOCAL (do (luaX_next ls)
+      TK_LOCAL (do (lex-next ls)
                    (if (testnext ls TK_FUNCTION)
                      (localfunc ls)
                      (localstat ls)))
       TK_GLOBAL (globalstatfunc ls line)
-      TK_DBCOLON (do (luaX_next ls)
-                     (labelstat ls (str_checkname ls) line))
-      TK_RETURN (do (luaX_next ls)
+      TK_DBCOLON (do (lex-next ls)
+                     (labelstat ls (str-checkname ls) line))
+      TK_RETURN (do (lex-next ls)
                     (retstat ls))
       TK_BREAK (breakstat ls line)
-      TK_GOTO (do (luaX_next ls)
+      TK_GOTO (do (lex-next ls)
                   (gotostat ls line))
       TK_NAME (if (globalname ls)
                 (globalstatfunc ls line)
                 (exprstat ls))
       (exprstat ls))
-    (set! ((ls 'fs) 'freereg) (luaY_nvarstack (ls 'fs)))  ; free the registers
+    (set! ((ls 'fs) 'freereg) (parser-nvarstack (ls 'fs)))  ; free the registers
     (leavelevel ls)))
 
 ; The main function: a vararg function with the upvalue LUA_ENV.
 (defn- mainfunc (ls:(ptr LexState) fs:(ptr FuncState)):void
   (let (bl:(ptr Block) (alloca Block))
-    (open_func ls fs bl)
+    (open-func ls fs bl)
     (setvararg fs)
     (let (env:(ptr Upvaldesc) (allocupvalue fs))
       (set! (env 'instack) 1)
       (set! (env 'idx) 0)
       (set! (env 'kind) VDKREG)
       (set! (env 'name) (ls 'envn))
-      (luaC_objbarrier (ls 'L) (fs 'f) (env 'name)))
-    (luaX_next ls)  ; the first token
+      (gc-objbarrier (ls 'L) (fs 'f) (env 'name)))
+    (lex-next ls)  ; the first token
     (statlist ls)
     (check ls TK_EOS)
-    (close_func ls)))
+    (close-func ls)))
 
-(defn luaY_parser (L:(ptr lua_State) z:(ptr ZIO) anchor:(ptr Table) buff:(ptr Mbuffer)
+(defn parse-chunk (L:(ptr lua_State) z:(ptr ZIO) anchor:(ptr Table) buff:(ptr Mbuffer)
                    dyd:(ptr Dyndata) name:CStr firstchar:i32):(ptr LClosure)
   (let (lexstate:(ptr LexState) (alloca LexState)
         funcstate:(ptr FuncState) (alloca FuncState)
-        cl:(ptr LClosure) (luaF_newLclosure L 1))  ; the main closure
+        cl:(ptr LClosure) (func-new-lclosure L 1))  ; the main closure
     (set! (lexstate 'h) anchor)  ; the scanner's table
-    (luaD_anchorobj L anchor (obj2gco cl))
-    (set! (cl 'p) (luaF_newproto L))
+    (do-anchorobj L anchor (obj2gco cl))
+    (set! (cl 'p) (func-newproto L))
     (set! (funcstate 'f) (cl 'p))
-    (luaC_objbarrier L cl (cl 'p))
-    (set! ((funcstate 'f) 'source) (luaS_new L name))
-    (luaC_objbarrier L (funcstate 'f) ((funcstate 'f) 'source))
+    (gc-objbarrier L cl (cl 'p))
+    (set! ((funcstate 'f) 'source) (string-new L name))
+    (gc-objbarrier L (funcstate 'f) ((funcstate 'f) 'source))
     (set! (lexstate 'buff) buff)
     (set! (lexstate 'dyd) dyd)
     (set! ((dyd 'actvar) 'n) 0)
     (set! ((dyd 'gt) 'n) 0)
     (set! ((dyd 'label) 'n) 0)
-    (luaX_setinput L lexstate z ((funcstate 'f) 'source) firstchar)
+    (lex-setinput L lexstate z ((funcstate 'f) 'source) firstchar)
     (mainfunc lexstate funcstate)
     (return cl)))

@@ -12,12 +12,15 @@
 (import-use "string.h")
 (import-use lua.util)
 (import-use lua.core)
+(import-use lua.do)
+(import-use lua.gc)
+(import-use lua.mem)
 
-(defconst MAXSTRTB 2147483647)  ; luaM_limitN(INT_MAX, TString*) on 64 bits
+(defconst MAXSTRTB 2147483647)  ; mem-limit-n(INT_MAX, TString*) on 64 bits
 (defconst MINSTRTABSIZE 128)    ; a power of 2; the core alone makes about 50
 (defconst MEMERRMSG "not enough memory")
 
-(defn luaS_eqstr (a:(ptr TString) b:(ptr TString)):i32
+(defn string-eqstr (a:(ptr TString) b:(ptr TString)):i32
   (let (len1:usize (tsslen a)
         len2:usize (tsslen b))
     (return (if (and (= len1 len2)
@@ -25,7 +28,7 @@
               1 0))))
 
 ; Unsigned, so that it wraps as C's does.
-(defn- luaS_hash (str:(ptr i8) l:usize seed:ui32):ui32
+(defn- lua-s-hash (str:(ptr i8) l:usize seed:ui32):ui32
   (let (h:ui32 (bit-xor seed (cast_uint l)))
     (while (> l 0)
       (set! h (bit-xor h (+ (bit-shl h 5) (bit-shr h 2)
@@ -33,9 +36,9 @@
       (set! l (- l 1)))
     (return h)))
 
-(defn luaS_hashlongstr (ts:(ptr TString)):ui32
+(defn string-hashlongstr (ts:(ptr TString)):ui32
   (when (= (ts 'extra) 0)  ; no hash yet?
-    (set! (ts 'hash) (luaS_hash (getlngstr ts) ((ts 'u) 'lnglen) (ts 'hash)))
+    (set! (ts 'hash) (lua-s-hash (getlngstr ts) ((ts 'u) 'lnglen) (ts 'hash)))
     (set! (ts 'extra) 1))
   (return (ts 'hash)))
 
@@ -53,13 +56,13 @@
           (set! p hnext))))))
 
 ; A failed allocation keeps the current size: any size above zero works.
-(defn luaS_resize (L:(ptr lua_State) nsize:i32):void
+(defn string-resize (L:(ptr lua_State) nsize:i32):void
   (let (tb:(ptr stringtable) (ref ((G L) 'strt))
         osize:i32 (tb 'size))
     (when (< nsize osize)  ; shrinking? depopulate the part to go
       (tablerehash (tb 'hash) osize nsize))
     (let (newvect:(ptr (ptr TString))
-          (luaM_reallocvector L (tb 'hash) osize nsize (ptr TString)))
+          (mem-reallocvector L (tb 'hash) osize nsize (ptr TString)))
       (if (= newvect null)
         (when (< nsize osize)  ; restore the original size
           (tablerehash (tb 'hash) nsize osize))
@@ -69,21 +72,21 @@
               (tablerehash newvect osize nsize)))))))
 
 ; Entries can't be empty, so one to be collected becomes a fixed string.
-(defn luaS_clearcache (g:(ptr global_State)):void
+(defn string-clearcache (g:(ptr global_State)):void
   (for (i:i32 0) (< i STRCACHE_N) (set! i (+ i 1))
     (let (p:(ptr (ptr TString)) (strcache-row g i))
       (for (j:i32 0) (< j STRCACHE_M) (set! j (+ j 1))
         (when (iswhite (aref p j))
           (set! (aref p j) (g 'memerrmsg)))))))
 
-(defn luaS_init (L:(ptr lua_State)):void
+(defn string-init (L:(ptr lua_State)):void
   (let (g:(ptr global_State) (G L)
         tb:(ptr stringtable) (ref (g 'strt)))
-    (set! (tb 'hash) (luaM_newvector L MINSTRTABSIZE (ptr TString)))
+    (set! (tb 'hash) (mem-newvector L MINSTRTABSIZE (ptr TString)))
     (tablerehash (tb 'hash) 0 MINSTRTABSIZE)  ; clear the array
     (set! (tb 'size) MINSTRTABSIZE)
-    (set! (g 'memerrmsg) (luaS_newliteral L MEMERRMSG))
-    (luaC_fix L (obj2gco (g 'memerrmsg)))  ; never collected
+    (set! (g 'memerrmsg) (string-newliteral L MEMERRMSG))
+    (gc-fix L (obj2gco (g 'memerrmsg)))  ; never collected
     (for (i:i32 0) (< i STRCACHE_N) (set! i (+ i 1))
       (let (p:(ptr (ptr TString)) (strcache-row g i))
         (for (j:i32 0) (< j STRCACHE_M) (set! j (+ j 1))
@@ -91,19 +94,19 @@
 
 ; A regular string needs no 'falloc' or 'ud' but holds its contents; a fixed
 ; external one needs neither; one to deallocate needs the whole struct.
-(defn luaS_sizelngstr (len:usize kind:i32):usize
+(defn string-sizelngstr (len:usize kind:i32):usize
   (cond (= kind LSTRREG) (return (+ (offsetof TString falloc) len 1))
         (= kind LSTRFIX) (return (offsetof TString falloc))
         true (return (cast_sizet (sizeof TString)))))
 
 (defn- createstrobj (L:(ptr lua_State) totalsize:usize tag:ui8 h:ui32):(ptr TString)
-  (let (ts:(ptr TString) (gco2ts (luaC_newobj L tag totalsize)))
+  (let (ts:(ptr TString) (gco2ts (gc-newobj L tag totalsize)))
     (set! (ts 'hash) h)
     (set! (ts 'extra) 0)
     (return ts)))
 
-(defn luaS_createlngstrobj (L:(ptr lua_State) l:usize):(ptr TString)
-  (let (ts:(ptr TString) (createstrobj L (luaS_sizelngstr l LSTRREG) LUA_VLNGSTR
+(defn string-createlngstrobj (L:(ptr lua_State) l:usize):(ptr TString)
+  (let (ts:(ptr TString) (createstrobj L (string-sizelngstr l LSTRREG) LUA_VLNGSTR
                                        ((G L) 'seed)))
     (set! ((ts 'u) 'lnglen) l)
     (set! (ts 'shrlen) LSTRREG)  ; a regular long string
@@ -111,7 +114,7 @@
     (set! (deref (p+ (ts 'contents) l)) 0)
     (return ts)))
 
-(defn luaS_remove (L:(ptr lua_State) ts:(ptr TString)):void
+(defn string-remove (L:(ptr lua_State) ts:(ptr TString)):void
   (let (tb:(ptr stringtable) (ref ((G L) 'strt))
         p:(ptr (ptr TString)) (p+ (tb 'hash) (lmod (ts 'hash) (tb 'size))))
     (while (!= (deref p) ts)  ; find the previous element
@@ -122,17 +125,17 @@
 
 (defn- growstrtab (L:(ptr lua_State) tb:(ptr stringtable)):void
   (when (= (tb 'nuse) MAXSTRTB)  ; too many strings?
-    (luaC_fullgc L 1)
+    (gc-fullgc L 1)
     (when (= (tb 'nuse) MAXSTRTB)
-      (luaM_error L)))  ; no memory even for a message
+      (mem-error L)))  ; no memory even for a message
   (when (<= (tb 'size) (/ MAXSTRTB 2))
-    (luaS_resize L (* (tb 'size) 2))))
+    (string-resize L (* (tb 'size) 2))))
 
 ; The interned short string, made if it doesn't exist.
 (defn- internshrstr (L:(ptr lua_State) str:(ptr i8) l:usize):(ptr TString)
   (let (g:(ptr global_State) (G L)
         tb:(ptr stringtable) (ref (g 'strt))
-        h:ui32 (luaS_hash str l (g 'seed))
+        h:ui32 (lua-s-hash str l (g 'seed))
         list:(ptr (ptr TString)) (p+ (tb 'hash) (lmod h (tb 'size)))
         ts:(ptr TString) (deref list))
     (while (!= ts null)
@@ -154,18 +157,18 @@
     (set! (tb 'nuse) (+ (tb 'nuse) 1))
     (return ts)))
 
-(defn luaS_newlstr (L:(ptr lua_State) str:CStr l:usize):(ptr TString)
+(defn string-newlstr (L:(ptr lua_State) str:CStr l:usize):(ptr TString)
   (if (<= l LUAI_MAXSHORTLEN)
     (return (internshrstr L (bytes str) l))
     (do (when (>= l (- (MAX_SIZE) (cast_sizet (sizeof TString))))
-          (luaM_toobig L))
-        (let (ts:(ptr TString) (luaS_createlngstrobj L l))
+          (mem-toobig L))
+        (let (ts:(ptr TString) (string-createlngstrobj L l))
           (memcpy (as ptr (getlngstr ts)) (as ptr str) l)
           (return ts)))))
 
 ; Through a cache keyed on the string's address. It holds only zero-terminated
 ; strings, so strcmp checks a hit.
-(defn luaS_new (L:(ptr lua_State) str:CStr):(ptr TString)
+(defn string-new (L:(ptr lua_State) str:CStr):(ptr TString)
   (let (i:i32 (cast_int (% (cast_uint (unsafe/cast usize (as ptr str))) (cast_uint STRCACHE_N)))
         p:(ptr (ptr TString)) (strcache-row (G L) i))
     (for (j:i32 0) (< j STRCACHE_M) (set! j (+ j 1))
@@ -173,13 +176,13 @@
         (return (aref p j))))
     (for (j:i32 (- STRCACHE_M 1)) (> j 0) (set! j (- j 1))  ; drop the last one
       (set! (aref p j) (aref p (- j 1))))
-    (set! (aref p 0) (luaS_newlstr L str (strlen str)))
+    (set! (aref p 0) (string-newlstr L str (strlen str)))
     (return (aref p 0))))
 
-(defn luaS_newudata (L:(ptr lua_State) s:usize nuvalue:ui16):(ptr Udata)
+(defn string-newudata (L:(ptr lua_State) s:usize nuvalue:ui16):(ptr Udata)
   (when (> s (- (MAX_SIZE) (udatamemoffset nuvalue)))
-    (luaM_toobig L))
-  (let (u:(ptr Udata) (gco2u (luaC_newobj L LUA_VUSERDATA (sizeudata nuvalue s))))
+    (mem-toobig L))
+  (let (u:(ptr Udata) (gco2u (gc-newobj L LUA_VUSERDATA (sizeudata nuvalue s))))
     (set! (u 'len) s)
     (set! (u 'nuvalue) nuvalue)
     (set! (u 'metatable) null)
@@ -193,20 +196,20 @@
   len:usize
   ts:(ptr TString))  ; the result
 
-(defn- f_newext (L:(ptr lua_State) ud:ptr):void
+(defn- f-newext (L:(ptr lua_State) ud:ptr):void
   (let (ne:(ptr NewExt) (unsafe/cast (ptr NewExt) ud))
-    (set! (ne 'ts) (createstrobj L (luaS_sizelngstr 0 (as i32 (ne 'kind))) LUA_VLNGSTR
+    (set! (ne 'ts) (createstrobj L (string-sizelngstr 0 (as i32 (ne 'kind))) LUA_VLNGSTR
                                  ((G L) 'seed)))))
 
-(defn luaS_newextlstr (L:(ptr lua_State) s:CStr len:usize falloc:lua_Alloc ud:ptr):(ptr TString)
+(defn string-newextlstr (L:(ptr lua_State) s:CStr len:usize falloc:lua_Alloc ud:ptr):(ptr TString)
   (let (ne:(ptr NewExt) (alloca NewExt))
     (if (= falloc null)
       (do (set! (ne 'kind) LSTRFIX)
-          (f_newext L (as ptr ne)))  ; only the header
+          (f-newext L (as ptr ne)))  ; only the header
       (do (set! (ne 'kind) LSTRMEM)
-          (when (!= (luaD_rawrunprotected L f_newext (as ptr ne)) LUA_OK)
+          (when (!= (do-rawrunprotected L f-newext (as ptr ne)) LUA_OK)
             (falloc ud (as ptr s) (+ len 1) 0)  ; free the external string
-            (luaM_error L))  ; and re-raise the memory error
+            (mem-error L))  ; and re-raise the memory error
           (set! ((ne 'ts) 'falloc) falloc)
           (set! ((ne 'ts) 'ud) ud)))
     (set! ((ne 'ts) 'shrlen) (ne 'kind))
@@ -215,7 +218,7 @@
     (return (ne 'ts))))
 
 ; An external string that is short is interned.
-(defn luaS_normstr (L:(ptr lua_State) ts:(ptr TString)):(ptr TString)
+(defn string-normstr (L:(ptr lua_State) ts:(ptr TString)):(ptr TString)
   (let (len:usize ((ts 'u) 'lnglen))
     (if (> len LUAI_MAXSHORTLEN)
       (return ts)

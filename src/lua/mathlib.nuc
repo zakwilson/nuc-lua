@@ -5,13 +5,14 @@
 (set-ir-prefix "")
 (import-use luacapi)
 (import-use lua.util)
+(import-ct nucleus.node)
 (import-use "math.h")
 (import-use "stdlib.h")
 (import-use "time.h")
 
 (defconst PI 3.141592653589793238462643383279502884)
 
-(defn- math_abs (L:(ptr lua_State)):i32
+(defn- math-abs (L:(ptr lua_State)):i32
   (if (!= (lua_isinteger L 1) 0)
     (let (n:lua_Integer (lua_tointeger L 1))
       (when (< n 0) (set! n (l_castU2S (- 0 (l_castS2U n)))))
@@ -19,33 +20,29 @@
     (lua_pushnumber L (fabs (luaL_checknumber L 1))))
   (return 1))
 
-(defn- math_sin (L:(ptr lua_State)):i32
-  (lua_pushnumber L (sin (luaL_checknumber L 1)))
+; The functions of one float, a row each: (lua-name C-function).
+(defmacro def-float-fns (:rest rows)
+  (let (out (node-list-new ((ast-at rows 0) (quote line))) i 0)
+    (while (< i (ast-len rows))
+      (let (name (ast-at (ast-at rows i) 0) f (ast-at (ast-at rows i) 1))
+        (node-push out `(defn-lua ~name (L (x number))
+                          (lua_pushnumber L (~f x))
+                          (return 1))))
+      (set! i (+ i 1)))
+    `(do ~@out)))
+
+(defn- deg (x:lua_Number):lua_Number (return (* x (/ 180.0 PI))))
+(defn- rad (x:lua_Number):lua_Number (return (* x (/ PI 180.0))))
+
+(def-float-fns (math-sin sin) (math-cos cos) (math-tan tan) (math-asin asin)
+               (math-acos acos) (math-sqrt sqrt) (math-exp exp) (math-deg deg)
+               (math-rad rad))
+
+(defn-lua math-atan (L (y number) (x number 1.0))
+  (lua_pushnumber L (atan2 y x))
   (return 1))
 
-(defn- math_cos (L:(ptr lua_State)):i32
-  (lua_pushnumber L (cos (luaL_checknumber L 1)))
-  (return 1))
-
-(defn- math_tan (L:(ptr lua_State)):i32
-  (lua_pushnumber L (tan (luaL_checknumber L 1)))
-  (return 1))
-
-(defn- math_asin (L:(ptr lua_State)):i32
-  (lua_pushnumber L (asin (luaL_checknumber L 1)))
-  (return 1))
-
-(defn- math_acos (L:(ptr lua_State)):i32
-  (lua_pushnumber L (acos (luaL_checknumber L 1)))
-  (return 1))
-
-(defn- math_atan (L:(ptr lua_State)):i32
-  (let (y:lua_Number (luaL_checknumber L 1)
-        x:lua_Number (luaL_optnumber L 2 1.0))
-    (lua_pushnumber L (atan2 y x))
-    (return 1)))
-
-(defn- math_toint (L:(ptr lua_State)):i32
+(defn- math-toint (L:(ptr lua_State)):i32
   (let (valid:i32 0
         n:lua_Integer (lua_tointegerx L 1 &valid))
     (if (!= valid 0)
@@ -55,25 +52,25 @@
     (return 1)))
 
 ; Pushes 'd' as an integer if it fits in one, else as a float.
-(defn- pushnumint (L:(ptr lua_State) d:lua_Number):void
+(defn- push-numint (L:(ptr lua_State) d:lua_Number):void
   (let (n:lua_Integer 0)
     (if (lua_numbertointeger d n)
       (lua_pushinteger L n)
       (lua_pushnumber L d))))
 
-(defn- math_floor (L:(ptr lua_State)):i32
+(defn- math-floor (L:(ptr lua_State)):i32
   (if (!= (lua_isinteger L 1) 0)
     (lua_settop L 1)  ; an integer is its own floor
-    (pushnumint L (floor (luaL_checknumber L 1))))
+    (push-numint L (floor (luaL_checknumber L 1))))
   (return 1))
 
-(defn- math_ceil (L:(ptr lua_State)):i32
+(defn- math-ceil (L:(ptr lua_State)):i32
   (if (!= (lua_isinteger L 1) 0)
     (lua_settop L 1)  ; an integer is its own ceiling
-    (pushnumint L (ceil (luaL_checknumber L 1))))
+    (push-numint L (ceil (luaL_checknumber L 1))))
   (return 1))
 
-(defn- math_fmod (L:(ptr lua_State)):i32
+(defn- math-fmod (L:(ptr lua_State)):i32
   (if (and (!= (lua_isinteger L 1) 0) (!= (lua_isinteger L 2) 0))
     (let (d:lua_Integer (lua_tointeger L 2))
       (if (<= (+ (l_castS2U d) 1) 1)  ; -1 or 0
@@ -83,64 +80,41 @@
     (lua_pushnumber L (fmod (luaL_checknumber L 1) (luaL_checknumber L 2))))
   (return 1))
 
-(defn- math_modf (L:(ptr lua_State)):i32
+(defn- math-modf (L:(ptr lua_State)):i32
   (if (!= (lua_isinteger L 1) 0)
     (do (lua_settop L 1)  ; the number is its own integer part
         (lua_pushnumber L 0.0))  ; with no fraction
     (let (n:lua_Number (luaL_checknumber L 1)
           ip:lua_Number (if (< n 0.0) (ceil n) (floor n)))  ; rounds toward zero
-      (pushnumint L ip)
+      (push-numint L ip)
       (lua_pushnumber L (if (= n ip) 0.0 (- n ip)))))  ; the test is for inf
   (return 2))
 
-(defn- math_sqrt (L:(ptr lua_State)):i32
-  (lua_pushnumber L (sqrt (luaL_checknumber L 1)))
+(defn-lua math-ult (L (a integer) (b integer))
+  (lua_pushboolean L (if (< (l_castS2U a) (l_castS2U b)) 1 0))
   (return 1))
 
-(defn- math_ult (L:(ptr lua_State)):i32
-  (let (a:lua_Integer (luaL_checkinteger L 1)
-        b:lua_Integer (luaL_checkinteger L 2))
-    (lua_pushboolean L (if (< (l_castS2U a) (l_castS2U b)) 1 0))
-    (return 1)))
-
-(defn- math_log (L:(ptr lua_State)):i32
-  (let (x:lua_Number (luaL_checknumber L 1)
-        res:lua_Number 0.0)
+(defn-lua math-log (L (x number))
+  (lua_pushnumber L
     (if (lua_isnoneornil L 2)
-      (set! res (log x))
+      (log x)
       (let (base:lua_Number (luaL_checknumber L 2))
-        (cond
-          (= base 2.0) (set! res (log2 x))
-          (= base 10.0) (set! res (log10 x))
-          true (set! res (/ (log x) (log base))))))
-    (lua_pushnumber L res)
-    (return 1)))
-
-(defn- math_exp (L:(ptr lua_State)):i32
-  (lua_pushnumber L (exp (luaL_checknumber L 1)))
+        (cond (= base 2.0) (log2 x)
+              (= base 10.0) (log10 x)
+              true (/ (log x) (log base))))))
   (return 1))
 
-(defn- math_deg (L:(ptr lua_State)):i32
-  (lua_pushnumber L (* (luaL_checknumber L 1) (/ 180.0 PI)))
-  (return 1))
-
-(defn- math_rad (L:(ptr lua_State)):i32
-  (lua_pushnumber L (* (luaL_checknumber L 1) (/ PI 180.0)))
-  (return 1))
-
-(defn- math_frexp (L:(ptr lua_State)):i32
+(defn-lua math-frexp (L (x number))
   (let (ep:i32 0)
-    (lua_pushnumber L (frexp (luaL_checknumber L 1) &ep))
+    (lua_pushnumber L (frexp x &ep))
     (lua_pushinteger L (as lua_Integer ep))
     (return 2)))
 
-(defn- math_ldexp (L:(ptr lua_State)):i32
-  (let (x:lua_Number (luaL_checknumber L 1)
-        ep:i32 (cast_int (luaL_checkinteger L 2)))
-    (lua_pushnumber L (ldexp x ep))
-    (return 1)))
+(defn-lua math-ldexp (L (x number) (ep integer))
+  (lua_pushnumber L (ldexp x (cast_int ep)))
+  (return 1))
 
-(defn- math_min (L:(ptr lua_State)):i32
+(defn- math-min (L:(ptr lua_State)):i32
   (let (n:i32 (lua_gettop L)
         imin:i32 1)
     (luaL_argcheck L (>= n 1) 1 "value expected")
@@ -150,7 +124,7 @@
     (lua_pushvalue L imin)
     (return 1)))
 
-(defn- math_max (L:(ptr lua_State)):i32
+(defn- math-max (L:(ptr lua_State)):i32
   (let (n:i32 (lua_gettop L)
         imax:i32 1)
     (luaL_argcheck L (>= n 1) 1 "value expected")
@@ -160,7 +134,7 @@
     (lua_pushvalue L imax)
     (return 1)))
 
-(defn- math_type (L:(ptr lua_State)):i32
+(defn- math-type (L:(ptr lua_State)):i32
   (if (= (lua_type L 1) LUA_TNUMBER)
     (lua_pushstring L (if (!= (lua_isinteger L 1) 0) "integer" "float"))
     (do (luaL_checkany L 1)
@@ -172,7 +146,7 @@
 (defn- rotl (x:ui64 n:ui64):ui64
   (return (bit-or (bit-shl x n) (bit-shr x (- 64 n)))))
 
-(defn- nextrand (state:(ptr ui64)):ui64
+(defn- next-rand (state:(ptr ui64)):ui64
   (let (state0:ui64 (aref state 0)
         state1:ui64 (aref state 1)
         state2:ui64 (bit-xor (aref state 2) state0)
@@ -185,7 +159,7 @@
     (return res)))
 
 ; A float in [0,1) from the top 53 bits (a double's mantissa), times 2^-53.
-(defn- I2d (x:ui64):lua_Number
+(defn- i2d (x:ui64):lua_Number
   (let (sx:i64 (l_castU2S (bit-shr x 11))
         res:lua_Number (* (unsafe/cast lua_Number sx) 0x1.0p-53))
     (when (< sx 0)
@@ -204,18 +178,18 @@
       (set! sh (* sh 2)))
     (set! ran (bit-and ran lim))
     (while (> ran n)  ; outside [0, n]: try again
-      (set! ran (bit-and (nextrand (state 's)) lim)))
+      (set! ran (bit-and (next-rand (state 's)) lim)))
     (return ran)))
 
-(defn- math_random (L:(ptr lua_State)):i32
+(defn- math-random (L:(ptr lua_State)):i32
   (let (state:&RanState (unsafe/cast &RanState (lua_touserdata L (lua_upvalueindex 1)))
-        rv:ui64 (nextrand (state 's))
+        rv:ui64 (next-rand (state 's))
         low:lua_Integer 0
         up:lua_Integer 0
         nargs:i32 (lua_gettop L))
     (cond
       (= nargs 0)
-        (do (lua_pushnumber L (I2d rv))  ; a float in [0,1)
+        (do (lua_pushnumber L (i2d rv))  ; a float in [0,1)
             (return 1))
       (= nargs 1)
         (do (set! low 1)
@@ -232,43 +206,43 @@
       (lua_pushinteger L (l_castU2S (+ p (l_castS2U low))))
       (return 1))))
 
-(defn- setseed (L:(ptr lua_State) state:(ptr ui64) n1:lua_Unsigned n2:lua_Unsigned):void
+(defn- set-seed (L:(ptr lua_State) state:(ptr ui64) n1:lua_Unsigned n2:lua_Unsigned):void
   (set! (aref state 0) n1)
   (set! (aref state 1) 0xff)  ; no all-zero state
   (set! (aref state 2) n2)
   (set! (aref state 3) 0)
   (dotimes (i:i32 16)
-    (nextrand state))  ; discard the first values, to spread the seed
+    (next-rand state))  ; discard the first values, to spread the seed
   (lua_pushinteger L (l_castU2S n1))
   (lua_pushinteger L (l_castU2S n2)))
 
-(defn- math_randomseed (L:(ptr lua_State)):i32
+(defn- math-randomseed (L:(ptr lua_State)):i32
   (let (state:&RanState (unsafe/cast &RanState (lua_touserdata L (lua_upvalueindex 1)))
         n1:lua_Unsigned 0
         n2:lua_Unsigned 0)
     (if (lua_isnone L 1)
       (do (set! n1 (as lua_Unsigned (luaL_makeseed L)))  ; a "random" seed
-          (set! n2 (nextrand (state 's))))  ; in case it isn't that random
+          (set! n2 (next-rand (state 's))))  ; in case it isn't that random
       (do (set! n1 (l_castS2U (luaL_checkinteger L 1)))
           (set! n2 (l_castS2U (luaL_optinteger L 2 0)))))
-    (setseed L (state 's) n1 n2)
+    (set-seed L (state 's) n1 n2)
     (return 2)))  ; the seeds
 
 ; The random functions, sharing their state as an upvalue.
-(defn- setrandfunc (L:(ptr lua_State)):void
+(defn- set-rand-funcs (L:(ptr lua_State)):void
   (let (state:&RanState (unsafe/cast &RanState (lua_newuserdatauv L (sizeof RanState) 0)))
-    (setseed L (state 's) (as lua_Unsigned (luaL_makeseed L)) 0)
+    (set-seed L (state 's) (as lua_Unsigned (luaL_makeseed L)) 0)
     (lua_pop L 2)  ; the seeds
-    (lua-setfuncs L 1 ("random" math_random) ("randomseed" math_randomseed))))
+    (lua-setfuncs L 1 ("random" math-random) ("randomseed" math-randomseed))))
 
 (defn luaopen_math (L:(ptr lua_State)):i32
   (lua-newlib L
-    ("abs" math_abs) ("acos" math_acos) ("asin" math_asin) ("atan" math_atan)
-    ("ceil" math_ceil) ("cos" math_cos) ("deg" math_deg) ("exp" math_exp)
-    ("tointeger" math_toint) ("floor" math_floor) ("fmod" math_fmod)
-    ("frexp" math_frexp) ("ult" math_ult) ("ldexp" math_ldexp) ("log" math_log)
-    ("max" math_max) ("min" math_min) ("modf" math_modf) ("rad" math_rad)
-    ("sin" math_sin) ("sqrt" math_sqrt) ("tan" math_tan) ("type" math_type)
+    ("abs" math-abs) ("acos" math-acos) ("asin" math-asin) ("atan" math-atan)
+    ("ceil" math-ceil) ("cos" math-cos) ("deg" math-deg) ("exp" math-exp)
+    ("tointeger" math-toint) ("floor" math-floor) ("fmod" math-fmod)
+    ("frexp" math-frexp) ("ult" math-ult) ("ldexp" math-ldexp) ("log" math-log)
+    ("max" math-max) ("min" math-min) ("modf" math-modf) ("rad" math-rad)
+    ("sin" math-sin) ("sqrt" math-sqrt) ("tan" math-tan) ("type" math-type)
     ("random" null) ("randomseed" null) ("pi" null) ("huge" null)  ; placeholders
     ("maxinteger" null) ("mininteger" null))
   (lua_pushnumber L PI)
@@ -279,5 +253,5 @@
   (lua_setfield L -2 "maxinteger")
   (lua_pushinteger L LUA_MININTEGER)
   (lua_setfield L -2 "mininteger")
-  (setrandfunc L)
+  (set-rand-funcs L)
   (return 1))

@@ -17,7 +17,7 @@
 (defconst CAP_POSITION -2)
 (defconst SPECIALS "^$*+?.([%-")
 
-(defn- str_len (L:(ptr lua_State)):i32
+(defn- str-len (L:(ptr lua_State)):i32
   (let (l:usize 0)
     (luaL_checklstring L 1 &l)
     (lua_pushinteger L (cast_st2S l))
@@ -25,7 +25,7 @@
 
 ; A relative initial position (negative counts back from the end), clipped to
 ; [1, inf). The inverted comparison keeps '-pos' from overflowing.
-(defn- posrelatI (pos:lua_Integer len:usize):usize
+(defn- posrelat-i (pos:lua_Integer len:usize):usize
   (return (cond
             (> pos 0) (cast_sizet pos)
             (= pos 0) 1
@@ -41,17 +41,17 @@
               (< pos (- 0 (cast_st2S len))) 0
               true (+ len (cast_sizet pos) 1)))))
 
-(defn- str_sub (L:(ptr lua_State)):i32
+(defn- str-sub (L:(ptr lua_State)):i32
   (let (l:usize 0
         s:(ptr i8) (bytes (luaL_checklstring L 1 &l))
-        start:usize (posrelatI (luaL_checkinteger L 2) l)
+        start:usize (posrelat-i (luaL_checkinteger L 2) l)
         e:usize (getendpos L 3 -1 l))
     (if (<= start e)
       (lua_pushlstring L (cstr (p+ s (- start 1))) (+ (- e start) 1))
       (lua_pushliteral L ""))
     (return 1)))
 
-(defn- str_reverse (L:(ptr lua_State)):i32
+(defn- str-reverse (L:(ptr lua_State)):i32
   (let (l:usize 0
         b:&luaL_Buffer (alloca luaL_Buffer)
         s:(ptr i8) (bytes (luaL_checklstring L 1 &l))
@@ -61,7 +61,7 @@
     (luaL_pushresultsize b l)
     (return 1)))
 
-(defn- str_lower (L:(ptr lua_State)):i32
+(defn- str-lower (L:(ptr lua_State)):i32
   (let (l:usize 0
         b:&luaL_Buffer (alloca luaL_Buffer)
         s:(ptr i8) (bytes (luaL_checklstring L 1 &l))
@@ -71,7 +71,7 @@
     (luaL_pushresultsize b l)
     (return 1)))
 
-(defn- str_upper (L:(ptr lua_State)):i32
+(defn- str-upper (L:(ptr lua_State)):i32
   (let (l:usize 0
         b:&luaL_Buffer (alloca luaL_Buffer)
         s:(ptr i8) (bytes (luaL_checklstring L 1 &l))
@@ -81,7 +81,7 @@
     (luaL_pushresultsize b l)
     (return 1)))
 
-(defn- str_rep (L:(ptr lua_State)):i32
+(defn- str-rep (L:(ptr lua_State)):i32
   (let (len:usize 0
         lsep:usize 0
         s:(ptr i8) (bytes (luaL_checklstring L 1 &len))
@@ -108,11 +108,11 @@
           (luaL_pushresultsize b totallen)))
     (return 1)))
 
-(defn- str_byte (L:(ptr lua_State)):i32
+(defn- str-byte (L:(ptr lua_State)):i32
   (let (l:usize 0
         s:(ptr i8) (bytes (luaL_checklstring L 1 &l))
         pi0:lua_Integer (luaL_optinteger L 2 1)
-        posi:usize (posrelatI pi0 l)
+        posi:usize (posrelat-i pi0 l)
         pose:usize (getendpos L 3 pi0 l))
     (when (> posi pose) (return 0))  ; an empty interval: no values
     (when (>= (- pose posi) (cast_sizet INT_MAX))  ; arithmetic overflow?
@@ -123,7 +123,7 @@
         (lua_pushinteger L (as lua_Integer (cast_uchar (aref s (- (+ posi (cast_sizet i)) 1))))))
       (return n))))
 
-(defn- str_char (L:(ptr lua_State)):i32
+(defn- str-char (L:(ptr lua_State)):i32
   (let (n:i32 (lua_gettop L)
         b:&luaL_Buffer (alloca luaL_Buffer)
         p:(ptr i8) (luaL_buffinitsize L b (cast_sizet n)))
@@ -149,7 +149,7 @@
       (luaL_addlstring &(state 'B) (cstr b) size))
     (return 0)))
 
-(defn- str_dump (L:(ptr lua_State)):i32
+(defn- str-dump (L:(ptr lua_State)):i32
   (let (state:&str_Writer (alloca str_Writer)
         strip:i32 (lua_toboolean L 2))
     (luaL_argcheck L (and (= (lua_type L 1) LUA_TFUNCTION) (= (lua_iscfunction L 1) 0))
@@ -186,14 +186,14 @@
     (trymt L mtname (cstr (p+ (bytes mtname) 2))))
   (return 1))
 
-(defn- arith_add (L:(ptr lua_State)):i32 (return (arith L LUA_OPADD "__add")))
-(defn- arith_sub (L:(ptr lua_State)):i32 (return (arith L LUA_OPSUB "__sub")))
-(defn- arith_mul (L:(ptr lua_State)):i32 (return (arith L LUA_OPMUL "__mul")))
-(defn- arith_mod (L:(ptr lua_State)):i32 (return (arith L LUA_OPMOD "__mod")))
-(defn- arith_pow (L:(ptr lua_State)):i32 (return (arith L LUA_OPPOW "__pow")))
-(defn- arith_div (L:(ptr lua_State)):i32 (return (arith L LUA_OPDIV "__div")))
-(defn- arith_idiv (L:(ptr lua_State)):i32 (return (arith L LUA_OPIDIV "__idiv")))
-(defn- arith_unm (L:(ptr lua_State)):i32 (return (arith L LUA_OPUNM "__unm")))
+(defn- arith-add (L:(ptr lua_State)):i32 (return (arith L LUA_OPADD "__add")))
+(defn- arith-sub (L:(ptr lua_State)):i32 (return (arith L LUA_OPSUB "__sub")))
+(defn- arith-mul (L:(ptr lua_State)):i32 (return (arith L LUA_OPMUL "__mul")))
+(defn- arith-mod (L:(ptr lua_State)):i32 (return (arith L LUA_OPMOD "__mod")))
+(defn- arith-pow (L:(ptr lua_State)):i32 (return (arith L LUA_OPPOW "__pow")))
+(defn- arith-div (L:(ptr lua_State)):i32 (return (arith L LUA_OPDIV "__div")))
+(defn- arith-idiv (L:(ptr lua_State)):i32 (return (arith L LUA_OPIDIV "__idiv")))
+(defn- arith-unm (L:(ptr lua_State)):i32 (return (arith L LUA_OPUNM "__unm")))
 
 ; ---- Pattern matching ----
 
@@ -209,14 +209,14 @@
   level:i32          ; the number of captures, finished or not
   capture:(array Capture 32))
 
-(defn- check_capture (ms:&MatchState l0:i32):i32
+(defn- check-capture (ms:&MatchState l0:i32):i32
   (let (l:i32 (- l0 (ch \1)))
     (when (or (< l 0) (>= l (ms 'level))
               (= ((aref (ms 'capture) l) 'len) CAP_UNFINISHED))
       (return (luaL_error (ms 'L) "invalid capture index %%%d" (+ l 1))))
     (return l)))
 
-(defn- capture_to_close (ms:&MatchState):i32
+(defn- capture-to-close (ms:&MatchState):i32
   (let (level:i32 (- (ms 'level) 1))
     (while (>= level 0)
       (when (= ((aref (ms 'capture) level) 'len) CAP_UNFINISHED)
@@ -246,7 +246,7 @@
             (return (p+ p 1)))
       (return p))))
 
-(defn- match_class (c:i32 cl:i32):i32
+(defn- match-class (c:i32 cl:i32):i32
   (let (res:i32 0)
     (case (tolower cl)
       (ch \a) (set! res (isalpha c))
@@ -277,7 +277,7 @@
       (cond
         (= (deref p) (ch \%))
           (do (set! p (p+ p 1))
-              (when (!= (match_class c (uc (deref p))) 0)
+              (when (!= (match-class c (uc (deref p))) 0)
                 (return sig)))
         (and (= (aref p 1) (ch \-)) (< (p+ p 2) ec))
           (do (set! p (p+ p 2))
@@ -292,7 +292,7 @@
   (let (c:i32 (uc (deref s)))
     (return (case (deref p)
               (ch \.) true  ; any character
-              (ch \%) (!= (match_class c (uc (aref p 1))) 0)
+              (ch \%) (!= (match-class c (uc (aref p 1))) 0)
               (ch \[) (!= (matchbracketclass c p (p+ ep -1)) 0)
               (= (uc (deref p)) c)))))
 
@@ -312,46 +312,46 @@
         (= (deref s) b) (inc! cont)))
     (return null)))  ; the string ends out of balance
 
-(defn- max_expand (ms:&MatchState s:(ptr i8) p:(ptr i8) ep:(ptr i8)):(ptr i8)
+(defn- max-expand (ms:&MatchState s:(ptr i8) p:(ptr i8) ep:(ptr i8)):(ptr i8)
   (let (i:i64 0)  ; the most repetitions of the item
     (while (singlematch ms (p+ s i) p ep) (inc! i))
     (while (>= i 0)  ; try the rest of the pattern from the longest
-      (let (res:(ptr i8) (do_match ms (p+ s i) (p+ ep 1)))
+      (let (res:(ptr i8) (do-match ms (p+ s i) (p+ ep 1)))
         (when (!= res null) (return res))
         (dec! i)))
     (return null)))
 
-(defn- min_expand (ms:&MatchState s0:(ptr i8) p:(ptr i8) ep:(ptr i8)):(ptr i8)
+(defn- min-expand (ms:&MatchState s0:(ptr i8) p:(ptr i8) ep:(ptr i8)):(ptr i8)
   (let (s:(ptr i8) s0)
     (while true
-      (let (res:(ptr i8) (do_match ms s (p+ ep 1)))
+      (let (res:(ptr i8) (do-match ms s (p+ ep 1)))
         (cond
           (!= res null) (return res)
           (singlematch ms s p ep) (set! s (p+ s 1))  ; one more repetition
           true (return null))))
     (return null)))
 
-(defn- start_capture (ms:&MatchState s:(ptr i8) p:(ptr i8) what:i64):(ptr i8)
+(defn- start-capture (ms:&MatchState s:(ptr i8) p:(ptr i8) what:i64):(ptr i8)
   (let (level:i32 (ms 'level))
     (when (>= level LUA_MAXCAPTURES) (luaL_error (ms 'L) "too many captures"))
     (set! ((aref (ms 'capture) level) 'init) s)
     (set! ((aref (ms 'capture) level) 'len) what)
     (set! (ms 'level) (+ level 1))
-    (let (res:(ptr i8) (do_match ms s p))
+    (let (res:(ptr i8) (do-match ms s p))
       (when (= res null)  ; undo the capture
         (set! (ms 'level) (- (ms 'level) 1)))
       (return res))))
 
-(defn- end_capture (ms:&MatchState s:(ptr i8) p:(ptr i8)):(ptr i8)
-  (let (l:i32 (capture_to_close ms))
+(defn- end-capture (ms:&MatchState s:(ptr i8) p:(ptr i8)):(ptr i8)
+  (let (l:i32 (capture-to-close ms))
     (set! ((aref (ms 'capture) l) 'len) (byte-diff s ((aref (ms 'capture) l) 'init)))
-    (let (res:(ptr i8) (do_match ms s p))
+    (let (res:(ptr i8) (do-match ms s p))
       (when (= res null)  ; undo the capture
         (set! ((aref (ms 'capture) l) 'len) CAP_UNFINISHED))
       (return res))))
 
-(defn- match_capture (ms:&MatchState s:(ptr i8) l0:i32):(ptr i8)
-  (let (l:i32 (check_capture ms l0)
+(defn- match-capture (ms:&MatchState s:(ptr i8) l0:i32):(ptr i8)
+  (let (l:i32 (check-capture ms l0)
         len:usize (cast_sizet ((aref (ms 'capture) l) 'len)))
     (if (and (>= (cast_sizet (byte-diff (ms 'src_end) s)) len)
              (= (memcmp ((aref (ms 'capture) l) 'init) s len) 0))
@@ -360,7 +360,7 @@
 
 ; C's 'match'. Its 'goto init' is the loop's `continue`, a tail call made a jump;
 ; 'goto dflt' sets 'dflt'.
-(defn- do_match (ms:&MatchState s0:(ptr i8) p0:(ptr i8)):(ptr i8)
+(defn- do-match (ms:&MatchState s0:(ptr i8) p0:(ptr i8)):(ptr i8)
   (let (s:(ptr i8) s0
         p:(ptr i8) p0
         depth:i32 (ms 'matchdepth))
@@ -371,10 +371,10 @@
         (case (deref p)
           (ch \()  ; a capture starts
             (set! s (if (= (aref p 1) (ch \)))  ; a position capture?
-                      (start_capture ms s (p+ p 2) CAP_POSITION)
-                      (start_capture ms s (p+ p 1) CAP_UNFINISHED)))
+                      (start-capture ms s (p+ p 2) CAP_POSITION)
+                      (start-capture ms s (p+ p 1) CAP_UNFINISHED)))
           (ch \))  ; a capture ends
-            (set! s (end_capture ms s (p+ p 1)))
+            (set! s (end-capture ms s (p+ p 1)))
           (ch \$)
             (if (!= (p+ p 1) (ms 'p_end))  ; not the pattern's last character?
               (set! dflt true)
@@ -399,7 +399,7 @@
                           (continue))
                         (set! s null)))  ; no match
                 (!= (isdigit (uc c1)) 0)  ; a back reference, %0-%9?
-                  (do (set! s (match_capture ms s (uc c1)))
+                  (do (set! s (match-capture ms s (uc c1)))
                       (when (!= s null)
                         (set! p (p+ p 2))
                         (continue)))
@@ -414,14 +414,14 @@
                 (set! s null))  ; '+' or no suffix: fail
               (case (deref ep)  ; one match: the suffix decides
                 (ch \?)
-                  (let (res:(ptr i8) (do_match ms (p+ s 1) (p+ ep 1)))
+                  (let (res:(ptr i8) (do-match ms (p+ s 1) (p+ ep 1)))
                     (if (!= res null)
                       (set! s res)
                       (do (set! p (p+ ep 1))
                           (continue))))
-                (ch \+) (set! s (max_expand ms (p+ s 1) p ep))  ; one match done
-                (ch \*) (set! s (max_expand ms s p ep))
-                (ch \-) (set! s (min_expand ms s p ep))
+                (ch \+) (set! s (max-expand ms (p+ s 1) p ep))  ; one match done
+                (ch \*) (set! s (max-expand ms s p ep))
+                (ch \-) (set! s (min-expand ms s p ep))
                 (do (set! s (p+ s 1))  ; no suffix
                     (set! p ep)
                     (continue))))))
@@ -448,7 +448,7 @@
 
 ; The i-th capture: a string's length, with its start in 'cap', or CAP_POSITION
 ; with the position pushed. With no captures, capture 0 is the whole match.
-(defn- get_onecapture (ms:&MatchState i:i32 s:(ptr i8) e:(ptr i8) cap:(ptr (ptr i8))):i64
+(defn- get-onecapture (ms:&MatchState i:i32 s:(ptr i8) e:(ptr i8) cap:(ptr (ptr i8))):i64
   (if (>= i (ms 'level))
     (do (when (!= i 0)
           (luaL_error (ms 'L) "invalid capture index %%%d" (+ i 1)))
@@ -463,17 +463,17 @@
             (+ (byte-diff ((aref (ms 'capture) i) 'init) (ms 'src_init)) 1)))
       (return capl))))
 
-(defn- push_onecapture (ms:&MatchState i:i32 s:(ptr i8) e:(ptr i8)):void
+(defn- push-onecapture (ms:&MatchState i:i32 s:(ptr i8) e:(ptr i8)):void
   (let (cap:(ptr i8) null
-        l:i64 (get_onecapture ms i s e &cap))
+        l:i64 (get-onecapture ms i s e &cap))
     (when (!= l CAP_POSITION)  ; else the position is already pushed
       (lua_pushlstring (ms 'L) (cstr cap) (cast_sizet l)))))
 
-(defn- push_captures (ms:&MatchState s:(ptr i8) e:(ptr i8)):i32
+(defn- push-captures (ms:&MatchState s:(ptr i8) e:(ptr i8)):i32
   (let (nlevels:i32 (if (and (= (ms 'level) 0) (!= s null)) 1 (ms 'level)))
     (luaL_checkstack (ms 'L) nlevels "too many captures")
     (for (i:i32 0) (< i nlevels) (inc! i)
-      (push_onecapture ms i s e))
+      (push-onecapture ms i s e))
     (return nlevels)))
 
 ; Whether the pattern has no special characters, past any '\0' in it too.
@@ -498,12 +498,12 @@
   (set! (ms 'matchdepth) MAXCCALLS)
   (set! (ms 'level) 0))
 
-(defn- str_find_aux (L:(ptr lua_State) find:bool):i32
+(defn- str-find-aux (L:(ptr lua_State) find:bool):i32
   (let (ls:usize 0
         lp:usize 0
         s:(ptr i8) (bytes (luaL_checklstring L 1 &ls))
         p:(ptr i8) (bytes (luaL_checklstring L 2 &lp))
-        init:usize (- (posrelatI (luaL_optinteger L 3 1) ls) 1))
+        init:usize (- (posrelat-i (luaL_optinteger L 3 1) ls) 1))
     (when (> init ls)  ; it starts after the string's end?
       (luaL_pushfail L)
       (return 1))
@@ -522,21 +522,21 @@
         (prepstate ms L s ls p lp)
         (while true
           (reprepstate ms)
-          (let (res:(ptr i8) (do_match ms s1 p))
+          (let (res:(ptr i8) (do-match ms s1 p))
             (when (!= res null)
               (if find
                 (do (lua_pushinteger L (+ (byte-diff s1 s) 1))  ; the start
                     (lua_pushinteger L (byte-diff res s))  ; the end
-                    (return (+ (push_captures ms null null) 2)))
-                (return (push_captures ms s1 res)))))
+                    (return (+ (push-captures ms null null) 2)))
+                (return (push-captures ms s1 res)))))
           (let (prev:(ptr i8) s1)
             (set! s1 (p+ s1 1))
             (when (or (>= prev (ms 'src_end)) anchor) (break))))))
     (luaL_pushfail L)  ; not found
     (return 1)))
 
-(defn- str_find (L:(ptr lua_State)):i32 (return (str_find_aux L true)))
-(defn- str_match (L:(ptr lua_State)):i32 (return (str_find_aux L false)))
+(defn- str-find (L:(ptr lua_State)):i32 (return (str-find-aux L true)))
+(defn- str-match (L:(ptr lua_State)):i32 (return (str-find-aux L false)))
 
 ; gmatch's state, in the closure's third upvalue.
 (defstruct GMatchState
@@ -545,18 +545,18 @@
   lastmatch:(ptr i8)  ; the end of the last match
   ms:MatchState)
 
-(defn- gmatch_aux (L:(ptr lua_State)):i32
+(defn- gmatch-aux (L:(ptr lua_State)):i32
   (let (gm:&GMatchState (unsafe/cast &GMatchState (lua_touserdata L (lua_upvalueindex 3)))
         ms:&MatchState &(gm 'ms)
         src:(ptr i8) (gm 'src))
     (set! (ms 'L) L)
     (while (<= src (ms 'src_end))
       (reprepstate ms)
-      (let (e:(ptr i8) (do_match ms src (gm 'p)))
+      (let (e:(ptr i8) (do-match ms src (gm 'p)))
         (when (and (!= e null) (!= e (gm 'lastmatch)))
           (set! (gm 'src) e)
           (set! (gm 'lastmatch) e)
-          (return (push_captures ms src e))))
+          (return (push-captures ms src e))))
       (set! src (p+ src 1)))
     (return 0)))  ; not found
 
@@ -565,7 +565,7 @@
         lp:usize 0
         s:(ptr i8) (bytes (luaL_checklstring L 1 &ls))
         p:(ptr i8) (bytes (luaL_checklstring L 2 &lp))
-        init:usize (- (posrelatI (luaL_optinteger L 3 1) ls) 1))
+        init:usize (- (posrelat-i (luaL_optinteger L 3 1) ls) 1))
     (lua_settop L 2)  ; the strings stay in the closure, safe from collection
     (let (gm:&GMatchState (unsafe/cast &GMatchState (lua_newuserdatauv L (sizeof GMatchState) 0)))
       (when (> init ls)  ; it starts after the string's end?
@@ -574,10 +574,10 @@
       (set! (gm 'src) (p+ s init))
       (set! (gm 'p) p)
       (set! (gm 'lastmatch) null)
-      (lua_pushcclosure L gmatch_aux 3)
+      (lua_pushcclosure L gmatch-aux 3)
       (return 1))))
 
-(defn- add_s (ms:&MatchState b:&luaL_Buffer s:(ptr i8) e:(ptr i8)):void
+(defn- add-s (ms:&MatchState b:&luaL_Buffer s:(ptr i8) e:(ptr i8)):void
   (let (L:(ptr lua_State) (ms 'L)
         l:usize 0
         news:(ptr i8) (bytes (lua_tolstring L 3 &l))
@@ -593,7 +593,7 @@
           (luaL_addlstring b (cstr s) (cast_sizet (byte-diff e s)))
         (!= (isdigit (uc (deref p))) 0)  ; '%n'
           (let (cap:(ptr i8) null
-                resl:i64 (get_onecapture ms (- (as i32 (deref p)) (ch \1)) s e &cap))
+                resl:i64 (get-onecapture ms (- (as i32 (deref p)) (ch \1)) s e &cap))
             (if (= resl CAP_POSITION)
               (luaL_addvalue b)  ; the position, already pushed
               (luaL_addlstring b (cstr cap) (cast_sizet resl))))
@@ -604,17 +604,17 @@
 
 ; Adds the replacement to 'b', and says whether the subject changed: a call or
 ; an index giving nil or false keeps the original text.
-(defn- add_value (ms:&MatchState b:&luaL_Buffer s:(ptr i8) e:(ptr i8) tr:i32):bool
+(defn- add-value (ms:&MatchState b:&luaL_Buffer s:(ptr i8) e:(ptr i8) tr:i32):bool
   (let (L:(ptr lua_State) (ms 'L))
     (cond
       (= tr LUA_TFUNCTION)
         (do (lua_pushvalue L 3)
-            (lua_call L (push_captures ms s e) 1))  ; the captures as arguments
+            (lua_call L (push-captures ms s e) 1))  ; the captures as arguments
       (= tr LUA_TTABLE)
-        (do (push_onecapture ms 0 s e)  ; the first capture is the key
+        (do (push-onecapture ms 0 s e)  ; the first capture is the key
             (lua_gettable L 3))
       true  ; a number or a string
-        (do (add_s ms b s e)
+        (do (add-s ms b s e)
             (return true)))
     (cond
       (= (lua_toboolean L -1) 0)  ; nil or false?
@@ -628,7 +628,7 @@
         (do (luaL_addvalue b)
             (return true)))))
 
-(defn- str_gsub (L:(ptr lua_State)):i32
+(defn- str-gsub (L:(ptr lua_State)):i32
   (let (srcl:usize 0
         lp:usize 0
         src:(ptr i8) (bytes (luaL_checklstring L 1 &srcl))  ; the subject
@@ -651,11 +651,11 @@
     (prepstate ms L src srcl p lp)
     (while (< n max_s)
       (reprepstate ms)
-      (let (e:(ptr i8) (do_match ms src p))
+      (let (e:(ptr i8) (do-match ms src p))
         (cond
           (and (!= e null) (!= e lastmatch))  ; a match?
             (do (inc! n)
-                (set! changed (or (add_value ms b src e tr) changed))
+                (set! changed (or (add-value ms b src e tr) changed))
                 (set! src e)
                 (set! lastmatch e))
           (< src (ms 'src_end))  ; else copy one character
@@ -782,7 +782,7 @@
     (set! (aref form (- (+ l lm) 1)) spec)
     (set! (aref form (+ l lm)) 0)))
 
-(defn- str_format (L:(ptr lua_State)):i32
+(defn- str-format (L:(ptr lua_State)):i32
   (let (top:i32 (lua_gettop L)
         arg:i32 1
         sfl:usize 0
@@ -1004,7 +1004,7 @@
         (set! dest (p+ dest -1))
         (set! src (p+ src 1))))))
 
-(defn- str_pack (L:(ptr lua_State)):i32
+(defn- str-pack (L:(ptr lua_State)):i32
   (let (b:&luaL_Buffer (alloca luaL_Buffer)
         h:&Header (alloca Header)
         fmt:(ptr i8) (bytes (luaL_checkstring L 1))
@@ -1084,7 +1084,7 @@
     (luaL_pushresult b)
     (return 1)))
 
-(defn- str_packsize (L:(ptr lua_State)):i32
+(defn- str-packsize (L:(ptr lua_State)):i32
   (let (h:&Header (alloca Header)
         fmt:(ptr i8) (bytes (luaL_checkstring L 1))
         totalsize:usize 0
@@ -1122,12 +1122,12 @@
               (luaL_error L "%d-byte integer does not fit into Lua Integer" size)))))
     (return (l_castU2S res))))
 
-(defn- str_unpack (L:(ptr lua_State)):i32
+(defn- str-unpack (L:(ptr lua_State)):i32
   (let (h:&Header (alloca Header)
         fmt:(ptr i8) (bytes (luaL_checkstring L 1))
         ld:usize 0
         data:(ptr i8) (bytes (luaL_checklstring L 2 &ld))
-        pos:usize (- (posrelatI (luaL_optinteger L 3 1) ld) 1)
+        pos:usize (- (posrelat-i (luaL_optinteger L 3 1) ld) 1)
         n:i32 0  ; the results
         ntoalign:ui32 0
         size:usize 0)
@@ -1173,8 +1173,8 @@
 (defn- createmetatable (L:(ptr lua_State)):void
   (lua_createtable L 0 9)
   (lua-setfuncs L 0
-    ("__add" arith_add) ("__sub" arith_sub) ("__mul" arith_mul) ("__mod" arith_mod)
-    ("__pow" arith_pow) ("__div" arith_div) ("__idiv" arith_idiv) ("__unm" arith_unm)
+    ("__add" arith-add) ("__sub" arith-sub) ("__mul" arith-mul) ("__mod" arith-mod)
+    ("__pow" arith-pow) ("__div" arith-div) ("__idiv" arith-idiv) ("__unm" arith-unm)
     ("__index" null))  ; set below
   (lua_pushliteral L "")  ; a dummy string
   (lua_pushvalue L -2)
@@ -1186,10 +1186,10 @@
 
 (defn luaopen_string (L:(ptr lua_State)):i32
   (lua-newlib L
-    ("byte" str_byte) ("char" str_char) ("dump" str_dump) ("find" str_find)
-    ("format" str_format) ("gmatch" gmatch) ("gsub" str_gsub) ("len" str_len)
-    ("lower" str_lower) ("match" str_match) ("rep" str_rep) ("reverse" str_reverse)
-    ("sub" str_sub) ("upper" str_upper) ("pack" str_pack) ("packsize" str_packsize)
-    ("unpack" str_unpack))
+    ("byte" str-byte) ("char" str-char) ("dump" str-dump) ("find" str-find)
+    ("format" str-format) ("gmatch" gmatch) ("gsub" str-gsub) ("len" str-len)
+    ("lower" str-lower) ("match" str-match) ("rep" str-rep) ("reverse" str-reverse)
+    ("sub" str-sub) ("upper" str-upper) ("pack" str-pack) ("packsize" str-packsize)
+    ("unpack" str-unpack))
   (createmetatable L)
   (return 1))

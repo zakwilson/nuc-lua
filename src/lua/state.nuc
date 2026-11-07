@@ -18,6 +18,16 @@
 (import-use "string.h")
 (import-use lua.util)
 (import-use lua.core)
+(import-use lua.object)
+(import-use lua.func)
+(import-use lua.gc)
+(import-use lua.lex)
+(import-use lua.tm)
+(import-use lua.string)
+(import-use lua.table)
+(import-use lua.debug)
+(import-use lua.do)
+(import-use lua.mem)
 
 (defconst LUAI_MAXCCALLS 200)
 (defconst BASIC_STACK_SIZE 40)  ; 2*LUA_MINSTACK
@@ -27,33 +37,22 @@
 (defconst GCSpause 8)
 (defconst KGC_INC 0)
 
-(defmacro getCcalls (L) `(bit-and (~L 'nCcalls) 0xffff))
-(defmacro incnny (L) `(set! (~L 'nCcalls) (+ (~L 'nCcalls) 0x10000)))
-(defmacro stacksize (th) `(cast_int (stack-diff ((~th 'stack_last) 'p) ((~th 'stack) 'p))))
-(defmacro resethookcount (L) `(set! (~L 'hookcount) (~L 'basehookcount)))
-(defmacro mainthread (g) `(ref ((~g 'mainth) 'l)))
-(defmacro setthvalue (L obj x)
-  `(let (a:(ptr TValue) ~obj)
-     (set! ((a 'value_) 'gc) (obj2gco ~x))
-     (set! (a 'tt_) (ctb LUA_VTHREAD))))
-(defmacro lua_getextraspace (L) `(as ptr (p+ (bytes ~L) (- LUA_EXTRASPACE))))
 ; The LX holding a thread: the extra space sits just before it.
 (defmacro fromstate (L) `(unsafe/cast (ptr LX) (p+ (bytes ~L) (- (offsetof LX l)))))
-(defmacro gettotalbytes (g) `(- (~g 'GCtotalbytes) (~g 'GCdebt)))
-(defmacro setgcparam (g p v) `(set! (aref (~g 'gcparams) ~p) (luaO_codeparam ~v)))
+(defmacro setgcparam (g p v) `(set! (aref (~g 'gcparams) ~p) (obj-codeparam ~v)))
 
 ; Sets GCdebt, keeping GCtotalbytes - GCdebt (the bytes really allocated)
 ; invariant without overflowing GCtotalbytes.
-(defn luaE_setdebt (g:(ptr global_State) debt0:l_mem):void
+(defn state-setdebt (g:(ptr global_State) debt0:l_mem):void
   (let (tb:l_mem (gettotalbytes g)
         debt:l_mem (if (> debt0 (- MAX_LMEM tb)) (- MAX_LMEM tb) debt0))  ; GCtotalbytes == MAX_LMEM
     (set! (g 'GCtotalbytes) (+ tb debt))
     (set! (g 'GCdebt) debt)))
 
-(defn luaE_extendCI (L:(ptr lua_State) err:i32):(ptr CallInfo)
-  (let (ci:(ptr CallInfo) (luaM_reallocvector L null 0 1 CallInfo))
+(defn state-extend-ci (L:(ptr lua_State) err:i32):(ptr CallInfo)
+  (let (ci:(ptr CallInfo) (mem-reallocvector L null 0 1 CallInfo))
     (when (= (as ptr ci) null)  ; the allocation failed?
-      (when (!= err 0) (luaM_error L))
+      (when (!= err 0) (mem-error L))
       (return null))  ; else only report it
     (set! (ci 'next) ((L 'ci) 'next))
     (set! (ci 'previous) (L 'ci))
@@ -65,18 +64,18 @@
     (return ci)))
 
 ; Frees every CallInfo the thread isn't using.
-(defn- freeCI (L:(ptr lua_State)):void
+(defn- free-ci (L:(ptr lua_State)):void
   (let (ci:(ptr CallInfo) (L 'ci)
         next:(ptr CallInfo) (ci 'next))
     (set! (ci 'next) null)
     (while (!= (as ptr next) null)
       (set! ci next)
       (set! next (ci 'next))
-      (luaM_free L ci CallInfo)
+      (mem-free L ci CallInfo)
       (set! (L 'nci) (- (L 'nci) 1)))))
 
 ; Frees half the CallInfos the thread isn't using, keeping the first.
-(defn luaE_shrinkCI (L:(ptr lua_State)):void
+(defn state-shrink-ci (L:(ptr lua_State)):void
   (let (ci:(ptr CallInfo) ((L 'ci) 'next))  ; the first free one
     (when (= (as ptr ci) null) (return))
     (while (!= (as ptr (ci 'next)) null)  ; two extra elements?
@@ -84,23 +83,23 @@
             next2:(ptr CallInfo) (next 'next))
         (set! (ci 'next) next2)  ; remove 'next' from the list
         (set! (L 'nci) (- (L 'nci) 1))
-        (luaM_free L next CallInfo)
+        (mem-free L next CallInfo)
         (when (= (as ptr next2) null) (break))
         (set! (next2 'previous) ci)
         (set! ci next2)))))
 
 ; At getCcalls(L) >= LUAI_MAXCCALLS: an overflow error when equal; when larger
 ; but not by much, nothing, so the overflow's own handling can run.
-(defn luaE_checkcstack (L:(ptr lua_State)):void
-  (cond (= (getCcalls L) LUAI_MAXCCALLS) (luaG_runerror L "C stack overflow")
-        (>= (getCcalls L) (* (/ LUAI_MAXCCALLS 10) 11)) (luaD_errerr L)))  ; an error while handling one
+(defn state-checkcstack (L:(ptr lua_State)):void
+  (cond (= (getCcalls L) LUAI_MAXCCALLS) (debug-runerror L "C stack overflow")
+        (>= (getCcalls L) (* (/ LUAI_MAXCCALLS 10) 11)) (do-errerr L)))  ; an error while handling one
 
-(defn luaE_incCstack (L:(ptr lua_State)):void
+(defn state-inc-cstack (L:(ptr lua_State)):void
   (set! (L 'nCcalls) (+ (L 'nCcalls) 1))
   (when (>= (getCcalls L) LUAI_MAXCCALLS)
-    (luaE_checkcstack L)))
+    (state-checkcstack L)))
 
-(defn- resetCI (L:(ptr lua_State)):void
+(defn- reset-ci (L:(ptr lua_State)):void
   (let (ci:(ptr CallInfo) (ref (L 'base_ci)))
     (set! (L 'ci) ci)
     (set! ((ci 'func) 'p) ((L 'stack) 'p))
@@ -111,48 +110,48 @@
     (set! (L 'status) LUA_OK)
     (set! (L 'errfunc) 0)))  ; unwinding the stack may drop the error function
 
-(defn- stack_init (L1:(ptr lua_State) L:(ptr lua_State)):void
-  (set! ((L1 'stack) 'p) (luaM_newvector L (+ BASIC_STACK_SIZE EXTRA_STACK) StackValue))
+(defn- stack-init (L1:(ptr lua_State) L:(ptr lua_State)):void
+  (set! ((L1 'stack) 'p) (mem-newvector L (+ BASIC_STACK_SIZE EXTRA_STACK) StackValue))
   (set! ((L1 'tbclist) 'p) ((L1 'stack) 'p))
   (for (i:i32 0) (< i (+ BASIC_STACK_SIZE EXTRA_STACK)) (inc! i)
     (setnilvalue2s (p+ ((L1 'stack) 'p) i)))
   (set! ((L1 'stack_last) 'p) (p+ ((L1 'stack) 'p) BASIC_STACK_SIZE))
-  (resetCI L1)
+  (reset-ci L1)
   (set! ((L1 'top) 'p) (p+ ((L1 'stack) 'p) 1)))  ; past the 'function' entry
 
 (defn- freestack (L:(ptr lua_State)):void
   (when (= (as ptr ((L 'stack) 'p)) null)
     (return))  ; the stack isn't built yet
   (set! (L 'ci) (ref (L 'base_ci)))  ; free the whole ci list
-  (freeCI L)
-  (luaM_freearray L ((L 'stack) 'p) (+ (stacksize L) EXTRA_STACK) StackValue))
+  (free-ci L)
+  (mem-freearray L ((L 'stack) 'p) (+ (stacksize L) EXTRA_STACK) StackValue))
 
 ; The registry, with registry[1] = false, the main thread and the globals.
-(defn- init_registry (L:(ptr lua_State) g:(ptr global_State)):void
+(defn- init-registry (L:(ptr lua_State) g:(ptr global_State)):void
   (let (aux:(ptr TValue) (alloca TValue)
-        registry:(ptr Table) (luaH_new L))
+        registry:(ptr Table) (table-new L))
     (sethvalue L (ref (g 'l_registry)) registry)
-    (luaH_resize L registry LUA_RIDX_LAST 0)
+    (table-resize L registry LUA_RIDX_LAST 0)
     (setbfvalue aux)
-    (luaH_setint L registry 1 aux)
+    (table-setint L registry 1 aux)
     (setthvalue L aux L)
-    (luaH_setint L registry LUA_RIDX_MAINTHREAD aux)
-    (sethvalue L aux (luaH_new L))
-    (luaH_setint L registry LUA_RIDX_GLOBALS aux)))
+    (table-setint L registry LUA_RIDX_MAINTHREAD aux)
+    (sethvalue L aux (table-new L))
+    (table-setint L registry LUA_RIDX_GLOBALS aux)))
 
 ; The parts of the state that may fail to allocate.
-(defn- f_luaopen (L:(ptr lua_State) ud:ptr):void
+(defn- f-luaopen (L:(ptr lua_State) ud:ptr):void
   (let (g:(ptr global_State) (G L))
-    (stack_init L L)
-    (init_registry L g)
-    (luaS_init L)
-    (luaT_init L)
-    (luaX_init L)
+    (stack-init L L)
+    (init-registry L g)
+    (string-init L)
+    (tm-init L)
+    (lex-init L)
     (set! (g 'gcstp) 0)  ; allow the collector
     (setnilvalue (ref (g 'nilvalue)))))  ; the state is complete
 
 ; Consistent values for a thread, allocating nothing, so nothing can fail.
-(defn- preinit_thread (L:(ptr lua_State) g:(ptr global_State)):void
+(defn- preinit-thread (L:(ptr lua_State) g:(ptr global_State)):void
   (set! (L 'l_G) g)
   (set! ((L 'stack) 'p) null)
   (set! (L 'ci) null)
@@ -172,60 +171,60 @@
   (set! ((L 'base_ci) 'previous) null)
   (set! ((L 'base_ci) 'next) null))
 
-(defn luaE_threadsize (L:(ptr lua_State)):lu_mem
+(defn state-threadsize (L:(ptr lua_State)):lu_mem
   (let (sz:lu_mem (+ (cast_sizet (sizeof LX)) (* (as lu_mem (cast_uint (L 'nci))) (cast_sizet (sizeof CallInfo)))))
     (when (!= (as ptr ((L 'stack) 'p)) null)
       (set! sz (+ sz (* (as lu_mem (cast_uint (+ (stacksize L) EXTRA_STACK))) (cast_sizet (sizeof StackValue))))))
     (return sz)))
 
-(defn- close_state (L:(ptr lua_State)):void
+(defn- close-state (L:(ptr lua_State)):void
   (let (g:(ptr global_State) (G L))
     (if (not (completestate g))
-      (luaC_freeallobjects L)  ; partly built: just collect its objects
-      (do (resetCI L)
-          (luaD_closeprotected L 1 LUA_OK)  ; close every upvalue
+      (gc-freeallobjects L)  ; partly built: just collect its objects
+      (do (reset-ci L)
+          (do-closeprotected L 1 LUA_OK)  ; close every upvalue
           (set! ((L 'top) 'p) (p+ ((L 'stack) 'p) 1))  ; an empty stack, for the finalizers
-          (luaC_freeallobjects L)))
-    (luaM_freearray L ((g 'strt) 'hash) ((g 'strt) 'size) (ptr TString))
+          (gc-freeallobjects L)))
+    (mem-freearray L ((g 'strt) 'hash) ((g 'strt) 'size) (ptr TString))
     (freestack L)
     ((g 'frealloc) (g 'ud) (as ptr g) (cast_sizet (sizeof global_State)) 0)))  ; the main block
 
 (defn lua_newthread (L:(ptr lua_State)):(ptr lua_State)
   (let (g:(ptr global_State) (G L))
-    (luaC_checkGC L)
-    (let (o:(ptr GCObject) (luaC_newobjdt L LUA_TTHREAD (cast_sizet (sizeof LX)) (offsetof LX l))
+    (gc-check L)
+    (let (o:(ptr GCObject) (gc-newobjdt L LUA_TTHREAD (cast_sizet (sizeof LX)) (offsetof LX l))
           L1:(ptr lua_State) (gco2th o))
       (setthvalue L (s2v ((L 'top) 'p)) L1)  ; anchored on L's stack
       (set! ((L 'top) 'p) (p+ ((L 'top) 'p) 1))
-      (preinit_thread L1 g)
+      (preinit-thread L1 g)
       (set! (L1 'hookmask) (L 'hookmask))
       (set! (L1 'basehookcount) (L 'basehookcount))
       (set! (L1 'hook) (L 'hook))
       (resethookcount L1)
       (memcpy (lua_getextraspace L1) (lua_getextraspace (mainthread g)) LUA_EXTRASPACE)
-      (stack_init L1 L)
+      (stack-init L1 L)
       (return L1))))
 
-(defn luaE_freethread (L:(ptr lua_State) L1:(ptr lua_State)):void
+(defn state-freethread (L:(ptr lua_State) L1:(ptr lua_State)):void
   (let (l:(ptr LX) (fromstate L1))
-    (luaF_closeupval L1 ((L1 'stack) 'p))  ; close every upvalue
+    (func-closeupval L1 ((L1 'stack) 'p))  ; close every upvalue
     (freestack L1)
-    (luaM_free L l LX)))
+    (mem-free L l LX)))
 
-(defn luaE_resetthread (L:(ptr lua_State) status0:TStatus):TStatus
-  (resetCI L)
-  (let (status:TStatus (luaD_closeprotected L 1 (if (= status0 LUA_YIELD) LUA_OK status0)))
+(defn state-resetthread (L:(ptr lua_State) status0:TStatus):TStatus
+  (reset-ci L)
+  (let (status:TStatus (do-closeprotected L 1 (if (= status0 LUA_YIELD) LUA_OK status0)))
     (if (!= status LUA_OK)  ; errors?
-      (luaD_seterrorobj L status (p+ ((L 'stack) 'p) 1))
+      (do-seterrorobj L status (p+ ((L 'stack) 'p) 1))
       (set! ((L 'top) 'p) (p+ ((L 'stack) 'p) 1)))
-    (luaD_reallocstack L (cast_int (stack-diff (((L 'ci) 'top) 'p) ((L 'stack) 'p))) 0)
+    (do-reallocstack L (cast_int (stack-diff (((L 'ci) 'top) 'p) ((L 'stack) 'p))) 0)
     (return status)))
 
 (defn lua_closethread (L:(ptr lua_State) from:(ptr lua_State)):i32
   (set! (L 'nCcalls) (if (!= (as ptr from) null) (getCcalls from) 0))
-  (let (status:TStatus (luaE_resetthread L (L 'status)))
+  (let (status:TStatus (state-resetthread L (L 'status)))
     (when (= L from)  ; closing itself?
-      (luaD_throwbaselevel L status))
+      (do-throwbaselevel L status))
     (return (as i32 status))))
 
 (defn lua_newstate (f:lua_Alloc ud:ptr seed:ui32):(ptr lua_State)
@@ -235,8 +234,8 @@
     (let (L:(ptr lua_State) (mainthread g))
       (set! (L 'tt) LUA_VTHREAD)
       (set! (g 'currentwhite) 8)  ; bitmask(WHITE0BIT)
-      (set! (L 'marked) (cast_uchar (bit-and (g 'currentwhite) WHITEBITS)))  ; luaC_white
-      (preinit_thread L g)
+      (set! (L 'marked) (cast_uchar (bit-and (g 'currentwhite) WHITEBITS)))  ; gc-white
+      (preinit-thread L g)
       (set! (g 'allgc) (obj2gco L))  ; the only object yet
       (set! (L 'next) null)
       (incnny L)  ; the main thread never yields
@@ -275,25 +274,25 @@
       (setgcparam g LUA_GCPMAJORMINOR 50)  ; LUAI_MAJORMINOR
       (for (i:i32 0) (< i LUA_NUMTYPES) (inc! i)
         (set! (aref (g 'mt) i) null))
-      (when (!= (luaD_rawrunprotected L f_luaopen null) LUA_OK)
-        (close_state L)  ; an allocation failed: free the partial state
+      (when (!= (do-rawrunprotected L f-luaopen null) LUA_OK)
+        (close-state L)  ; an allocation failed: free the partial state
         (return null))
       (return L))))
 
 (defn lua_close (L:(ptr lua_State)):void
-  (close_state (mainthread (G L))))  ; only the main thread can be closed
+  (close-state (mainthread (G L))))  ; only the main thread can be closed
 
-(defn luaE_warning (L:(ptr lua_State) msg:CStr tocont:i32):void
+(defn state-warning (L:(ptr lua_State) msg:CStr tocont:i32):void
   (let (wf:lua_WarnFunction ((G L) 'warnf))
     (when (!= (unsafe/cast ptr wf) null)
       (wf ((G L) 'ud_warn) msg tocont))))
 
 ; The warning "error in WHERE (MSG)" from the error object on the top.
-(defn luaE_warnerror (L:(ptr lua_State) where:CStr):void
+(defn state-warnerror (L:(ptr lua_State) where:CStr):void
   (let (errobj:(ptr TValue) (s2v (p+ ((L 'top) 'p) -1))
         msg:CStr (if (ttisstring errobj) (cstr (getstr (tsvalue errobj))) (cstr "error object is not a string")))
-    (luaE_warning L "error in " 1)
-    (luaE_warning L where 1)
-    (luaE_warning L " (" 1)
-    (luaE_warning L msg 1)
-    (luaE_warning L ")" 0)))
+    (state-warning L "error in " 1)
+    (state-warning L where 1)
+    (state-warning L " (" 1)
+    (state-warning L msg 1)
+    (state-warning L ")" 0)))

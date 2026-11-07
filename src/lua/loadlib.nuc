@@ -24,16 +24,16 @@
 
 ; ---- The dlopen system ----
 
-(defn- lsys_unloadlib (lib:ptr):void
+(defn- sys-unloadlib (lib:ptr):void
   (dlclose lib))
 
-(defn- lsys_load (L:(ptr lua_State) path:CStr seeglb:bool):ptr
+(defn- sys-load (L:(ptr lua_State) path:CStr seeglb:bool):ptr
   (let (lib:ptr (dlopen path (bit-or RTLD_NOW (if seeglb RTLD_GLOBAL RTLD_LOCAL))))
     (when (= lib null)
       (lua_pushstring L (dlerror)))
     (return lib)))
 
-(defn- lsys_sym (L:(ptr lua_State) lib:ptr sym:CStr):lua_CFunction
+(defn- sys-sym (L:(ptr lua_State) lib:ptr sym:CStr):lua_CFunction
   (let (f:lua_CFunction (unsafe/cast lua_CFunction (dlsym lib sym)))
     (when (= f null)
       (lua_pushstring L (dlerror)))
@@ -91,7 +91,7 @@
 
 ; The deallocator of a library string: unloads its library.
 (defn- freelib (ud:ptr p:ptr osize:usize nsize:usize):ptr
-  (lsys_unloadlib ud)
+  (sys-unloadlib ud)
   (return null))
 
 (defconst LIBSTR "01234567890")  ; every library string's contents
@@ -118,18 +118,18 @@
   (let (reg:ptr (checkclib L path)
         star:bool (= (aref (bytes sym) 0) (ch \*)))
     (when (= reg null)
-      (set! reg (lsys_load L path star))  ; global symbols for "*"
+      (set! reg (sys-load L path star))  ; global symbols for "*"
       (when (= reg null) (return ERRLIB))
       (addtoclib L path reg))
     (when star  ; just the library
       (lua_pushboolean L 1)
       (return 0))
-    (let (f:lua_CFunction (lsys_sym L reg sym))
+    (let (f:lua_CFunction (sys-sym L reg sym))
       (when (= f null) (return ERRFUNC))
       (lua_pushcfunction L f)
       (return 0))))
 
-(defn- ll_loadlib (L:(ptr lua_State)):i32
+(defn- pkg-loadlib (L:(ptr lua_State)):i32
   (let (path:CStr (luaL_checkstring L 1)
         init:CStr (luaL_checkstring L 2)
         stat:i32 (lookforfunc L path init))
@@ -192,7 +192,7 @@
       (pusherrornotfound L (lua_tostring L -1))
       (return (as CStr null)))))
 
-(defn- ll_searchpath (L:(ptr lua_State)):i32
+(defn- pkg-searchpath (L:(ptr lua_State)):i32
   (let (f:CStr (searchpath L (luaL_checkstring L 1) (luaL_checkstring L 2)
                           (luaL_optstring L 3 ".") (luaL_optstring L 4 LUA_DIRSEP)))
     (when (!= (as ptr f) null)
@@ -215,7 +215,7 @@
   (return (luaL_error L "error loading module '%s' from file '%s':\n\t%s"
                       (lua_tostring L 1) filename (lua_tostring L -1))))
 
-(defn- searcher_Lua (L:(ptr lua_State)):i32
+(defn- searcher-lua (L:(ptr lua_State)):i32
   (let (name:CStr (luaL_checkstring L 1)
         filename:CStr (findfile L name "path" LUA_LSUBSEP))
     (when (= (as ptr filename) null) (return 1))  ; not in this path
@@ -235,13 +235,13 @@
           (set! modname (cstr (unsafe/ptr+ mark 1))))))  ; try the old-style name
     (return (lookforfunc L filename (lua_pushfstring L "luaopen_%s" modname)))))
 
-(defn- searcher_C (L:(ptr lua_State)):i32
+(defn- searcher-c (L:(ptr lua_State)):i32
   (let (name:CStr (luaL_checkstring L 1)
         filename:CStr (findfile L name "cpath" LUA_CSUBSEP))
     (when (= (as ptr filename) null) (return 1))  ; not in this path
     (return (checkload L (= (loadfunc L filename name) 0) filename))))
 
-(defn- searcher_Croot (L:(ptr lua_State)):i32
+(defn- searcher-croot (L:(ptr lua_State)):i32
   (let (name:CStr (luaL_checkstring L 1)
         p:(ptr i8) (bytes (strchr name (ch \.))))
     (when (= p null) (return 0))  ; a root
@@ -257,7 +257,7 @@
       (lua_pushstring L filename)  ; the module's second argument
       (return 2))))
 
-(defn- searcher_preload (L:(ptr lua_State)):i32
+(defn- searcher-preload (L:(ptr lua_State)):i32
   (let (name:CStr (luaL_checkstring L 1))
     (lua_getfield L LUA_REGISTRYINDEX LUA_PRELOAD_TABLE)
     (when (= (lua_getfield L -1 name) LUA_TNIL)
@@ -290,7 +290,7 @@
               (luaL_addstring msg "\n\t"))
         true (lua_pop L 2)))))  ; nothing
 
-(defn- ll_require (L:(ptr lua_State)):i32
+(defn- pkg-require (L:(ptr lua_State)):i32
   (let (name:CStr (luaL_checkstring L 1))
     (lua_settop L 1)  ; LOADED goes at index 2
     (lua_getfield L LUA_REGISTRYINDEX LUA_LOADED_TABLE)
@@ -316,10 +316,10 @@
 ; package.searchers, each closed over 'package'.
 (defn- createsearcherstable (L:(ptr lua_State)):void
   (lua_createtable L 4 0)
-  (addsearcher L searcher_preload 1)
-  (addsearcher L searcher_Lua 2)
-  (addsearcher L searcher_C 3)
-  (addsearcher L searcher_Croot 4)
+  (addsearcher L searcher-preload 1)
+  (addsearcher L searcher-lua 2)
+  (addsearcher L searcher-c 3)
+  (addsearcher L searcher-croot 4)
   (lua_setfield L -2 "searchers"))
 
 (defn- addsearcher (L:(ptr lua_State) f:lua_CFunction i:lua_Integer):void
@@ -331,7 +331,7 @@
   (luaL_getsubtable L LUA_REGISTRYINDEX CLIBS)  ; create CLIBS
   (lua_pop L 1)
   (lua-newlib L
-    ("loadlib" ll_loadlib) ("searchpath" ll_searchpath) ("preload" null) ("cpath" null)
+    ("loadlib" pkg-loadlib) ("searchpath" pkg-searchpath) ("preload" null) ("cpath" null)
     ("path" null) ("searchers" null) ("loaded" null))  ; placeholders
   (createsearcherstable L)
   (setpath L "path" LUA_PATH_VAR LUA_PATH_DEFAULT)
@@ -344,6 +344,6 @@
   (lua_setfield L -2 "preload")
   (lua_pushglobaltable L)
   (lua_pushvalue L -2)  ; 'package', require's upvalue
-  (lua-setfuncs L 1 ("require" ll_require))
+  (lua-setfuncs L 1 ("require" pkg-require))
   (lua_pop L 1)  ; the global table
   (return 1))

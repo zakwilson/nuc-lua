@@ -15,7 +15,7 @@
 (import lua.tm)
 (import lua.table)
 (import lua.state)  ; execution state
-(import lua.debug)
+(import-use lua.debug)
 (import lua.do)
 (import lua.api)
 (import lua.gc)
@@ -24,7 +24,7 @@
 (import lua.lex)
 (import-use lua.code)  ; isvararg
 (import lua.parser)
-(import lua.dump)
+(import-use lua.dump)
 (import lua.undump)
 (import-use lua.util)
 (import-use lua.core)
@@ -172,11 +172,11 @@
           (fatal (lua_tolstring L -1 null)))))
     (let (f:(ptr Proto) (combine L argc))
       (when (!= listing 0)
-        (PrintFunction f (> listing 1)))
+        (print-function f (> listing 1)))
       (when (!= dumping 0)
         (let (D:(ptr FILE) (if (= (as ptr output) null) stdout (fopen output "wb")))
           (when (= (as ptr D) null) (cannot "open"))
-          (luaU_dump L f writer (as ptr D) stripping)
+          (dump-chunk L f writer (as ptr D) stripping)
           (when (!= (ferror D) 0) (cannot "write"))
           (when (!= (fclose D) 0) (cannot "close")))))
     (return 0)))
@@ -208,7 +208,7 @@
 
 ; A string constant as Lua reads it back: escapes for the controls, and
 ; decimal escapes for the bytes isprint refuses.
-(defn- PrintString (ts:(ptr TString)):void
+(defn- print-string (ts:(ptr TString)):void
   (let (s:(ptr ui8) (unsafe/cast (ptr ui8) (getstr ts))
         n:usize (tsslen ts))
     (printf "\"")
@@ -227,7 +227,7 @@
           (if (!= (isprint c) 0) (printf "%c" c) (printf "\\%03d" c)))))
     (printf "\"")))
 
-(defn- PrintType (f:(ptr Proto) i:i32):void
+(defn- print-type (f:(ptr Proto) i:i32):void
   (let (tt:i32 (as i32 (ttypetag (p+ (f 'k) i))))
     (case tt
       LUA_VNIL (printf "N")
@@ -238,7 +238,7 @@
       (printf "?%d" tt))  ; can't happen
     (printf "\t")))
 
-(defn- PrintConstant (f:(ptr Proto) i:i32):void
+(defn- print-constant (f:(ptr Proto) i:i32):void
   (let (o:(ptr TValue) (p+ (f 'k) i)
         tt:i32 (as i32 (ttypetag o))
         buff:(ptr i8) (alloca i8 100))
@@ -251,12 +251,12 @@
                       (when (= (deref (p+ buff (strspn (cstr buff) "-0123456789"))) 0)
                         (printf ".0")))  ; looks like an integer: say it isn't
       LUA_VNUMINT (printf LUA_INTEGER_FMT (ivalue o))
-      (:or LUA_VSHRSTR LUA_VLNGSTR) (PrintString (tsvalue o))
+      (:or LUA_VSHRSTR LUA_VLNGSTR) (print-string (tsvalue o))
       (printf "?%d" tt))))  ; can't happen
 
 ; Each instruction: its number, line, name and operands, and a comment that
 ; reads the operands (a constant, an upvalue's name, a jump's target).
-(defn- PrintCode (f:(ptr Proto)):void
+(defn- print-code (f:(ptr Proto)):void
   (let (code:(ptr Instruction) (f 'code)
         n:i32 (f 'sizecode))
     (for (pc:i32 0) (< pc n) (inc! pc)
@@ -274,8 +274,8 @@
             sbx:i32 (GETARG_sBx i)
             isk:i32 (GETARG_k i)
             k:CStr (if (!= isk 0) (cstr "k") (cstr ""))
-            line:i32 (luaG_getfuncline f pc))
-        (macrolet ((konst (x) `(PrintConstant f ~x))
+            line:i32 (debug-getfuncline f pc))
+        (macrolet ((konst (x) `(print-constant f ~x))
                    (extraarg () `(GETARG_Ax (deref (p+ code (+ pc 1)))))
                    (extraargc () `(* (extraarg) (+ MAXARG_C 1))))
           (printf "\t%d\t" (+ pc 1))
@@ -347,7 +347,7 @@
 
 (defmacro plural (x) `(if (= ~x 1) (cstr "") (cstr "s")))
 
-(defn- PrintHeader (f:(ptr Proto)):void
+(defn- print-header (f:(ptr Proto)):void
   (let (src:CStr (if (= (as ptr (f 'source)) null) (cstr "=?") (cstr (getstr (f 'source))))
         c:i32 (as i32 (aref (bytes src) 0))
         s:CStr (cond (or (= c 64) (= c 61)) (cstr (p+ (bytes src) 1))  ; '@' or '='
@@ -365,12 +365,12 @@
             (f 'sizelocvars) (plural (f 'sizelocvars)) (f 'sizek) (plural (f 'sizek))
             (f 'sizep) (plural (f 'sizep)))))
 
-(defn- PrintDebug (f:(ptr Proto)):void
+(defn- print-debug (f:(ptr Proto)):void
   (printf "constants (%d) for %p:\n" (f 'sizek) (as ptr f))
   (for (i:i32 0) (< i (f 'sizek)) (inc! i)
     (printf "\t%d\t" i)
-    (PrintType f i)
-    (PrintConstant f i)
+    (print-type f i)
+    (print-constant f i)
     (printf "\n"))
   (printf "locals (%d) for %p:\n" (f 'sizelocvars) (as ptr f))
   (for (i:i32 0) (< i (f 'sizelocvars)) (inc! i)
@@ -381,9 +381,9 @@
     (let (up:(ptr Upvaldesc) (p+ (f 'upvalues) i))
       (printf "\t%d\t%s\t%d\t%d\n" i (upvalname f i) (as i32 (up 'instack)) (as i32 (up 'idx))))))
 
-(defn- PrintFunction (f:(ptr Proto) full:bool):void
-  (PrintHeader f)
-  (PrintCode f)
-  (when full (PrintDebug f))
+(defn- print-function (f:(ptr Proto) full:bool):void
+  (print-header f)
+  (print-code f)
+  (when full (print-debug f))
   (for (i:i32 0) (< i (f 'sizep)) (inc! i)
-    (PrintFunction (deref (p+ (f 'p) i)) full)))
+    (print-function (deref (p+ (f 'p) i)) full)))

@@ -30,7 +30,7 @@
     (lua_xmove co L 1)  ; the error message
     (return -1)))
 
-(defn- luaB_coresume (L:(ptr lua_State)):i32
+(defn- co-resume (L:(ptr lua_State)):i32
   (let (co:(ptr lua_State) (getco L)
         r:i32 (auxresume L co (- (lua_gettop L) 1)))
     (when (< r 0)
@@ -41,7 +41,7 @@
     (lua_insert L (- 0 (+ r 1)))
     (return (+ r 1))))  ; true and what resume returned
 
-(defn- luaB_auxwrap (L:(ptr lua_State)):i32
+(defn- co-auxwrap (L:(ptr lua_State)):i32
   (let (co:(ptr lua_State) (lua_tothread L (lua_upvalueindex 1))
         r:i32 (auxresume L co (lua_gettop L)))
     (when (< r 0)
@@ -56,19 +56,19 @@
         (return (lua_error L))))
     (return r)))
 
-(defn- luaB_cocreate (L:(ptr lua_State)):i32
+(defn- co-create (L:(ptr lua_State)):i32
   (luaL_checktype L 1 LUA_TFUNCTION)
   (let (NL:(ptr lua_State) (lua_newthread L))
     (lua_pushvalue L 1)
     (lua_xmove L NL 1)  ; the function, into the new thread
     (return 1)))
 
-(defn- luaB_cowrap (L:(ptr lua_State)):i32
-  (luaB_cocreate L)
-  (lua_pushcclosure L luaB_auxwrap 1)
+(defn- co-wrap (L:(ptr lua_State)):i32
+  (co-create L)
+  (lua_pushcclosure L co-auxwrap 1)
   (return 1))
 
-(defn- luaB_yield (L:(ptr lua_State)):i32
+(defn- co-yield (L:(ptr lua_State)):i32
   (return (lua_yield L (lua_gettop L))))
 
 (defconst COS_RUN 0)
@@ -91,7 +91,7 @@
             true (return COS_YIELD)))))  ; not started
   (return COS_DEAD))  ; an error
 
-(defn- luaB_costatus (L:(ptr lua_State)):i32
+(defn- co-status (L:(ptr lua_State)):i32
   (let (co:(ptr lua_State) (getco L))
     (lua_pushstring L (aref statname (auxstatus L co)))
     (return 1)))
@@ -99,15 +99,15 @@
 (defn- getoptco (L:(ptr lua_State)):(ptr lua_State)
   (return (if (lua_isnone L 1) L (getco L))))
 
-(defn- luaB_yieldable (L:(ptr lua_State)):i32
+(defn- co-isyieldable (L:(ptr lua_State)):i32
   (lua_pushboolean L (lua_isyieldable (getoptco L)))
   (return 1))
 
-(defn- luaB_corunning (L:(ptr lua_State)):i32
+(defn- co-running (L:(ptr lua_State)):i32
   (lua_pushboolean L (lua_pushthread L))
   (return 2))
 
-(defn- luaB_close (L:(ptr lua_State)):i32
+(defn- co-close (L:(ptr lua_State)):i32
   (let (co:(ptr lua_State) (getoptco L)
         status:i32 (auxstatus L co))
     (cond
@@ -130,7 +130,7 @@
 
 (defn luaopen_coroutine (L:(ptr lua_State)):i32
   (lua-newlib L
-    ("create" luaB_cocreate) ("resume" luaB_coresume) ("running" luaB_corunning)
-    ("status" luaB_costatus) ("wrap" luaB_cowrap) ("yield" luaB_yield)
-    ("isyieldable" luaB_yieldable) ("close" luaB_close))
+    ("create" co-create) ("resume" co-resume) ("running" co-running)
+    ("status" co-status) ("wrap" co-wrap) ("yield" co-yield)
+    ("isyieldable" co-isyieldable) ("close" co-close))
   (return 1))

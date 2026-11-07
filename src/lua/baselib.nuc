@@ -10,7 +10,7 @@
 (import-use "stdlib.h")
 (import-use "string.h")
 
-(defn- luaB_print (L:(ptr lua_State)):i32
+(defn- base-print (L:(ptr lua_State)):i32
   (let (n:i32 (lua_gettop L))
     (for (i:i32 1) (<= i n) (inc! i)
       (let (l:usize 0
@@ -23,7 +23,7 @@
 
 ; Checks every argument first, so that an error can't leave a warning half
 ; written.
-(defn- luaB_warn (L:(ptr lua_State)):i32
+(defn- base-warn (L:(ptr lua_State)):i32
   (let (n:i32 (lua_gettop L))
     (luaL_checkstring L 1)  ; at least one argument
     (for (i:i32 2) (<= i n) (inc! i)
@@ -36,7 +36,7 @@
 (defconst SPACECHARS " \x0c\n\r\t\x0b")
 
 ; Reads an integer numeral in 'base'; returns the end of it, or null.
-(defn- b_str2int (s0:CStr base:ui32 pn:&lua_Integer):(ptr i8)
+(defn- b-str2int (s0:CStr base:ui32 pn:&lua_Integer):(ptr i8)
   (let (s:(ptr i8) (unsafe/ptr+ (bytes s0) (as i64 (strspn s0 SPACECHARS)))  ; skip spaces
         n:lua_Unsigned 0
         neg:bool false)
@@ -58,7 +58,7 @@
     (set! (deref pn) (l_castU2S (if neg (- 0 n) n)))
     (return s)))
 
-(defn- luaB_tonumber (L:(ptr lua_State)):i32
+(defn- base-tonumber (L:(ptr lua_State)):i32
   (if (lua_isnoneornil L 2)  ; standard conversion?
     (do
       (when (= (lua_type L 1) LUA_TNUMBER)  ; already a number?
@@ -75,14 +75,14 @@
       (luaL_checktype L 1 LUA_TSTRING)  ; no numbers as strings
       (let (s:CStr (lua_tolstring L 1 &l))
         (luaL_argcheck L (and (<= 2 base) (<= base 36)) 2 "base out of range")
-        (when (= (as ptr (b_str2int s (cast_uint base) &n))
+        (when (= (as ptr (b-str2int s (cast_uint base) &n))
                  (as ptr (unsafe/ptr+ (bytes s) (as i64 l))))
           (lua_pushinteger L n)
           (return 1)))))
   (luaL_pushfail L)  ; not a number
   (return 1))
 
-(defn- luaB_error (L:(ptr lua_State)):i32
+(defn- base-error (L:(ptr lua_State)):i32
   (let (level:i32 (cast_int (luaL_optinteger L 2 1)))
     (lua_settop L 1)
     (when (and (= (lua_type L 1) LUA_TSTRING) (> level 0))
@@ -91,7 +91,7 @@
       (lua_concat L 2))
     (return (lua_error L))))
 
-(defn- luaB_getmetatable (L:(ptr lua_State)):i32
+(defn- base-getmetatable (L:(ptr lua_State)):i32
   (luaL_checkany L 1)
   (when (= (lua_getmetatable L 1) 0)
     (lua_pushnil L)
@@ -99,7 +99,7 @@
   (luaL_getmetafield L 1 "__metatable")
   (return 1))  ; the __metatable field if there is one, else the metatable
 
-(defn- luaB_setmetatable (L:(ptr lua_State)):i32
+(defn- base-setmetatable (L:(ptr lua_State)):i32
   (let (t:i32 (lua_type L 2))
     (luaL_checktype L 1 LUA_TTABLE)
     (luaL_argexpected L (or (= t LUA_TNIL) (= t LUA_TTABLE)) 2 "nil or table")
@@ -109,26 +109,26 @@
     (lua_setmetatable L 1)
     (return 1)))
 
-(defn- luaB_rawequal (L:(ptr lua_State)):i32
+(defn- base-rawequal (L:(ptr lua_State)):i32
   (luaL_checkany L 1)
   (luaL_checkany L 2)
   (lua_pushboolean L (lua_rawequal L 1 2))
   (return 1))
 
-(defn- luaB_rawlen (L:(ptr lua_State)):i32
+(defn- base-rawlen (L:(ptr lua_State)):i32
   (let (t:i32 (lua_type L 1))
     (luaL_argexpected L (or (= t LUA_TTABLE) (= t LUA_TSTRING)) 1 "table or string")
     (lua_pushinteger L (l_castU2S (lua_rawlen L 1)))
     (return 1)))
 
-(defn- luaB_rawget (L:(ptr lua_State)):i32
+(defn- base-rawget (L:(ptr lua_State)):i32
   (luaL_checktype L 1 LUA_TTABLE)
   (luaL_checkany L 2)
   (lua_settop L 2)
   (lua_rawget L 1)
   (return 1))
 
-(defn- luaB_rawset (L:(ptr lua_State)):i32
+(defn- base-rawset (L:(ptr lua_State)):i32
   (luaL_checktype L 1 LUA_TTABLE)
   (luaL_checkany L 2)
   (luaL_checkany L 3)
@@ -157,7 +157,7 @@
 
 ; A result of -1 means lua_gc was called from a finalizer: that is C's
 ; `checkvalres`, which breaks out to the fail at the end.
-(defn- luaB_collectgarbage (L:(ptr lua_State)):i32
+(defn- base-collectgarbage (L:(ptr lua_State)):i32
   (let (o:i32 (aref gc-optsnum (luaL_checkoption L 1 "collect" gc-opts)))
     (cond
       (= o LUA_GCCOUNT)
@@ -192,13 +192,13 @@
   (luaL_pushfail L)  ; called from a finalizer
   (return 1))
 
-(defn- luaB_type (L:(ptr lua_State)):i32
+(defn- base-type (L:(ptr lua_State)):i32
   (let (t:i32 (lua_type L 1))
     (luaL_argcheck L (!= t LUA_TNONE) 1 "value expected")
     (lua_pushstring L (lua_typename L t))
     (return 1)))
 
-(defn- luaB_next (L:(ptr lua_State)):i32
+(defn- base-next (L:(ptr lua_State)):i32
   (luaL_checktype L 1 LUA_TTABLE)
   (lua_settop L 2)  ; a second argument if there isn't one
   (when (!= (lua_next L 1) 0)
@@ -209,10 +209,10 @@
 (defn- pairscont (L:(ptr lua_State) status:i32 k:lua_KContext):i32
   (return 4))  ; __pairs did all the work
 
-(defn- luaB_pairs (L:(ptr lua_State)):i32
+(defn- base-pairs (L:(ptr lua_State)):i32
   (luaL_checkany L 1)
   (if (= (luaL_getmetafield L 1 "__pairs") LUA_TNIL)  ; no metamethod?
-    (do (lua_pushcfunction L luaB_next)  ; the generator,
+    (do (lua_pushcfunction L base-next)  ; the generator,
         (lua_pushvalue L 1)  ; the state,
         (lua_pushnil L)  ; the initial value
         (lua_pushnil L))  ; and the to-be-closed object
@@ -226,14 +226,14 @@
     (return (if (= (lua_geti L 1 i) LUA_TNIL) 1 2))))
 
 ; Returns ipairsaux, the "table" (which may not be one), and 0.
-(defn- luaB_ipairs (L:(ptr lua_State)):i32
+(defn- base-ipairs (L:(ptr lua_State)):i32
   (luaL_checkany L 1)
   (lua_pushcfunction L ipairsaux)
   (lua_pushvalue L 1)
   (lua_pushinteger L 0)
   (return 3))
 
-(defn- load_aux (L:(ptr lua_State) status:i32 envidx:i32):i32
+(defn- load-aux (L:(ptr lua_State) status:i32 envidx:i32):i32
   (when (= status LUA_OK)
     (when (!= envidx 0)  ; an 'env' argument?
       (lua_pushvalue L envidx)
@@ -244,21 +244,21 @@
   (lua_insert L -2)
   (return 2))
 
-(defn- getMode (L:(ptr lua_State) idx:i32):CStr
+(defn- get-mode (L:(ptr lua_State) idx:i32):CStr
   (let (mode:CStr (luaL_optstring L idx (as CStr null)))
     (when (and (!= (as ptr mode) null) (!= (as ptr (strchr mode (ch \B))) null))
       (luaL_argerror L idx "invalid mode"))  ; Lua code can't use fixed buffers
     (return mode)))
 
-(defn- luaB_loadfile (L:(ptr lua_State)):i32
+(defn- base-loadfile (L:(ptr lua_State)):i32
   (let (fname:CStr (luaL_optstring L 1 (as CStr null))
-        mode:CStr (getMode L 2)
+        mode:CStr (get-mode L 2)
         env:i32 (if (lua_isnone L 3) 0 3)
         status:i32 (luaL_loadfilex L fname mode))
-    (return (load_aux L status env))))
+    (return (load-aux L status env))))
 
 ; The reader for 'load' from a function: calls it for each piece.
-(defn- generic_reader (L:(ptr lua_State) ud:ptr size:(ptr usize)):CStr
+(defn- generic-reader (L:(ptr lua_State) ud:ptr size:(ptr usize)):CStr
   (let (firstcall:(ptr i32) (unsafe/cast (ptr i32) ud))
     (luaL_checkstack L 2 "too many nested functions")
     (if (!= (deref firstcall) 0)
@@ -273,10 +273,10 @@
       (luaL_error L "reader function must return a string"))
     (return (lua_tolstring L -1 size))))
 
-(defn- luaB_load (L:(ptr lua_State)):i32
+(defn- base-load (L:(ptr lua_State)):i32
   (let (l:usize 0
         s:CStr (lua_tolstring L 1 &l)
-        mode:CStr (getMode L 3)
+        mode:CStr (get-mode L 3)
         env:i32 (if (lua_isnone L 4) 0 4)
         status:i32 0)
     (if (!= (as ptr s) null)  ; a string?
@@ -285,13 +285,13 @@
       (let (firstcall:i32 1
             chunkname:CStr (luaL_optstring L 2 "=(load)"))
         (luaL_checktype L 1 LUA_TFUNCTION)
-        (set! status (lua_load L generic_reader &firstcall chunkname mode))))
-    (return (load_aux L status env))))
+        (set! status (lua_load L generic-reader &firstcall chunkname mode))))
+    (return (load-aux L status env))))
 
 (defn- dofilecont (L:(ptr lua_State) d1:i32 d2:lua_KContext):i32
   (return (- (lua_gettop L) 1)))
 
-(defn- luaB_dofile (L:(ptr lua_State)):i32
+(defn- base-dofile (L:(ptr lua_State)):i32
   (let (fname:CStr (luaL_optstring L 1 (as CStr null)))
     (lua_settop L 1)
     (when (!= (luaL_loadfilex L fname "bt") LUA_OK)
@@ -299,16 +299,16 @@
     (lua_callk L 0 LUA_MULTRET 0 dofilecont)
     (return (dofilecont L 0 0))))
 
-(defn- luaB_assert (L:(ptr lua_State)):i32
+(defn- base-assert (L:(ptr lua_State)):i32
   (when (!= (lua_toboolean L 1) 0)
     (return (lua_gettop L)))  ; all the arguments
   (luaL_checkany L 1)  ; there must be a condition
   (lua_remove L 1)
   (lua_pushliteral L "assertion failed!")  ; the default message
   (lua_settop L 1)  ; the message, given or default
-  (return (luaB_error L)))
+  (return (base-error L)))
 
-(defn- luaB_select (L:(ptr lua_State)):i32
+(defn- base-select (L:(ptr lua_State)):i32
   (let (n:i32 (lua_gettop L))
     (when (and (= (lua_type L 1) LUA_TSTRING)
                (= (aref (bytes (lua_tostring L 1)) 0) (ch \#)))
@@ -330,7 +330,7 @@
     (return 2))
   (return (- (lua_gettop L) (cast_int extra))))
 
-(defn- luaB_pcall (L:(ptr lua_State)):i32
+(defn- base-pcall (L:(ptr lua_State)):i32
   (luaL_checkany L 1)
   (lua_pushboolean L 1)  ; the first result if there's no error
   (lua_insert L 1)
@@ -338,7 +338,7 @@
 
 ; After the rotate the stack is <f, err, true, f, args...>, so 'finishpcall'
 ; skips 2.
-(defn- luaB_xpcall (L:(ptr lua_State)):i32
+(defn- base-xpcall (L:(ptr lua_State)):i32
   (let (n:i32 (lua_gettop L))
     (luaL_checktype L 2 LUA_TFUNCTION)  ; the error function
     (lua_pushboolean L 1)
@@ -346,7 +346,7 @@
     (lua_rotate L 3 2)  ; both below the function's arguments
     (return (finishpcall L (lua_pcallk L (- n 2) LUA_MULTRET 2 2 finishpcall) 2))))
 
-(defn- luaB_tostring (L:(ptr lua_State)):i32
+(defn- base-tostring (L:(ptr lua_State)):i32
   (luaL_checkany L 1)
   (luaL_tolstring L 1 null)
   (return 1))
@@ -354,14 +354,14 @@
 (defn luaopen_base (L:(ptr lua_State)):i32
   (lua_pushglobaltable L)  ; the library goes into the global table
   (lua-setfuncs L 0
-    ("assert" luaB_assert) ("collectgarbage" luaB_collectgarbage)
-    ("dofile" luaB_dofile) ("error" luaB_error) ("getmetatable" luaB_getmetatable)
-    ("ipairs" luaB_ipairs) ("loadfile" luaB_loadfile) ("load" luaB_load)
-    ("next" luaB_next) ("pairs" luaB_pairs) ("pcall" luaB_pcall) ("print" luaB_print)
-    ("warn" luaB_warn) ("rawequal" luaB_rawequal) ("rawlen" luaB_rawlen)
-    ("rawget" luaB_rawget) ("rawset" luaB_rawset) ("select" luaB_select)
-    ("setmetatable" luaB_setmetatable) ("tonumber" luaB_tonumber)
-    ("tostring" luaB_tostring) ("type" luaB_type) ("xpcall" luaB_xpcall)
+    ("assert" base-assert) ("collectgarbage" base-collectgarbage)
+    ("dofile" base-dofile) ("error" base-error) ("getmetatable" base-getmetatable)
+    ("ipairs" base-ipairs) ("loadfile" base-loadfile) ("load" base-load)
+    ("next" base-next) ("pairs" base-pairs) ("pcall" base-pcall) ("print" base-print)
+    ("warn" base-warn) ("rawequal" base-rawequal) ("rawlen" base-rawlen)
+    ("rawget" base-rawget) ("rawset" base-rawset) ("select" base-select)
+    ("setmetatable" base-setmetatable) ("tonumber" base-tonumber)
+    ("tostring" base-tostring) ("type" base-type) ("xpcall" base-xpcall)
     (LUA_GNAME null) ("_VERSION" null))  ; placeholders
   (lua_pushvalue L -1)
   (lua_setfield L -2 LUA_GNAME)  ; _G

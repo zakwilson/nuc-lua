@@ -320,7 +320,7 @@
 
 ; Gets or creates the boxes' metatable. Built call by call rather than from a
 ; luaL_Reg table, which can't be constant data (ISSUE-004).
-(defn- getBoxMT (L:(ptr lua_State)):void
+(defn- get-box-mt (L:(ptr lua_State)):void
   (when (= (luaL_getmetatable L "_UBOX*") LUA_TNIL)
     (lua_createtable L 0 2)
     (lua_pushcfunction L boxgc)
@@ -334,7 +334,7 @@
   (let (box:&UBox (unsafe/cast &UBox (lua_newuserdatauv L (sizeof UBox) 0)))
     (set! (box 'box) null)
     (set! (box 'bsize) 0)
-    (getBoxMT L)
+    (get-box-mt L)
     (lua_setmetatable L -2)))
 
 ; Whether the buffer has moved into a box on the stack. `b` is a CStr, whose `=`
@@ -471,7 +471,7 @@
   f:(ptr FILE)
   buff:(array i8 BUFSIZ))
 
-(defn- getF (L:(ptr lua_State) ud:ptr size:(ptr usize)):CStr
+(defn- get-f (L:(ptr lua_State) ud:ptr size:(ptr usize)):CStr
   (let (lf:&LoadF (unsafe/cast &LoadF ud))
     (if (> (lf 'n) 0)  ; pre-read bytes first
       (do (set! (deref size) (as usize (lf 'n)))
@@ -494,7 +494,7 @@
 
 ; Skips a BOM. A partial one returns its first byte, to force an error: no
 ; chunk starts with 0xEF.
-(defn- skipBOM (f:(ptr FILE)):i32
+(defn- skip-bom (f:(ptr FILE)):i32
   (let (c:i32 (getc f))
     (if (and (= c 0xEF) (= (getc f) 0xBB) (= (getc f) 0xBF))
       (return (getc f))
@@ -503,7 +503,7 @@
 ; Skips a BOM and a first line starting with '#'. Returns whether it skipped a
 ; line; 'cp' gets the first byte after them.
 (defn- skipcomment (f:(ptr FILE) cp:&i32):bool
-  (let (c:i32 (skipBOM f))
+  (let (c:i32 (skip-bom f))
     (set! (deref cp) c)
     (when (= c (ch \#))  ; a Unix executable's first line
       (while (and (!= c EOF) (!= c (ch \newline)))
@@ -537,7 +537,7 @@
     (when (!= c EOF)
       (set! (aref (ref lf 'buff) (as i64 (lf 'n))) (cast_char c))
       (set! (lf 'n) (+ (lf 'n) 1)))
-    (let (status:i32 (lua_load L getF lf (lua_tostring L -1) mode)
+    (let (status:i32 (lua_load L get-f lf (lua_tostring L -1) mode)
           readstatus:i32 (ferror (lf 'f)))
       (set-errno 0)  ; no useful error number until here
       (when (!= (as ptr filename) null) (fclose (lf 'f)))
@@ -551,7 +551,7 @@
   s:CStr
   size:usize)
 
-(defn- getS (L:(ptr lua_State) ud:ptr size:(ptr usize)):CStr
+(defn- get-s (L:(ptr lua_State) ud:ptr size:(ptr usize)):CStr
   (let (ls:&LoadS (unsafe/cast &LoadS ud))
     (when (= (ls 'size) 0) (return (as CStr null)))
     (set! (deref size) (ls 'size))
@@ -562,7 +562,7 @@
   (let (ls:&LoadS (alloca LoadS))
     (set! (ls 's) buff)
     (set! (ls 'size) size)
-    (return (lua_load L getS ls name mode))))
+    (return (lua_load L get-s ls name mode))))
 
 (defn luaL_loadstring (L:(ptr lua_State) s:CStr):i32
   (return (luaL_loadbufferx L s (strlen s) s "t")))

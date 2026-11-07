@@ -58,52 +58,52 @@
 ; ---- integer and float arithmetic ----
 
 (deftest idiv-floors
-  (try (check-eq-int (luaV_idiv null 7 2) 3 "7 // 2"))
-  (try (check-eq-int (luaV_idiv null -7 2) -4 "-7 // 2"))
-  (try (check-eq-int (luaV_idiv null 7 -2) -4 "7 // -2"))
-  (try (check-eq-int (luaV_idiv null -7 -2) 3 "-7 // -2"))
-  (try (check-eq-int (luaV_idiv null -6 3) -2 "-6 // 3, exact"))
-  (try (check-eq-int (luaV_idiv null MININT -1) MININT "mininteger // -1 wraps"))
-  (try (check-eq-int (luaV_idiv null MININT 1) MININT "mininteger // 1")))
+  (try (check-eq-int (vm-idiv null 7 2) 3 "7 // 2"))
+  (try (check-eq-int (vm-idiv null -7 2) -4 "-7 // 2"))
+  (try (check-eq-int (vm-idiv null 7 -2) -4 "7 // -2"))
+  (try (check-eq-int (vm-idiv null -7 -2) 3 "-7 // -2"))
+  (try (check-eq-int (vm-idiv null -6 3) -2 "-6 // 3, exact"))
+  (try (check-eq-int (vm-idiv null MININT -1) MININT "mininteger // -1 wraps"))
+  (try (check-eq-int (vm-idiv null MININT 1) MININT "mininteger // 1")))
 
 (deftest mod-takes-the-divisors-sign
-  (try (check-eq-int (luaV_mod null -7 3) 2 "-7 % 3"))
-  (try (check-eq-int (luaV_mod null 7 -3) -2 "7 % -3"))
-  (try (check-eq-int (luaV_mod null -7 -3) -1 "-7 % -3"))
-  (try (check-eq-int (luaV_mod null 6 -3) 0 "6 % -3"))
-  (try (check-eq-int (luaV_mod null MININT -1) 0 "mininteger % -1"))
-  (try (check-eq-int (luaV_mod null MAXINT MININT) -1 "maxinteger % mininteger")))
+  (try (check-eq-int (vm-mod null -7 3) 2 "-7 % 3"))
+  (try (check-eq-int (vm-mod null 7 -3) -2 "7 % -3"))
+  (try (check-eq-int (vm-mod null -7 -3) -1 "-7 % -3"))
+  (try (check-eq-int (vm-mod null 6 -3) 0 "6 % -3"))
+  (try (check-eq-int (vm-mod null MININT -1) 0 "mininteger % -1"))
+  (try (check-eq-int (vm-mod null MAXINT MININT) -1 "maxinteger % mininteger")))
 
 (deftest float-mod
-  (try (check (= (luaV_modf null -4.0 3.0) 2.0) "-4.0 % 3"))
-  (try (check (= (luaV_modf null 4.0 -3.0) -2.0) "4.0 % -3"))
-  (try (check (= (luaV_modf null -4.0 -5.0) -4.0) "-4.0 % -5"))
-  (try (check (= (luaV_modf null 5.5 +inf.0) 5.5) "5.5 % inf"))
-  (try (check (= (luaV_modf null -5.5 +inf.0) +inf.0) "-5.5 % inf is inf"))
-  (try (check (!= (luaV_modf null 1.0 0.0) (luaV_modf null 1.0 0.0)) "1.0 % 0 is nan")))
+  (try (check (= (vm-modf null -4.0 3.0) 2.0) "-4.0 % 3"))
+  (try (check (= (vm-modf null 4.0 -3.0) -2.0) "4.0 % -3"))
+  (try (check (= (vm-modf null -4.0 -5.0) -4.0) "-4.0 % -5"))
+  (try (check (= (vm-modf null 5.5 +inf.0) 5.5) "5.5 % inf"))
+  (try (check (= (vm-modf null -5.5 +inf.0) +inf.0) "-5.5 % inf is inf"))
+  (try (check (!= (vm-modf null 1.0 0.0) (vm-modf null 1.0 0.0)) "1.0 % 0 is nan")))
 
 (deftest shifts-past-the-width
-  (try (check-eq-int (luaV_shiftl 1 63) MININT "1 << 63"))
-  (try (check-eq-int (luaV_shiftl 1 64) 0 "1 << 64"))
-  (try (check-eq-int (luaV_shiftl 1 1000) 0 "1 << 1000"))
-  (try (check-eq-int (luaV_shiftl -1 -1) MAXINT "-1 >> 1 is logical"))
-  (try (check-eq-int (luaV_shiftl -8 -1) 0x7ffffffffffffffc "-8 >> 1"))
-  (try (check-eq-int (luaV_shiftl -1 -64) 0 "-1 >> 64"))
-  (try (check-eq-int (luaV_shiftl 5 MININT) 0 "5 >> mininteger")))
+  (try (check-eq-int (vm-shiftl 1 63) MININT "1 << 63"))
+  (try (check-eq-int (vm-shiftl 1 64) 0 "1 << 64"))
+  (try (check-eq-int (vm-shiftl 1 1000) 0 "1 << 1000"))
+  (try (check-eq-int (vm-shiftl -1 -1) MAXINT "-1 >> 1 is logical"))
+  (try (check-eq-int (vm-shiftl -8 -1) 0x7ffffffffffffffc "-8 >> 1"))
+  (try (check-eq-int (vm-shiftl -1 -64) 0 "-1 >> 64"))
+  (try (check-eq-int (vm-shiftl 5 MININT) 0 "5 >> mininteger")))
 
 (deftest float-to-integer-modes
   (let (i:(ptr lua_Integer) (alloca lua_Integer))
-    (try (check (= (luaV_flttointeger 3.0 i F2Ieq) 1) "3.0 exact"))
+    (try (check (= (vm-flttointeger 3.0 i F2Ieq) 1) "3.0 exact"))
     (try (check-eq-int (deref i) 3 "3.0"))
-    (try (check (= (luaV_flttointeger 3.5 i F2Ieq) 0) "3.5 is not exact"))
-    (try (check (= (luaV_flttointeger 3.5 i F2Ifloor) 1) "3.5 floors"))
+    (try (check (= (vm-flttointeger 3.5 i F2Ieq) 0) "3.5 is not exact"))
+    (try (check (= (vm-flttointeger 3.5 i F2Ifloor) 1) "3.5 floors"))
     (try (check-eq-int (deref i) 3 "floor 3.5"))
-    (try (check (= (luaV_flttointeger -3.5 i F2Iceil) 1) "-3.5 ceils"))
+    (try (check (= (vm-flttointeger -3.5 i F2Iceil) 1) "-3.5 ceils"))
     (try (check-eq-int (deref i) -3 "ceil -3.5"))
-    (try (check (= (luaV_flttointeger 9223372036854775808.0 i F2Ifloor) 0) "2^63 doesn't fit"))
-    (try (check (= (luaV_flttointeger -9223372036854775808.0 i F2Ieq) 1) "-2^63 fits"))
+    (try (check (= (vm-flttointeger 9223372036854775808.0 i F2Ifloor) 0) "2^63 doesn't fit"))
+    (try (check (= (vm-flttointeger -9223372036854775808.0 i F2Ieq) 1) "-2^63 fits"))
     (try (check-eq-int (deref i) MININT "-2^63"))
-    (try (check (= (luaV_flttointeger (/ 0.0 0.0) i F2Ifloor) 0) "nan doesn't fit"))))
+    (try (check (= (vm-flttointeger (/ 0.0 0.0) i F2Ifloor) 0) "nan doesn't fit"))))
 
 (defn- fval (v:(ptr TValue) x:lua_Number):(ptr TValue)
   (setfltvalue v x)
@@ -116,26 +116,26 @@
 (deftest mixed-comparisons-are-exact
   (let (a:(ptr TValue) (alloca TValue)
         b:(ptr TValue) (alloca TValue))
-    (try (check (= (luaV_lessthan null (ival a MAXINT) (fval b 9223372036854775808.0)) 1)
+    (try (check (= (vm-lessthan null (ival a MAXINT) (fval b 9223372036854775808.0)) 1)
                 "maxinteger < 2^63"))
-    (try (check (= (luaV_lessthan null (fval a 9223372036854775808.0) (ival b MAXINT)) 0)
+    (try (check (= (vm-lessthan null (fval a 9223372036854775808.0) (ival b MAXINT)) 0)
                 "not 2^63 < maxinteger"))
-    (try (check (= (luaV_lessequal null (ival a MININT) (fval b -9223372036854775808.0)) 1)
+    (try (check (= (vm-lessequal null (ival a MININT) (fval b -9223372036854775808.0)) 1)
                 "mininteger <= -2^63"))
-    (try (check (= (luaV_lessthan null (ival a MININT) (fval b -9223372036854775808.0)) 0)
+    (try (check (= (vm-lessthan null (ival a MININT) (fval b -9223372036854775808.0)) 0)
                 "not mininteger < -2^63"))
-    (try (check (= (luaV_lessthan null (ival a 9007199254740993) (fval b 9007199254740992.0)) 0)
+    (try (check (= (vm-lessthan null (ival a 9007199254740993) (fval b 9007199254740992.0)) 0)
                 "not 2^53+1 < 2^53"))
-    (try (check (= (luaV_lessthan null (ival a 1) (fval b (/ 0.0 0.0))) 0) "not 1 < nan"))
-    (try (check (= (luaV_lessequal null (fval a (/ 0.0 0.0)) (ival b 1)) 0) "not nan <= 1"))
-    (try (check (= (luaV_equalobj null (ival a 3) (fval b 3.0)) 1) "3 == 3.0"))
-    (try (check (= (luaV_equalobj null (ival a 9007199254740993) (fval b 9007199254740992.0)) 0)
+    (try (check (= (vm-lessthan null (ival a 1) (fval b (/ 0.0 0.0))) 0) "not 1 < nan"))
+    (try (check (= (vm-lessequal null (fval a (/ 0.0 0.0)) (ival b 1)) 0) "not nan <= 1"))
+    (try (check (= (vm-equalobj null (ival a 3) (fval b 3.0)) 1) "3 == 3.0"))
+    (try (check (= (vm-equalobj null (ival a 9007199254740993) (fval b 9007199254740992.0)) 0)
                 "2^53+1 ~= 2^53"))))
 
 ; ---- parsing and formatting numbers ----
 
 (defn- parsed (s:CStr v:(ptr TValue)):i64
-  (return (as i64 (luaO_str2num s v))))
+  (return (as i64 (obj-str2num s v))))
 
 (deftest str2num
   (let (v:(ptr TValue) (alloca TValue))
@@ -159,7 +159,7 @@
 
 (defn- formatted (v:(ptr TValue)):String
   (let (buff:(ptr i8) (alloca i8 LUA_N2SBUFFSZ)
-        n:ui32 (luaO_tostringbuff v buff))
+        n:ui32 (obj-tostringbuff v buff))
     (set! (aref buff n) 0)
     (return (str (sv buff)))))
 
@@ -183,7 +183,7 @@
 
 ; ---- generated tables, against stock's bytes ----
 
-; luaP_opmodes and luai_ctype_ as stock lua 5.5.1 holds them (check-tables.sh
+; op-modes and ctype-table as stock lua 5.5.1 holds them (check-tables.sh
 ; compares the executables; these pin the values themselves).
 (defvar- stock-opmodes:(array ui8 85)
   (array ui8 0x08 0x0b 0x0b 0x0a 0x0a 0x08 0x08 0x08 0x08 0x08 0x00 0x08 0x08 0x08 0x08 0x00
@@ -205,12 +205,12 @@
 
 (deftest opmodes-are-stocks
   (for (i:i32 0) (< i 85) (set! i (+ i 1))
-    (try (check-eq-int (as i64 (aref luaP_opmodes i)) (as i64 (aref stock-opmodes i)) "an opmode"))))
+    (try (check-eq-int (as i64 (aref op-modes i)) (as i64 (aref stock-opmodes i)) "an opmode"))))
 
 (deftest ctype-is-stocks
   (for (i:i32 0) (< i 257) (set! i (+ i 1))
     (let (want:i64 (if (< i 129) (as i64 (aref stock-ctype i)) 0))
-      (try (check-eq-int (as i64 (aref luai_ctype_ i)) want "a ctype entry")))))
+      (try (check-eq-int (as i64 (aref ctype-table i)) want "a ctype entry")))))
 
 ; ---- token names ----
 
@@ -226,13 +226,13 @@
     (set! (ls 'L) L)
     (for (i:i32 0) (< i 38) (set! i (+ i 1))
       (let (t:i32 (+ FIRST_RESERVED i)
-            got:CStr (luaX_token2str ls t)
+            got:CStr (lex-token2str ls t)
             want:String (if (< t TK_EOS) (str "'" (sv (aref stock-tokens i)) "'")
                             (str (sv (aref stock-tokens i)))))
         (try (check-eq (sv got) (string-as-view (ref want))))
         (drop (ref want))))
-    (try (check-eq (sv (luaX_token2str ls 43)) "'+'"))
-    (try (check-eq (sv (luaX_token2str ls 7)) "'<\\7>'"))
+    (try (check-eq (sv (lex-token2str ls 43)) "'+'"))
+    (try (check-eq (sv (lex-token2str ls 7)) "'<\\7>'"))
     (lua_close L)))
 
 ; ---- the binding's macros ----

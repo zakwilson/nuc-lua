@@ -11,9 +11,10 @@ symbytes() {
     awk '/^ [0-9a-f]+ /{for(i=2;i<=5;i++) printf "%s", $i}' | cut -c1-$(( $3 * 2 ))
 }
 fail=0
-for t in luaP_opmodes:85 luai_ctype_:257; do
-  sym=${t%%:*}; n=${t##*:}
-  p=$(symbytes "$LUA" "$sym" "$n"); r=$(symbytes "$REFLUA" "$sym" "$n")
+# port-name:stock-name:bytes (the port's internals have Nucleus names since M9)
+for t in op-modes:luaP_opmodes:85 ctype-table:luai_ctype_:257; do
+  IFS=: read -r psym sym n <<<"$t"
+  p=$(symbytes "$LUA" "$psym" "$n"); r=$(symbytes "$REFLUA" "$sym" "$n")
   if [ "$p" = "$r" ] && [ "$p" != missing ]; then echo "ok    $sym ($n bytes)"
   else echo "FAIL  $sym: port $p"; echo "      stock $r"; fail=1; fi
 done

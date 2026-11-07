@@ -22,38 +22,40 @@ Ranked by porter pain removed per unit of language work.
 | 16 | ISSUE-008 | Integer to float takes `unsafe/cast` | major | design | worked-around |
 | 17 | ISSUE-027 | Unary minus on a float is `0 - x`, so `(- 0.0)` is `0.0`, not `-0.0` | major | bug | worked-around |
 | 18 | ISSUE-045 | A computed goto's jump table can be neither a local array nor a static one | minor | missing-feature | worked-around |
-| 19 | ISSUE-019 | A header's `char *` is `(ptr i8)`, and an `if` won't join it with a string literal | minor | design | worked-around |
-| 20 | ISSUE-021 | Pointers can't be subtracted | minor | missing-feature | worked-around |
-| 21 | ISSUE-028 | `bit-not` of an unsigned operand is refused | minor | bug | worked-around |
-| 22 | ISSUE-029 | A constant macro built with a function-like macro isn't imported: `LUA_VNUMINT` | minor | known-limitation | worked-around |
-| 23 | ISSUE-030 | A `defconst` over a header constant is refused once a `defstruct` uses it as an array length | minor | bug | worked-around |
-| 24 | ISSUE-031 | A row of a header's 2-D array field doesn't decay, so it can't be indexed | minor | bug | worked-around |
-| 25 | ISSUE-034 | In a namespaced file, a header type named like a prelude type is silently the prelude's | minor | design | worked-around |
-| 26 | ISSUE-018 | A header's expression macros aren't imported: `errno`, `WIFEXITED` | minor | known-limitation | worked-around |
-| 27 | ISSUE-007 | A shared library is always named `lib<name>.so` | minor | tooling | worked-around |
-| 28 | ISSUE-048 | A shared library's link ignored `:link-args` | minor | bug | fixed in nucleus (see PROGRESS.md) |
-| 29 | ISSUE-010 | There is no `offsetof` | minor | missing-feature | worked-around |
-| 30 | ISSUE-012 | A header's string macros aren't imported | minor | known-limitation | worked-around |
-| 31 | ISSUE-011 | No `sizeof` of an expression, so no array length | minor | missing-feature | worked-around |
-| 32 | ISSUE-015 | Only the entry file can export a strong symbol | minor | design | worked-around |
-| 33 | ISSUE-016 | No byte literal: `\e` is a 32-bit Char and won't convert to `i8` | minor | design | worked-around |
-| 34 | ISSUE-017 | A `CStr` can't be indexed | minor | design | worked-around |
-| 35 | ISSUE-014 | `SIG_DFL` imports as the integer 0 | minor | interop | worked-around |
-| 36 | ISSUE-040 | A later declarator in a field list (`*previous, *next`) imported as a bare `ptr` | minor | bug | fixed in nucleus `a64ac73` |
-| 37 | ISSUE-042 | `=` on two `CStr`s compares contents, so a C pointer test ported as written reads through null | minor | design | worked-around |
-| 38 | ISSUE-041 | `bit-not` of an unsigned value is refused: `-1` doesn't fit it | papercut | bug | worked-around |
-| 39 | ISSUE-044 | A global `i8` array takes no string initializer, so `lua_ident` is spelled out in bytes | papercut | missing-feature | worked-around |
-| 40 | ISSUE-046 | A header's array variable, `extern const char lua_ident[]`, isn't imported | papercut | known-limitation | worked-around |
-| 41 | ISSUE-050 | In a file with no `(ns …)`, a macro can't name the file's own private helpers | papercut | design | worked-around |
-| 42 | ISSUE-024 | A `_`-prefixed macro isn't imported, even ISO C's `_IOFBF` | papercut | design | worked-around |
-| 43 | ISSUE-020 | `set!` won't expand a macro in its place | papercut | missing-feature | worked-around |
-| 44 | ISSUE-025 | `sizeof` is a signed integer, so comparing a size with it is refused | papercut | design | worked-around |
-| 45 | ISSUE-035 | `unsafe/cast` from a function pointer to an integer is refused | papercut | bug | worked-around |
-| 46 | ISSUE-036 | A `defvar`'s array initializer isn't macroexpanded before its shape is checked | papercut | bug | worked-around |
-| 47 | ISSUE-037 | A `defstruct` can't complete a struct its header declares without a body | papercut | missing-feature | worked-around |
-| 48 | ISSUE-038 | A parameter named like a special form is accepted, then misparsed at its use | papercut | design | worked-around |
-| 49 | ISSUE-039 | A `build.edn` makes one program, and a second sharing its sources warns at every build | papercut | tooling | worked-around |
-| 50 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
+| 19 | ISSUE-037 | A `defstruct` can't complete a struct its header declares without a body, so the port can't own `lua_State` | minor | missing-feature | worked-around |
+| 20 | ISSUE-052 | A macro doesn't cross an import cycle, so mutually recursive modules keep their shared macros in a leaf | minor | known-limitation | worked-around |
+| 21 | ISSUE-051 | A local named like a macro in scope is the macro at the head of a form, so `(next 'v)` expands | minor | design | worked-around |
+| 22 | ISSUE-019 | A header's `char *` is `(ptr i8)`, and an `if` won't join it with a string literal | minor | design | worked-around |
+| 23 | ISSUE-021 | Pointers can't be subtracted | minor | missing-feature | worked-around |
+| 24 | ISSUE-028 | `bit-not` of an unsigned operand is refused | minor | bug | worked-around |
+| 25 | ISSUE-029 | A constant macro built with a function-like macro isn't imported: `LUA_VNUMINT` | minor | known-limitation | worked-around |
+| 26 | ISSUE-030 | A `defconst` over a header constant is refused once a `defstruct` uses it as an array length | minor | bug | worked-around |
+| 27 | ISSUE-031 | A row of a header's 2-D array field doesn't decay, so it can't be indexed | minor | bug | worked-around |
+| 28 | ISSUE-034 | In a namespaced file, a header type named like a prelude type is silently the prelude's | minor | design | worked-around |
+| 29 | ISSUE-018 | A header's expression macros aren't imported: `errno`, `WIFEXITED` | minor | known-limitation | worked-around |
+| 30 | ISSUE-007 | A shared library is always named `lib<name>.so` | minor | tooling | worked-around |
+| 31 | ISSUE-048 | A shared library's link ignored `:link-args` | minor | bug | fixed in nucleus (see PROGRESS.md) |
+| 32 | ISSUE-010 | There is no `offsetof` | minor | missing-feature | worked-around |
+| 33 | ISSUE-012 | A header's string macros aren't imported | minor | known-limitation | worked-around |
+| 34 | ISSUE-011 | No `sizeof` of an expression, so no array length | minor | missing-feature | worked-around |
+| 35 | ISSUE-015 | Only the entry file can export a strong symbol | minor | design | worked-around |
+| 36 | ISSUE-016 | No byte literal: `\e` is a 32-bit Char and won't convert to `i8` | minor | design | worked-around |
+| 37 | ISSUE-017 | A `CStr` can't be indexed | minor | design | worked-around |
+| 38 | ISSUE-014 | `SIG_DFL` imports as the integer 0 | minor | interop | worked-around |
+| 39 | ISSUE-040 | A later declarator in a field list (`*previous, *next`) imported as a bare `ptr` | minor | bug | fixed in nucleus `a64ac73` |
+| 40 | ISSUE-042 | `=` on two `CStr`s compares contents, so a C pointer test ported as written reads through null | minor | design | worked-around |
+| 41 | ISSUE-041 | `bit-not` of an unsigned value is refused: `-1` doesn't fit it | papercut | bug | worked-around |
+| 42 | ISSUE-044 | A global `i8` array takes no string initializer, so `lua_ident` is spelled out in bytes | papercut | missing-feature | worked-around |
+| 43 | ISSUE-046 | A header's array variable, `extern const char lua_ident[]`, isn't imported | papercut | known-limitation | worked-around |
+| 44 | ISSUE-050 | In a file with no `(ns …)`, a macro can't name the file's own private helpers | papercut | design | worked-around |
+| 45 | ISSUE-024 | A `_`-prefixed macro isn't imported, even ISO C's `_IOFBF` | papercut | design | worked-around |
+| 46 | ISSUE-020 | `set!` won't expand a macro in its place | papercut | missing-feature | worked-around |
+| 47 | ISSUE-025 | `sizeof` is a signed integer, so comparing a size with it is refused | papercut | design | worked-around |
+| 48 | ISSUE-035 | `unsafe/cast` from a function pointer to an integer is refused | papercut | bug | worked-around |
+| 49 | ISSUE-036 | A `defvar`'s array initializer isn't macroexpanded before its shape is checked | papercut | bug | worked-around |
+| 50 | ISSUE-038 | A parameter named like a special form is accepted, then misparsed at its use | papercut | design | worked-around |
+| 51 | ISSUE-039 | A `build.edn` makes one program, and a second sharing its sources warns at every build | papercut | tooling | worked-around |
+| 52 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
 
 ## ISSUE-001: A C variadic couldn't be defined in Nucleus
 
@@ -745,11 +747,12 @@ which the docs recommend `macmap` and `~e` for, is the case it stops.
 
 ## ISSUE-037: A `defstruct` can't complete a struct its header declares without a body
 
-- **Severity:** papercut
+- **Severity:** minor (papercut until M9)
 - **Kind:** missing-feature
 - **Status:** worked-around
 - **Probe:** `probes/issue-037.nuc`
-- **Port sites:** `Block` in `parser.nuc`
+- **Port sites:** `Block` in `parser.nuc`; and the layouts as a whole, which stay in the
+  stock internal headers (M9)
 - **Workaround:** the struct takes another name, and the header's field is cast at
   each read and store (`fs-bl`).
 
@@ -758,6 +761,16 @@ Context: `lparser.h` declares `struct BlockCnt;` and `FuncState` points to one;
 `(defstruct BlockCnt …)` under `(set-ir-prefix "")` is refused: "BlockCnt links as
 %BlockCnt, the LLVM type of BlockCnt — rename it". A module that ports a C file
 which owns such a struct needs a second name and casts at the boundary.
+
+M9 was to move the layouts from `lobject.h`, `lstate.h` and the rest into
+`defstruct`s once no C shared them. `lua.h` declares `lua_State` without a body,
+and every API function's prototype names it, so the port's own `lua_State` would be
+a second name, `State`, cast from `lua_State*` at each of the 180 API entry points,
+in every hook and every `lua_CFunction` call, the `fs-bl` workaround multiplied by a
+hundred. The port therefore still reads its layouts from the stock headers, as it did
+during the migration; only the names moved (the `luaH_`, `luaV_` functions are
+`table-`, `vm-` and so on). Letting a `defstruct` complete a header's declared
+struct, as C's `.c` file does, is the one change that would free the layouts.
 
 ## ISSUE-038: A parameter named like a special form is accepted, then misparsed at its use
 
@@ -891,6 +904,49 @@ although the path is committed and holds in every checkout. The alternative, the
 as a `:kind :library`, archives it, so `lua` would need `--whole-archive` to keep the
 API symbols that C modules call. A `:programs` map (name to entry), sharing the rest
 of the settings, would cover both.
+
+## ISSUE-051: A local named like a macro in scope is the macro at the head of a form
+
+- **Severity:** minor
+- **Kind:** design
+- **Status:** worked-around
+- **Probe:** `probes/issue-051.nuc` — expected `5`; actual `quote needs the node
+  runtime — add (import-use nucleus.node)`
+- **Port sites:** `state-shrink-ci` in `state.nuc` and the upvalue list in `func.nuc`
+  (a local `next`), once M9's imports made `lex.nuc`'s `next` macro visible there
+- **Workaround:** rename the macro (`next-char`); the core's shared macros got names
+  no local would take (`exp-u`, not `u`).
+
+Context: `(x 'f)` is how Nucleus reads a field through a pointer, so a local in head
+position is ordinary: `next:(ptr CallInfo)` then `(next 'next)`. If any macro named
+`next` is in scope, from any imported module, the form is a macro call instead, and
+the error is about the expansion, here a quoted symbol that the macro body spliced
+into code. Nothing says the binding was shadowed. A local should shadow a macro in
+its scope, as it shadows a function; at the least, the binding should be refused
+where it is made, as ISSUE-038 asks for special forms. A module's public macros are
+every importer's reserved words, so the risk grows with each `import-use`.
+
+## ISSUE-052: A macro doesn't cross an import cycle
+
+- **Severity:** minor
+- **Kind:** known-limitation
+- **Status:** worked-around
+- **Port sites:** the core's modules, which call one another in cycles (`ldo` raises
+  through `ldebug`, which calls `ldo`); 34 macros that a second module used, from
+  `mainthread` to `exp-u`
+- **Workaround:** every macro a second module uses lives in `core.nuc`, which
+  imports no other core module.
+
+Context: until M9 the core's functions kept their C names, so the stock headers
+declared them and every module reached every other without importing it. Renamed,
+they need imports, and the core's imports form cycles. The docs say cycles are legal
+and carry functions, globals and constants, but not macros: "unknown: set-u —
+defined in a file this unit imports circularly". The rule moves each shared macro to
+a leaf, away from the structure it belongs to, `code.nuc`'s `expdesc` accessors
+included. It did also expose 17 macros the migration had copied into two to four
+modules each, some subtly different (`pcRel`, `get_nresults`, `tonumber`'s result
+type); they are one copy each now. A macro registered graph-wide, as signatures
+are, would keep each where it is defined.
 
 ## What worked well
 

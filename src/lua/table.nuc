@@ -18,6 +18,13 @@
 (import "lobject.h" c)  ; for c/Node: a bare Node is the prelude's (ISSUE-034)
 (import-use lua.util)
 (import-use lua.core)
+(import-use lua.vm)
+(import-use lua.gc)
+(import-use lua.do)
+(import-use lua.object)
+(import-use lua.mem)
+(import-use lua.debug)
+(import-use lua.string)
 
 ; Only hash parts of 2^LIMFORLAST nodes or more keep a 'lastfree' pointer, in a
 ; Limbox just before the nodes; smaller ones search the whole part for a free one.
@@ -61,7 +68,7 @@
 
 ; frexp(n) * -INT_MIN plus the exponent. The product's magnitude is at most
 ; INT_MAX; unsigned sums avoid overflow, and ~u (not -u) handles INT_MIN.
-(defn- l_hashfloat (n:lua_Number):ui32
+(defn- hashfloat (n:lua_Number):ui32
   (let (i:i32 0
         ni:lua_Integer 0)
     (set! n (* (frexp n &i) 2147483648.0))
@@ -72,12 +79,12 @@
             (return (if (<= u (as ui32 INT_MAX)) u (bit-xor u 0xFFFFFFFF))))))))
 
 ; The main position of a key: the node its hash gives.
-(defn- mainpositionTV (t:(ptr Table) key:(ptr TValue)):(ptr c/Node)
+(defn- mainposition-tv (t:(ptr Table) key:(ptr TValue)):(ptr c/Node)
   (let (tag:ui8 (ttypetag key))
     (cond (= tag LUA_VNUMINT) (return (hashint t (ivalue key)))
-          (= tag LUA_VNUMFLT) (return (hashmod t (l_hashfloat (fltvalue key))))
+          (= tag LUA_VNUMFLT) (return (hashmod t (hashfloat (fltvalue key))))
           (= tag LUA_VSHRSTR) (return (hashstr t (tsvalue key)))
-          (= tag LUA_VLNGSTR) (return (hashpow2 t (luaS_hashlongstr (tsvalue key))))
+          (= tag LUA_VLNGSTR) (return (hashpow2 t (string-hashlongstr (tsvalue key))))
           (= tag LUA_VFALSE) (return (hashpow2 t (as ui32 0)))
           (= tag LUA_VTRUE) (return (hashpow2 t (as ui32 1)))
           (= tag LUA_VLIGHTUSERDATA) (return (hashpointer t (pvalue key)))
@@ -87,7 +94,7 @@
 (defn- mainpositionfromnode (t:(ptr Table) nd:(ptr c/Node)):(ptr c/Node)
   (let (key:(ptr TValue) (alloca TValue))
     (getnodekey null key nd)
-    (return (mainpositionTV t key))))
+    (return (mainposition-tv t key))))
 
 ; Raw equality of key 'k1' and node n2's key. Integral floats are normalized,
 ; so an integer never equals a float, and short strings compare by identity.
@@ -96,7 +103,7 @@
 (defn- equalkey (k1:(ptr TValue) n2:(ptr c/Node) deadok:i32):i32
   (when (!= (rawtt k1) (keytt n2))  ; different variants
     (cond (and (keyisshrstr n2) (ttislngstring k1))  ; an external string may equal a short key
-            (return (luaS_eqstr (tsvalue k1) (keystrval n2)))
+            (return (string-eqstr (tsvalue k1) (keystrval n2)))
           (and (!= deadok 0) (keyisdead n2) (iscollectable k1))
             (return (if (= (gcvalue k1) (gckey n2)) 1 0))
           true (return 0)))
@@ -107,12 +114,12 @@
           (= tt LUA_VLIGHTUSERDATA) (return (if (= (pvalue k1) ((keyval n2) 'p)) 1 0))
           (= tt LUA_VLCF)
             (return (if (= (unsafe/cast ptr (fvalue k1)) (unsafe/cast ptr ((keyval n2) 'f))) 1 0))
-          (= tt (ctb LUA_VLNGSTR)) (return (luaS_eqstr (tsvalue k1) (keystrval n2)))
+          (= tt (ctb LUA_VLNGSTR)) (return (string-eqstr (tsvalue k1) (keystrval n2)))
           true (return (if (= (gcvalue k1) (gckey n2)) 1 0)))))
 
 ; Not for integers, which may be in the array part, nor integral floats.
 (defn- getgeneric (t:(ptr Table) key:(ptr TValue) deadok:i32):(ptr TValue)
-  (let (n:(ptr c/Node) (mainpositionTV t key))
+  (let (n:(ptr c/Node) (mainposition-tv t key))
     (while true
       (when (!= (equalkey key n deadok) 0)
         (return (gval n)))
@@ -142,11 +149,11 @@
       (return i))
     (let (n:(ptr TValue) (getgeneric t key 1))
       (when (isabstkey n)
-        (luaG_runerror L "invalid key to 'next'"))
+        (debug-runerror L "invalid key to 'next'"))
       (set! i (cast_uint (node-diff (nodefromval n) (gnode t 0))))
       (return (+ i 1 asize)))))
 
-(defn luaH_next (L:(ptr lua_State) t:(ptr Table) key:(ptr StackValue)):i32
+(defn table-next (L:(ptr lua_State) t:(ptr Table) key:(ptr StackValue)):i32
   (let (asize:ui32 (t 'asize)
         i:ui32 (findindex L t (s2v key) asize))
     (while (< i asize)  ; the array part
@@ -175,7 +182,7 @@
 (defn- freehash (L:(ptr lua_State) t:(ptr Table)):void
   (when (not (isdummy t))
     (let (arr:(ptr i8) (p+ (unsafe/cast (ptr i8) (t 'node)) (- 0 (as i64 (extraLastfree t)))))
-      (luaM_free_ L (as ptr arr) (sizehash t)))))
+      (mem-free-fn L (as ptr arr) (sizehash t)))))
 
 ; ---- rehash ----
 
@@ -213,7 +220,7 @@
 (defn- countint (key:lua_Integer ct:(ptr Counters)):void
   (let (k:ui32 (arrayindex key))
     (when (!= k 0)
-      (let (lg:i32 (as i32 (luaO_ceillog2 k)))
+      (let (lg:i32 (as i32 (obj-ceillog2 k)))
         (set! (aref (ct 'nums) lg) (+ (aref (ct 'nums) lg) 1)))
       (set! (ct 'na) (+ (ct 'na) 1)))))
 
@@ -272,11 +279,11 @@
 (defn- resizearray (L:(ptr lua_State) t:(ptr Table) oldasize:ui32 newasize:ui32):(ptr Value)
   (cond (= oldasize newasize) (return (t 'array))
         (= newasize 0)
-          (do (luaM_freemem L (as ptr (p+ (t 'array) (- 0 (as i64 oldasize))))
+          (do (mem-freemem L (as ptr (p+ (t 'array) (- 0 (as i64 oldasize))))
                             (concretesize oldasize))
               (return null)))
   (let (newasizeb:usize (concretesize newasize)
-        np:(ptr Value) (unsafe/cast (ptr Value) (luaM_realloc_ L null 0 newasizeb)))
+        np:(ptr Value) (unsafe/cast (ptr Value) (mem-realloc L null 0 newasizeb)))
     (when (= np null)
       (return null))
     (set! np (p+ np newasize))  ; to the end of the values
@@ -286,7 +293,7 @@
             tomove:i64 (as i64 (if (< oldasize newasize) oldasize newasize))
             tomoveb:usize (if (< oldasize newasize) oldasizeb newasizeb))
         (memcpy (as ptr (p+ np (- 0 tomove))) (as ptr (p+ op (- 0 tomove))) tomoveb)
-        (luaM_freemem L (as ptr (p+ op (- 0 (as i64 oldasize)))) oldasizeb)))
+        (mem-freemem L (as ptr (p+ op (- 0 (as i64 oldasize)))) oldasizeb)))
     (return np)))
 
 ; The hash part, or the dummy node for size 0. The first test keeps the shift
@@ -296,14 +303,14 @@
     (do (set! (t 'node) (dummynode))
         (set! (t 'lsizenode) 0)
         (setdummy t))
-    (let (lsize:i32 (as i32 (luaO_ceillog2 size)))
+    (let (lsize:i32 (as i32 (obj-ceillog2 size)))
       (when (or (> lsize MAXHBITS) (> (bit-shl 1 lsize) MAXHSIZE))
-        (luaG_runerror L "table overflow"))
+        (debug-runerror L "table overflow"))
       (set! size (twoto lsize))
       (if (< lsize LIMFORLAST)
-        (set! (t 'node) (luaM_newvector L size c/Node))
+        (set! (t 'node) (mem-newvector L size c/Node))
         (let (bsize:usize (+ (* (cast_sizet size) (as usize NODESIZE)) (as usize LIMBOXSIZE))
-              node:(ptr i8) (unsafe/cast (ptr i8) (luaM_malloc_ L bsize 0)))
+              node:(ptr i8) (unsafe/cast (ptr i8) (mem-malloc L bsize 0)))
           (set! (t 'node) (unsafe/cast (ptr c/Node) (p+ node LIMBOXSIZE)))
           (set! (deref (lastfree-ptr t)) (gnode t size))))  ; every position free
       (set! (t 'lsizenode) (cast_uchar lsize))
@@ -338,7 +345,7 @@
     (set! (t2 'flags) (bit-or (bit-and (t2 'flags) NOTBITDUMMY) bitdummy1))))
 
 ; Moves the array's vanishing slice into the (new) hash part.
-(defn- reinsertOldSlice (t:(ptr Table) oldasize:ui32 newasize:ui32):void
+(defn- reinsert-old-slice (t:(ptr Table) oldasize:ui32 newasize:ui32):void
   (let (key:(ptr TValue) (alloca TValue)
         aux:(ptr TValue) (alloca TValue))
     (for (i:ui32 newasize) (< i oldasize) (inc! i)
@@ -348,7 +355,7 @@
           (farr2val t i tag aux)
           (insertkey t key aux))))))
 
-(defn- clearNewSlice (t:(ptr Table) oldasize:ui32 newasize:ui32):void
+(defn- clear-new-slice (t:(ptr Table) oldasize:ui32 newasize:ui32):void
   (while (< oldasize newasize)
     (set! (deref (getArrTag t oldasize)) LUA_VEMPTY)
     (inc! oldasize)))
@@ -357,32 +364,32 @@
 ; array's shrinking slice goes into the new hash, and the array is reallocated;
 ; if that fails, the table is as it was, so the new hash is freed before the
 ; error. Otherwise the table takes the new parts, and the old hash is reinserted.
-(defn luaH_resize (L:(ptr lua_State) t:(ptr Table) newasize:ui32 nhsize:ui32):void
+(defn table-resize (L:(ptr lua_State) t:(ptr Table) newasize:ui32 nhsize:ui32):void
   (let (newt:(ptr Table) (alloca Table)  ; holds the new hash part
         oldasize:ui32 (t 'asize))
     (when (> newasize MAXASIZE)
-      (luaG_runerror L "table overflow"))
+      (debug-runerror L "table overflow"))
     (set! (newt 'flags) 0)
     (setnodevector L newt nhsize)
     (when (< newasize oldasize)  ; the array shrinks
       (exchangehashpart t newt)  ; pretend the table has the new hash
-      (reinsertOldSlice t oldasize newasize)
+      (reinsert-old-slice t oldasize newasize)
       (exchangehashpart t newt))  ; the old hash back, in case of errors
     (let (newarray:(ptr Value) (resizearray L t oldasize newasize))
       (when (and (= newarray null) (> newasize 0))
         (freehash L newt)
-        (luaM_error L))
+        (mem-error L))
       (exchangehashpart t newt)  ; 't' has the new hash, 'newt' the old
       (set! (t 'array) newarray)
       (set! (t 'asize) newasize)
       (when (!= newarray null)
         (set! (deref (lenhint t)) (/ newasize 2)))
-      (clearNewSlice t oldasize newasize)
+      (clear-new-slice t oldasize newasize)
       (reinserthash L newt t)
       (freehash L newt))))
 
-(defn luaH_resizearray (L:(ptr lua_State) t:(ptr Table) nasize:ui32):void
-  (luaH_resize L t nasize (allocsizenode t)))
+(defn table-resizearray (L:(ptr lua_State) t:(ptr Table) nasize:ui32):void
+  (table-resize L t nasize (allocsizenode t)))
 
 ; Counts the keys, sizes the array part for the integer keys outside it, and
 ; resizes.
@@ -405,10 +412,10 @@
     (set! nsize (- (ct 'total) (ct 'na)))
     (when (!= (ct 'deleted) 0)  ; insert-delete-insert: room to spare
       (set! nsize (+ nsize (bit-shr nsize 2))))
-    (luaH_resize L t asize nsize)))
+    (table-resize L t asize nsize)))
 
-(defn luaH_new (L:(ptr lua_State)):(ptr Table)
-  (let (t:(ptr Table) (gco2t (luaC_newobj L LUA_VTABLE (cast_sizet (sizeof Table)))))
+(defn table-new (L:(ptr lua_State)):(ptr Table)
+  (let (t:(ptr Table) (gco2t (gc-newobj L LUA_VTABLE (cast_sizet (sizeof Table)))))
     (set! (t 'metatable) null)
     (set! (t 'flags) maskflags)  ; no metamethod fields
     (set! (t 'array) null)
@@ -416,16 +423,16 @@
     (setnodevector L t 0)
     (return t)))
 
-(defn luaH_size (t:(ptr Table)):lu_mem
+(defn table-size (t:(ptr Table)):lu_mem
   (let (sz:lu_mem (+ (cast_sizet (sizeof Table)) (concretesize (t 'asize))))
     (when (not (isdummy t))
       (set! sz (+ sz (sizehash t))))
     (return sz)))
 
-(defn luaH_free (L:(ptr lua_State) t:(ptr Table)):void
+(defn table-free (L:(ptr lua_State) t:(ptr Table)):void
   (freehash L t)
   (resizearray L t (t 'asize) 0)
-  (luaM_free L t Table))
+  (mem-free L t Table))
 
 (defn- getfreepos (t:(ptr Table)):(ptr c/Node)
   (if (haslastfree t)
@@ -446,7 +453,7 @@
 ; is out of its own main position, it moves to a free one and the key takes its
 ; place; if not, the key goes to a free position. 0 when there is none.
 (defn- insertkey (t:(ptr Table) key:(ptr TValue) value:(ptr TValue)):i32
-  (let (mp:(ptr c/Node) (mainpositionTV t key))
+  (let (mp:(ptr c/Node) (mainposition-tv t key))
     (when (or (not (isempty (gval mp))) (isdummy t))  ; main position taken?
       (let (f:(ptr c/Node) (getfreepos t))
         (when (= f null)
@@ -476,12 +483,12 @@
       (obj2arr t (- i 1) value)
       (insertkey t key value))))  ; it can't fail
 
-(defn- luaH_newkey (L:(ptr lua_State) t:(ptr Table) key:(ptr TValue) value:(ptr TValue)):void
+(defn- lua-h-newkey (L:(ptr lua_State) t:(ptr Table) key:(ptr TValue) value:(ptr TValue)):void
   (when (not (ttisnil value))  ; nil values aren't inserted
     (when (= (insertkey t key value) 0)  ; no free place: grow the table
       (rehash L t key)
       (newcheckedkey t key value))
-    (luaC_barrierback L (obj2gco t) key)))
+    (gc-barrierback L (obj2gco t) key)))
 
 (defn- getintfromhash (t:(ptr Table) key:lua_Integer):(ptr TValue)
   (let (n:(ptr c/Node) (hashint t key))
@@ -502,7 +509,7 @@
     (setobj null res val))
   (return (ttypetag val)))
 
-(defn luaH_getint (t:(ptr Table) key:lua_Integer res:(ptr TValue)):lu_byte
+(defn table-getint (t:(ptr Table) key:lua_Integer res:(ptr TValue)):lu_byte
   (let (k:ui32 (ikeyinarray t key))
     (if (> k 0)
       (let (tag:ui8 (deref (getArrTag t (- k 1))))
@@ -511,7 +518,7 @@
         (return tag))
       (return (finishnodeget (getintfromhash t key) res)))))
 
-(defn luaH_Hgetshortstr (t:(ptr Table) key:(ptr TString)):(ptr TValue)
+(defn table-hgetshortstr (t:(ptr Table) key:(ptr TString)):(ptr TValue)
   (let (n:(ptr c/Node) (hashstr t key))
     (while true
       (when (and (keyisshrstr n) (= (keystrval n) key))
@@ -522,32 +529,32 @@
         (set! n (p+ n nx))))
     (return &absentkey)))
 
-(defn luaH_getshortstr (t:(ptr Table) key:(ptr TString) res:(ptr TValue)):lu_byte
-  (return (finishnodeget (luaH_Hgetshortstr t key) res)))
+(defn table-getshortstr (t:(ptr Table) key:(ptr TString) res:(ptr TValue)):lu_byte
+  (return (finishnodeget (table-hgetshortstr t key) res)))
 
 ; A long string goes through the generic search.
-(defn- Hgetlongstr (t:(ptr Table) key:(ptr TString)):(ptr TValue)
+(defn- hgetlongstr (t:(ptr Table) key:(ptr TString)):(ptr TValue)
   (let (ko:(ptr TValue) (alloca TValue))
     (setsvalue null ko key)
     (return (getgeneric t ko 0))))
 
-(defn- Hgetstr (t:(ptr Table) key:(ptr TString)):(ptr TValue)
+(defn- hgetstr (t:(ptr Table) key:(ptr TString)):(ptr TValue)
   (if (strisshr key)
-    (return (luaH_Hgetshortstr t key))
-    (return (Hgetlongstr t key))))
+    (return (table-hgetshortstr t key))
+    (return (hgetlongstr t key))))
 
-(defn luaH_getstr (t:(ptr Table) key:(ptr TString) res:(ptr TValue)):lu_byte
-  (return (finishnodeget (Hgetstr t key) res)))
+(defn table-getstr (t:(ptr Table) key:(ptr TString) res:(ptr TValue)):lu_byte
+  (return (finishnodeget (hgetstr t key) res)))
 
-(defn luaH_get (t:(ptr Table) key:(ptr TValue) res:(ptr TValue)):lu_byte
+(defn table-get (t:(ptr Table) key:(ptr TValue) res:(ptr TValue)):lu_byte
   (let (tag:ui8 (ttypetag key))
-    (cond (= tag LUA_VSHRSTR) (return (finishnodeget (luaH_Hgetshortstr t (tsvalue key)) res))
-          (= tag LUA_VNUMINT) (return (luaH_getint t (ivalue key) res))
+    (cond (= tag LUA_VSHRSTR) (return (finishnodeget (table-hgetshortstr t (tsvalue key)) res))
+          (= tag LUA_VNUMINT) (return (table-getint t (ivalue key) res))
           (= tag LUA_VNIL) (return (finishnodeget &absentkey res))
           (= tag LUA_VNUMFLT)
             (let (k:lua_Integer 0)
-              (when (!= (luaV_flttointeger (fltvalue key) &k F2Ieq) 0)  ; an integral index
-                (return (luaH_getint t k res)))))
+              (when (!= (vm-flttointeger (fltvalue key) &k F2Ieq) 0)  ; an integral index
+                (return (table-getint t k res)))))
     (return (finishnodeget (getgeneric t key 0) res))))
 
 ; Where an incomplete pset's key is, for luaH_finishset.
@@ -568,18 +575,18 @@
     (do (setobj null slot val)
         (return 1))))
 
-(defn luaH_psetint (t:(ptr Table) key:lua_Integer val:(ptr TValue)):i32
+(defn table-psetint (t:(ptr Table) key:lua_Integer val:(ptr TValue)):i32
   (return (finishnodeset t (getintfromhash t key) val)))
 
 (defn- psetint (t:(ptr Table) key:lua_Integer val:(ptr TValue)):i32
   (let (hres:i32 0)
-    (luaH_fastseti t key val hres)
+    (table-fastseti t key val hres)
     (return hres)))
 
-; finishnodeset over luaH_Hgetshortstr, but completing the common case of a
+; finishnodeset over table-hgetshortstr, but completing the common case of a
 ; constructor ({x=1, y=2}) here: no metatable, not black, and room for the key.
-(defn luaH_psetshortstr (t:(ptr Table) key:(ptr TString) val:(ptr TValue)):i32
-  (let (slot:(ptr TValue) (luaH_Hgetshortstr t key))
+(defn table-psetshortstr (t:(ptr Table) key:(ptr TString) val:(ptr TValue)):i32
+  (let (slot:(ptr TValue) (table-hgetshortstr t key))
     (when (not (ttisnil slot))  ; the key has a value: update it
       (setobj null slot val)
       (return HOK))
@@ -595,75 +602,75 @@
     ; a __newindex, a barrier or a rehash: the caller finishes it
     (return (retpsetcode t slot))))
 
-(defn luaH_psetstr (t:(ptr Table) key:(ptr TString) val:(ptr TValue)):i32
+(defn table-psetstr (t:(ptr Table) key:(ptr TString) val:(ptr TValue)):i32
   (if (strisshr key)
-    (return (luaH_psetshortstr t key val))
-    (return (finishnodeset t (Hgetlongstr t key) val))))
+    (return (table-psetshortstr t key val))
+    (return (finishnodeset t (hgetlongstr t key) val))))
 
-(defn luaH_pset (t:(ptr Table) key:(ptr TValue) val:(ptr TValue)):i32
+(defn table-pset (t:(ptr Table) key:(ptr TValue) val:(ptr TValue)):i32
   (let (tag:ui8 (ttypetag key))
-    (cond (= tag LUA_VSHRSTR) (return (luaH_psetshortstr t (tsvalue key) val))
+    (cond (= tag LUA_VSHRSTR) (return (table-psetshortstr t (tsvalue key) val))
           (= tag LUA_VNUMINT) (return (psetint t (ivalue key) val))
           (= tag LUA_VNIL) (return HNOTFOUND)
           (= tag LUA_VNUMFLT)
             (let (k:lua_Integer 0)
-              (when (!= (luaV_flttointeger (fltvalue key) &k F2Ieq) 0)
+              (when (!= (vm-flttointeger (fltvalue key) &k F2Ieq) 0)
                 (return (psetint t k val)))))
     (return (finishnodeset t (getgeneric t key 0) val))))
 
 ; Finishes a raw set where 'hres', a pset's result, says where the value goes.
 ; The caller may need a barrier and to invalidate the TM cache.
-(defn luaH_finishset (L:(ptr lua_State) t:(ptr Table) key:(ptr TValue) value:(ptr TValue)
+(defn table-finishset (L:(ptr lua_State) t:(ptr Table) key:(ptr TValue) value:(ptr TValue)
                       hres:i32):void
   (cond (= hres HNOTFOUND)
           (let (aux:(ptr TValue) (alloca TValue)
                 actk:(ptr TValue) key)  ; the key actually inserted
-            (cond (ttisnil key) (luaG_runerror L "table index is nil")
+            (cond (ttisnil key) (debug-runerror L "table index is nil")
                   (ttisfloat key)
                     (let (f:lua_Number (fltvalue key)
                           k:lua_Integer 0)
-                      (if (!= (luaV_flttointeger f &k F2Ieq) 0)  ; an integral float
+                      (if (!= (vm-flttointeger f &k F2Ieq) 0)  ; an integral float
                         (do (setivalue aux k)
                             (set! actk aux))
-                        (when (luai_numisnan f)
-                          (luaG_runerror L "table index is NaN"))))
+                        (when (num-isnan f)
+                          (debug-runerror L "table index is NaN"))))
                   (isextstr key)  ; a short one must be interned to be a key
-                    (let (ts:(ptr TString) (luaS_normstr L (tsvalue key)))
+                    (let (ts:(ptr TString) (string-normstr L (tsvalue key)))
                       (setsvalue2s L ((L 'top) 'p) ts)  ; anchored (EXTRA_STACK)
                       (set! ((L 'top) 'p) (p+ ((L 'top) 'p) 1))
-                      (luaH_newkey L t (s2v (p+ ((L 'top) 'p) -1)) value)
+                      (lua-h-newkey L t (s2v (p+ ((L 'top) 'p) -1)) value)
                       (set! ((L 'top) 'p) (p+ ((L 'top) 'p) -1))
                       (return)))
-            (luaH_newkey L t actk value))
+            (lua-h-newkey L t actk value))
         (> hres 0)  ; a node
           (setobj2t L (gval (gnode t (- hres HFIRSTNODE))) value)
         true  ; an array entry, at ~hres
           (obj2arr t (cast_uint (bit-xor hres -1)) value)))
 
 ; The caller may need a barrier and to invalidate the TM cache.
-(defn luaH_set (L:(ptr lua_State) t:(ptr Table) key:(ptr TValue) value:(ptr TValue)):void
-  (let (hres:i32 (luaH_pset t key value))
+(defn table-set (L:(ptr lua_State) t:(ptr Table) key:(ptr TValue) value:(ptr TValue)):void
+  (let (hres:i32 (table-pset t key value))
     (when (!= hres HOK)
-      (luaH_finishset L t key value hres))))
+      (table-finishset L t key value hres))))
 
 ; The caller may need a barrier; an integer is never a metamethod's key.
-(defn luaH_setint (L:(ptr lua_State) t:(ptr Table) key:lua_Integer value:(ptr TValue)):void
+(defn table-setint (L:(ptr lua_State) t:(ptr Table) key:lua_Integer value:(ptr TValue)):void
   (let (ik:ui32 (ikeyinarray t key))
     (if (> ik 0)
       (obj2arr t (- ik 1) value)
       (when (= (rawfinishnodeset (getintfromhash t key) value) 0)
         (let (k:(ptr TValue) (alloca TValue))
           (setivalue k key)
-          (luaH_newkey L t k value))))))
+          (lua-h-newkey L t k value))))))
 
 ; A border in the hash part, where t[asize + 1] is present: double 'j' until
 ; t[j] is absent (or try maxinteger), then binary search. The first doubling
 ; adds a random number about as wide as 'i', from the seed, so a crafted table
 ; can't steer the probes into a huge length.
-(defn- hash_search (L:(ptr lua_State) t:(ptr Table) asize:ui32):lua_Unsigned
+(defn- hash-search (L:(ptr lua_State) t:(ptr Table) asize:ui32):lua_Unsigned
   (let (i:lua_Unsigned (+ (as lua_Unsigned asize) 1)
         rnd:ui32 ((G L) 'seed)
-        n:i32 (if (> asize 0) (as i32 (luaO_ceillog2 asize)) 0)
+        n:i32 (if (> asize 0) (as i32 (obj-ceillog2 asize)) 0)
         mask:ui32 (- (bit-shl (as ui32 1) (as ui32 n)) 1)
         incr:ui32 (+ (bit-and rnd mask) 1)
         maxu:lua_Unsigned (l_castS2U LUA_MAXINTEGER)
@@ -700,7 +707,7 @@
 ; t[maxinteger] is present. In the array part, near the last result first
 ; (t[#t+1] = v and t[#t] = nil move it by one), else by binary search; if the
 ; array part is missing or full, in the hash part.
-(defn luaH_getn (L:(ptr lua_State) t:(ptr Table)):lua_Unsigned
+(defn table-getn (L:(ptr lua_State) t:(ptr Table)):lua_Unsigned
   (let (asize:ui32 (t 'asize))
     (when (> asize 0)
       (let (maxvicinity:ui32 4
@@ -727,4 +734,4 @@
         (set! (deref (lenhint t)) asize)))
     (if (or (isdummy t) (hashkeyisempty t (+ (as lua_Unsigned asize) 1)))
       (return (as lua_Unsigned asize))
-      (return (hash_search L t asize)))))
+      (return (hash-search L t asize)))))

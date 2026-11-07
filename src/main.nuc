@@ -404,7 +404,7 @@
       (when (!= (lua_pcall L n 0 0) LUA_OK)
         (l-message progname (lua_pushfstring L "error calling 'print' (%s)" (lua_tostring L -1)))))))
 
-(defn- doREPL (L:&lua_State):void
+(defn- do-repl (L:&lua_State):void
   (let (oldprogname:CStr progname
         status:i32 0)
     (set! progname (as CStr null))  ; no program name on errors in interactive mode
@@ -442,10 +442,10 @@
     (when (and (> script 0) (!= (handle-script L (unsafe/ptr+ argv (as i64 script))) LUA_OK))
       (return 0))
     (cond
-      (!= (bit-and args has-i) 0) (doREPL L)
+      (!= (bit-and args has-i) 0) (do-repl L)
       (and (< script 1) (= (bit-and args (bit-or has-e has-v)) 0))
         (if (!= (isatty 0) 0)
-          (do (print-version) (doREPL L))
+          (do (print-version) (do-repl L))
           (dofile L (as CStr null))))  ; run stdin as a file
     (lua_pushboolean L 1)  ; no errors
     (return 1)))

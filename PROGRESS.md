@@ -39,7 +39,8 @@ object model, the compiler, execution state, the collector and the VM (§10).
 | 6 The collector | done: `lgc`; the suite passes collecting as often as it can, in both modes |
 | 7 The VM | done: `lvm`, threaded dispatch; no stock object linked; benchmarked; user test request below |
 | 8 Nucleus libraries | done: `libs/nucdemo`, `tests/capi/nuc`, `docs/writing-libraries.md`; the full matrix, two libraries at once, the unload path; user test request below |
-| 9–11 | not started |
+| 9 Idiom pass | done: internals and private functions in kebab-case, shared macros in one place, `mathlib` in `defn-lua`; the layouts stay in the stock headers (ISSUE-037) |
+| 10–11 | not started |
 
 ### Nucleus
 
@@ -123,6 +124,9 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
   at `lua_close`, and see both unmapped afterwards. `probes/issue-047.nuc` confirms
   that a `longjmp` skips `defer` and `with` cleanups; the rule that follows is in
   `docs/writing-libraries.md`.
+- M9: after the renames every gate passes as before (suite, both stressed runs, the
+  matrix, bytecode, tables, `nm` for both programs, 13 unit tests); the benchmark
+  is unchanged, 0.93 to 1.13 times stock.
 - The spike: a Nucleus `luaopen_` module whose function raises with `luaL_error`
   (a real C variadic call) is caught by `pcall` in stock `lua`.
 
@@ -138,7 +142,7 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
 - `scripts/check-probes.sh`.
 - `nucleus test` builds and runs `tests/unit/main.nuc` (PROMPT §7.6): integer and float
   arithmetic at the edges, mixed integer/float comparisons past 2^53, numerals parsed
-  and formatted, `luaP_opmodes` and `luai_ctype_` against stock's bytes, the token
+  and formatted, `op-modes` and `ctype-table` against stock's bytes, the token
   names, and the binding's macros on a live state.
 - `scripts/check-bytecode.sh`: the 78 dumps of the suite's files and of
   `tests/bytecode/gen-stress.lua`'s sources (LOADKX, SETLIST's extra argument, absolute
@@ -148,7 +152,8 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
   corrupted loads must read the same. The port's `luac` (built by `nucleus build` in
   `luac/`; `PLUAC=` picks another) must dump as `string.dump`, list as stock `luac`, and
   answer its options as stock does.
-- `scripts/check-tables.sh`: `luaP_opmodes` and `luai_ctype_` byte-identical to stock's.
+- `scripts/check-tables.sh`: `op-modes` and `ctype-table` byte-identical to stock's
+  `luaP_opmodes` and `luai_ctype_`.
 - `scripts/check-nm.sh [binary]`: no global a stock object defines is strong in the
   port (Nucleus's public `defn`s are weak, C's are not).
 - `scripts/check-suite.sh` runs the official suite (`LUA=` picks the binary).
@@ -161,17 +166,49 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
 
 ## Next
 
-M9, the idiom pass (PROMPT §10): rename internals to Nucleus style now that no C
-shares the layouts, revisit the early modules, redo what the migration held back, and
-rerun the benchmarks. Then M10 (the `T` harness) and M11 (the final report). `code.nuc` holds `lcode.h`'s macros and the `expdesc`
-union accessors (`u`, `set-u`, `ind`, `set-ind`, `uvar`, `set-uvar`) that `parser.nuc`
-uses; `parser.nuc`'s `Block` is C's `BlockCnt` (ISSUE-037). `opcodes.nuc` generates `luaP_opmodes` from one
-opcode row table (`with-opcodes`); `luac`'s `opnames` come from the same rows.
+M10, the `T` harness (PROMPT §10), then M11, the final report.
+
+## The idiom pass (M9)
+
+- **Names.** The core's functions are no longer called by C, so they have Nucleus
+  names: `luaH_get` is `table-get`, `luaV_execute` `vm-execute`, `luaD_throw`
+  `do-throw`; one prefix per subsystem (`gc-`, `do-`, `state-`, `func-`, `debug-`,
+  `table-`, `code-`, `mem-`, `obj-`, `op-`, `string-`, `tm-`, `vm-`, `lex-`,
+  `parser-`, `zio-`), `luaY_parser` is `parse-chunk`, `luaU_dump` `dump-chunk`.
+  Every private function, in the libraries too, is kebab-case (`str-find-aux`,
+  `co-resume`, `pkg-require`). The public API (`lua_*`, `luaL_*`, `luaopen_*`)
+  keeps its C names. Of stock `lua`'s globals, only the API's (`lua_*`, `luaL_*`,
+  `luaopen_*`) and `main` are still in the port's symbol table.
+- **Imports.** The stock headers had declared every core function, so a module
+  called any other without importing it. Renamed, each module imports what it calls,
+  and the core's imports form cycles, which Nucleus allows; its macros don't cross a
+  cycle (ISSUE-052), so `core.nuc` now holds every macro two modules share. That
+  merged 17 macros the migration had copied into two to four modules each, some
+  subtly different (`tonumber`'s result, `get_nresults`'s mask, two `pcRel`s, two
+  `code-at`s), and gave `code.nuc`'s `expdesc` accessors names no local would take
+  (`exp-u`, `set-exp-u`, `exp-ind`, `exp-var`), since a macro in scope beats a local
+  of its name (ISSUE-051). `lex.nuc`'s `next` macro became `next-char` for that reason.
+- **Libraries.** `mathlib` is in the `defn-lua` style: the one-float functions are one
+  row each in `def-float-fns`, and the others declare their arguments. The other
+  libraries keep their explicit `luaL_check*` calls, since their checks are
+  interleaved with optional and dependent arguments whose order the error messages
+  reveal.
+- **Held back still: the layouts.** The core reads `lobject.h`, `lstate.h` and the
+  rest for its structs, as during the migration. Owning them means a `defstruct` for
+  `lua_State`, which `lua.h` declares without a body, and a Nucleus struct can't
+  complete it (ISSUE-037, now minor): every API function would cast from
+  `lua_State*` to a second name. The function names moved; the types stay.
+- **Benchmarks.** Unchanged (the renames don't touch code generation); nothing is
+  near 1.5×. `vm-execute` is 26 KB against `luaV_execute`'s 16 KB, and `do-precall`
+  1.1 KB against 0.6 KB; M11's code generation section looks at why.
 
 The core modules import the internal headers (`-Ireference/build/src` in `:cflags`) for
 their layouts. `src/lua/core.nuc` holds the internal headers' macros (`lobject.h`,
 `lstate.h`, `lgc.h`, `ltm.h`, `ltable.h`, `lfunc.h`, `ldo.h`), with constants built
-from function-like macros written out (ISSUE-029); `src/lua/ctype.nuc` holds `lctype.h`'s.
+from function-like macros written out (ISSUE-029), and every macro that two modules
+use (ISSUE-052); `src/lua/ctype.nuc` holds `lctype.h`'s. `parser.nuc`'s `Block` is C's
+`BlockCnt` (ISSUE-037). `opcodes.nuc` generates `op-modes` from one opcode row table
+(`with-opcodes`); `luac`'s `opnames` come from the same rows.
 A namespaced module that names `Node` imports `lobject.h` a second time with prefix `c`
 and writes `c/Node` (ISSUE-034). Every ported module is checked with `nm` for mangled
 names (ISSUE-022), since a definition whose type misses the header's prototype links as an
@@ -261,3 +298,16 @@ at `-O2`; a ratio above 1 is the port slower.
 | patterns | 291 | 330 | 1.13 |
 | strings | 194 | 187 | 0.96 |
 | tables | 367 | 339 | 0.92 |
+
+### Benchmark, 2026-11-07, Nucleus b8e711e
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 428 | 476 | 1.11 |
+| closures | 427 | 411 | 0.96 |
+| floats | 279 | 269 | 0.96 |
+| gc | 624 | 594 | 0.95 |
+| metamethods | 375 | 384 | 1.02 |
+| patterns | 298 | 336 | 1.13 |
+| strings | 195 | 183 | 0.94 |
+| tables | 376 | 348 | 0.93 |

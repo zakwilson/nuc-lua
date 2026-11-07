@@ -206,7 +206,7 @@
 (defmacro pvalue (o) `((val_ ~o) 'p))
 (defmacro fvalue (o) `((val_ ~o) 'f))
 (defmacro isextstr (o) `(and (ttislngstring ~o) (!= ((tsvalue ~o) 'shrlen) LSTRREG)))
-(defmacro luai_numisnan (a) `(!= ~a ~a))
+(defmacro num-isnan (a) `(!= ~a ~a))
 
 ; ---- ltable.h ----
 (defmacro gnode (t i) `(p+ (~t 'node) ~i))
@@ -238,16 +238,16 @@
   `(do (set! (deref ~tag) (~val 'tt_))
        (set! (deref (getArrVal ~h ~k)) (~val 'value_))))
 ; 'tag' gets the tag of t[k], and 'res' its value unless it is empty.
-(defmacro luaH_fastgeti (t k res tag)
+(defmacro table-fastgeti (t k res tag)
   (let (h (gensym) u (gensym))
     `(let ((~h (ptr Table)) ~t
            (~u lua_Unsigned) (- (l_castS2U ~k) 1))
        (if (< ~u (as lua_Unsigned (~h 'asize)))
          (do (set! ~tag (deref (getArrTag ~h ~u)))
              (when (not (tagisempty ~tag)) (farr2val ~h ~u ~tag ~res)))
-         (set! ~tag (luaH_getint ~h ~k ~res))))))
+         (set! ~tag (table-getint ~h ~k ~res))))))
 ; 'hres' gets HOK when t[k] was set, else where to finish the set.
-(defmacro luaH_fastseti (t k val hres)
+(defmacro table-fastseti (t k val hres)
   (let (h (gensym) u (gensym) tg (gensym))
     `(let ((~h (ptr Table)) ~t
            (~u lua_Unsigned) (- (l_castS2U ~k) 1))
@@ -256,7 +256,7 @@
            (if (or (checknoTM (~h 'metatable) TM_NEWINDEX) (not (tagisempty (deref ~tg))))
              (do (fval2arr ~h ~u ~tg ~val) (set! ~hres HOK))
              (set! ~hres (bit-xor (unsafe/cast i32 ~u) -1))))
-         (set! ~hres (luaH_psetint ~h ~k ~val))))))
+         (set! ~hres (table-psetint ~h ~k ~val))))))
 
 ; ---- lvm.h ----
 ; Float 'n' from a number, without string coercion; false if it isn't one.
@@ -272,18 +272,18 @@
     `(let ((~a (ptr TValue)) ~o)
        (if (ttisinteger ~a)
          (do (set! (deref ~i) (ivalue ~a)) true)
-         (!= (luaV_tointegerns ~a ~i F2Ieq) 0)))))
+         (!= (vm-tointegerns ~a ~i F2Ieq) 0)))))
 
 ; ---- ltm.h ----
 (defmacro notm (tm) `(ttisnil ~tm))
-(defmacro ttypename (x) `(aref luaT_typenames_ (+ ~x 1)))
+(defmacro ttypename (x) `(aref tm-typenames (+ ~x 1)))
 ; The metamethod 'e' of 'mt', or null; a miss is cached in the table's flags.
 (defmacro gfasttm (g mt e)
   (let (m (gensym))
     `(let ((~m (ptr Table)) ~mt)
        (if (or (= ~m null) (!= (bit-and (as ui32 (~m 'flags)) (bit-shl (as ui32 1) (as ui32 ~e))) 0))
          (as (ptr TValue) null)
-         (luaT_gettm ~m ~e (aref (~g 'tmname) ~e))))))
+         (tm-gettm ~m ~e (aref (~g 'tmname) ~e))))))
 (defmacro checknoTM (mt e)
   (let (m (gensym))
     `(let ((~m (ptr Table)) ~mt)
@@ -307,26 +307,26 @@
 (defmacro nw2black (x) `(set! (~x 'marked) (bit-or (~x 'marked) BLACKMASK)))
 
 ; A black object pointing to a white one must be fixed up for the collector.
-(defmacro luaC_objbarrier (L p o)
+(defmacro gc-objbarrier (L p o)
   `(when (and (isblack ~p) (iswhite ~o))
-     (luaC_barrier_ ~L (obj2gco ~p) (obj2gco ~o))))
-(defmacro luaC_barrier (L p v)
+     (gc-barrier-fn ~L (obj2gco ~p) (obj2gco ~o))))
+(defmacro gc-barrier (L p v)
   (let (a (gensym))
     `(let ((~a (ptr TValue)) ~v)
-       (when (iscollectable ~a) (luaC_objbarrier ~L ~p (gcvalue ~a))))))
-(defmacro luaC_objbarrierback (L p o)
+       (when (iscollectable ~a) (gc-objbarrier ~L ~p (gcvalue ~a))))))
+(defmacro gc-objbarrierback (L p o)
   `(when (and (isblack ~p) (iswhite ~o))
-     (luaC_barrierback_ ~L (obj2gco ~p))))
-(defmacro luaC_barrierback (L p v)
+     (gc-barrierback-fn ~L (obj2gco ~p))))
+(defmacro gc-barrierback (L p v)
   (let (a (gensym))
     `(let ((~a (ptr TValue)) ~v)
-       (when (iscollectable ~a) (luaC_objbarrierback ~L ~p (gcvalue ~a))))))
+       (when (iscollectable ~a) (gc-objbarrierback ~L ~p (gcvalue ~a))))))
 
 ; Row 'i' of the API's string cache. A C 2-D array's row won't decay (ISSUE-031).
 (defmacro strcache-row (g i) `(unsafe/cast (ptr (ptr TString)) (ref (aref (~g 'strcache) ~i))))
 
 ; CallInfo's status bits from CIST_FRESH on, built with cast() (ISSUE-029).
-(defconst CIST_FRESH 0x10000)      ; a fresh luaV_execute frame
+(defconst CIST_FRESH 0x10000)      ; a fresh vm-execute frame
 (defconst CIST_CLSRET 0x20000)     ; closing tbc variables at a return
 (defconst CIST_TBC 0x40000)        ; has tbc variables
 (defconst CIST_OAH 0x80000)        ; original allowhook
@@ -342,33 +342,33 @@
 (defmacro ci_func (ci) `(clLvalue (s2v ((~ci 'func) 'p))))
 
 ; ---- lgc.h ----
-(defmacro luaC_checkGC (L) `(when (<= ((G ~L) 'GCdebt) 0) (luaC_step ~L)))
+(defmacro gc-check (L) `(when (<= ((G ~L) 'GCdebt) 0) (gc-step ~L)))
 
 ; ---- lmem.h ----
-(defmacro luaM_error (L) `(luaD_throw ~L LUA_ERRMEM))
-(defmacro luaM_freemem (L b s) `(luaM_free_ ~L ~b ~s))
-(defmacro luaM_newvector (L n t)
-  `(unsafe/cast (ptr ~t) (luaM_malloc_ ~L (* (cast_sizet ~n) (cast_sizet (sizeof ~t))) 0)))
-(defmacro luaM_reallocvector (L v oldn n t)
-  `(unsafe/cast (ptr ~t) (luaM_realloc_ ~L (as ptr ~v)
+(defmacro mem-error (L) `(do-throw ~L LUA_ERRMEM))
+(defmacro mem-freemem (L b s) `(mem-free-fn ~L ~b ~s))
+(defmacro mem-newvector (L n t)
+  `(unsafe/cast (ptr ~t) (mem-malloc ~L (* (cast_sizet ~n) (cast_sizet (sizeof ~t))) 0)))
+(defmacro mem-reallocvector (L v oldn n t)
+  `(unsafe/cast (ptr ~t) (mem-realloc ~L (as ptr ~v)
                                          (* (cast_sizet ~oldn) (cast_sizet (sizeof ~t)))
                                          (* (cast_sizet ~n) (cast_sizet (sizeof ~t))))))
-; luaM_checksize never fires for an int count: sizeof(int) < sizeof(size_t).
-(defmacro luaM_newvectorchecked (L n t) `(luaM_newvector ~L ~n ~t))
-; luaM_limitN is the identity here: MAX_SIZET/sizeof(t) exceeds every int limit.
-(defmacro luaM_growvector (L v nelems size T limit e)
-  `(set! ~v (unsafe/cast (ptr ~T) (luaM_growaux_ ~L (as ptr ~v) ~nelems (ref ~size)
+; mem-checksize never fires for an int count: sizeof(int) < sizeof(size_t).
+(defmacro mem-newvectorchecked (L n t) `(mem-newvector ~L ~n ~t))
+; mem-limit-n is the identity here: MAX_SIZET/sizeof(t) exceeds every int limit.
+(defmacro mem-growvector (L v nelems size T limit e)
+  `(set! ~v (unsafe/cast (ptr ~T) (mem-growaux ~L (as ptr ~v) ~nelems (ref ~size)
                                                  (unsafe/cast ui32 (sizeof ~T)) ~limit ~e))))
-(defmacro luaM_shrinkvector (L v size fs T)
-  `(set! ~v (unsafe/cast (ptr ~T) (luaM_shrinkvector_ ~L (as ptr ~v) (ref ~size) ~fs
+(defmacro mem-shrinkvector (L v size fs T)
+  `(set! ~v (unsafe/cast (ptr ~T) (mem-shrinkvector-fn ~L (as ptr ~v) (ref ~size) ~fs
                                                       (unsafe/cast ui32 (sizeof ~T))))))
 
 ; ---- lstring.h ----
-(defmacro luaS_newliteral (L s) `(luaS_newlstr ~L ~s (strlen ~s)))
-(defmacro luaM_free (L b T) `(luaM_free_ ~L (as ptr ~b) (cast_sizet (sizeof ~T))))
+(defmacro string-newliteral (L s) `(string-newlstr ~L ~s (strlen ~s)))
+(defmacro mem-free (L b T) `(mem-free-fn ~L (as ptr ~b) (cast_sizet (sizeof ~T))))
 ; The element type is an argument: there's no sizeof of an expression (ISSUE-011).
-(defmacro luaM_freearray (L b n T)
-  `(luaM_free_ ~L (as ptr ~b) (* (cast_sizet ~n) (cast_sizet (sizeof ~T)))))
+(defmacro mem-freearray (L b n T)
+  `(mem-free-fn ~L (as ptr ~b) (* (cast_sizet ~n) (cast_sizet (sizeof ~T)))))
 
 ; ---- ldo.h ----
 ; A stack position as a byte offset, which survives the stack's reallocation.
@@ -376,15 +376,15 @@
 (defmacro restorestack (L n)
   `(unsafe/cast (ptr StackValue) (p+ (unsafe/cast (ptr i8) ((~L 'stack) 'p)) ~n)))
 ; Room for 'n' more slots, growing the stack if need be.
-(defmacro luaD_checkstack (L n)
+(defmacro do-checkstack (L n)
   `(when (<= (stack-diff ((~L 'stack_last) 'p) ((~L 'top) 'p)) ~n)
-     (luaD_growstack ~L ~n 1)))
+     (do-growstack ~L ~n 1)))
 ; The same, keeping 'p', a stack pointer variable, valid across a reallocation.
 (defmacro checkstackp (L n p)
   (let (t (gensym))
     `(when (<= (stack-diff ((~L 'stack_last) 'p) ((~L 'top) 'p)) ~n)
        (let (~t (savestack ~L ~p))
-         (luaD_growstack ~L ~n 1)
+         (do-growstack ~L ~n 1)
          (set! ~p (restorestack ~L ~t))))))
 ; How many slots 'q' is above 'p' (ISSUE-021).
 (defmacro stack-diff (q p) `(/ (byte-diff ~q ~p) (sizeof StackValue)))
@@ -411,17 +411,75 @@
                (set! (~a 'p) (p+ (~a 'p) 1))
                c))
          (do (set! (~a 'n) (- (~a 'n) 1))
-             (luaZ_fill ~a))))))
-(defmacro luaZ_buffer (b) `(~b 'buffer))
-(defmacro luaZ_sizebuffer (b) `(~b 'buffsize))
-(defmacro luaZ_bufflen (b) `(~b 'n))
-(defmacro luaZ_buffremove (b i) `(set! (~b 'n) (- (~b 'n) (cast_sizet ~i))))
-(defmacro luaZ_resetbuffer (b) `(set! (~b 'n) 0))
-(defmacro luaZ_initbuffer (L b) `(do (set! (~b 'buffer) null) (set! (~b 'buffsize) 0)))
-(defmacro luaZ_resizebuffer (L b size)
+             (zio-fill ~a))))))
+(defmacro zio-buffer (b) `(~b 'buffer))
+(defmacro zio-sizebuffer (b) `(~b 'buffsize))
+(defmacro zio-bufflen (b) `(~b 'n))
+(defmacro zio-buffremove (b i) `(set! (~b 'n) (- (~b 'n) (cast_sizet ~i))))
+(defmacro zio-resetbuffer (b) `(set! (~b 'n) 0))
+(defmacro zio-initbuffer (L b) `(do (set! (~b 'buffer) null) (set! (~b 'buffsize) 0)))
+(defmacro zio-resizebuffer (L b size)
   (let (m (gensym) sz (gensym))
     `(let ((~m (ptr Mbuffer)) ~b
            (~sz usize) ~size)
-       (set! (~m 'buffer) (unsafe/cast (ptr i8) (luaM_saferealloc_ ~L (as ptr (~m 'buffer)) (~m 'buffsize) ~sz)))
+       (set! (~m 'buffer) (unsafe/cast (ptr i8) (mem-saferealloc ~L (as ptr (~m 'buffer)) (~m 'buffsize) ~sz)))
        (set! (~m 'buffsize) ~sz))))
-(defmacro luaZ_freebuffer (L b) `(luaZ_resizebuffer ~L ~b 0))
+(defmacro zio-freebuffer (L b) `(zio-resizebuffer ~L ~b 0))
+
+; ---- shared by the core modules, which import one another in cycles ----
+; A cycle carries no macro, so every macro a second module uses lives here.
+
+(defmacro adjustresults (L nres)
+  `(when (and (<= ~nres LUA_MULTRET) (< (as ptr (((~L 'ci) 'top) 'p)) (as ptr ((~L 'top) 'p))))
+     (set! (((~L 'ci) 'top) 'p) ((~L 'top) 'p))))
+(defmacro api_incr_top (L) `(set! ((~L 'top) 'p) (p+ ((~L 'top) 'p) 1)))
+(defmacro code-abc (fs o a b c) `(code-abck ~fs ~o ~a ~b ~c 0))
+(defmacro code-at (fs pc) `(p+ ((~fs 'f) 'code) ~pc))
+(defmacro code-jumpto (fs t) `(code-patchlist ~fs (code-jump ~fs) ~t))
+(defmacro code-setmultret (fs e) `(code-setreturns ~fs ~e LUA_MULTRET))
+(defmacro copy-exp (dst src) `(memcpy ~dst ~src (sizeof expdesc)))
+(defmacro fastget (t k res f tag)
+  `(set! ~tag (if (not (ttistable ~t)) LUA_VNOTABLE (~f (hvalue ~t) ~k ~res))))
+(defmacro fastset (t k val hres f)
+  `(set! ~hres (if (not (ttistable ~t)) HNOTATABLE (~f (hvalue ~t) ~k ~val))))
+(defmacro finishfastset (L t v) `(gc-barrierback ~L (gcvalue ~t) ~v))
+(defmacro getCcalls (L) `(bit-and (~L 'nCcalls) 0xffff))
+(defmacro get_nresults (cs) `(- (cast_int (bit-and ~cs CIST_NRESULTS)) 1))
+(defmacro gettotalbytes (g) `(- (~g 'GCtotalbytes) (~g 'GCdebt)))
+(defmacro incnny (L) `(set! (~L 'nCcalls) (+ (~L 'nCcalls) 0x10000)))
+(defmacro exp-ind (e f) `(((~e 'u) 'ind) ~f))
+(defmacro exp-instr (fs e) `(code-at ~fs (exp-u ~e 'info)))  ; &getinstruction(fs, e)
+(defmacro isvararg (p) `(!= (bit-and (~p 'flag) (bit-or PF_VAHID PF_VATAB)) 0))
+(defmacro lua_getextraspace (L) `(as ptr (p+ (bytes ~L) (- LUA_EXTRASPACE))))
+(defmacro mainthread (g) `(ref ((~g 'mainth) 'l)))
+(defmacro needvatab (p) `(set! (~p 'flag) (cast_uchar (bit-or (~p 'flag) PF_VATAB))))
+(defmacro pcRel (pc p) `(- (cast_int (/ (byte-diff ~pc (~p 'code)) (sizeof Instruction))) 1))
+(defmacro resethookcount (L) `(set! (~L 'hookcount) (~L 'basehookcount)))
+(defmacro seminfo (ls f) `(((~ls 't) 'seminfo) ~f))
+(defmacro set-exp-ind (e f v) `(set! (((~e 'u) 'ind) ~f) ~v))
+(defmacro set-exp-u (e f v) `(set! ((~e 'u) ~f) ~v))
+(defmacro set-exp-var (e f v) `(set! (((~e 'u) 'var) ~f) ~v))
+(defmacro setclLvalue2s (L o cl)
+  `(let (a:(ptr TValue) (s2v ~o))
+     (set! ((a 'value_) 'gc) (obj2gco ~cl))
+     (set! (a 'tt_) (ctb LUA_VLCL))))
+(defmacro setgcovalue (obj x)
+  (let (a (gensym) gx (gensym))
+    `(let ((~a (ptr TValue)) ~obj
+           (~gx (ptr GCObject)) ~x)
+       (set! ((~a 'value_) 'gc) ~gx)
+       (set! (~a 'tt_) (ctb (~gx 'tt))))))
+(defmacro setthvalue (L obj x)
+  `(let (a:(ptr TValue) ~obj)
+     (set! ((a 'value_) 'gc) (obj2gco ~x))
+     (set! (a 'tt_) (ctb LUA_VTHREAD))))
+(defmacro stacksize (th) `(cast_int (stack-diff ((~th 'stack_last) 'p) ((~th 'stack) 'p))))
+; '*n' from a number or a numeric string.
+(defmacro tonumber (o n)
+  (let (a (gensym))
+    `(let ((~a (ptr TValue)) ~o)
+       (if (ttisfloat ~a) (do (set! (deref ~n) (fltvalue ~a)) 1) (vm-tonumber ~a ~n)))))
+; expdesc's union. A setter for each, as set! won't take a macro place (ISSUE-020).
+(defmacro exp-u (e f) `((~e 'u) ~f))
+(defmacro exp-var (e f) `(((~e 'u) 'var) ~f))
+(defmacro yieldable (L) `(= (bit-and (~L 'nCcalls) 0xffff0000) 0))

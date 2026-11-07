@@ -8,7 +8,7 @@
 (import-use lua.util)
 
 ; Refills the buffer and returns its first byte, or EOZ.
-(defn luaZ_fill (z:(ptr ZIO)):i32
+(defn zio-fill (z:(ptr ZIO)):i32
   (let (L:(ptr lua_State) (z 'L)
         size:usize 0
         buff:CStr ((z 'reader) L (z 'data) &size))
@@ -18,7 +18,7 @@
     (set! (z 'p) (unsafe/ptr+ (bytes buff) 1))
     (return (as i32 (cast_uchar (deref (bytes buff)))))))
 
-(defn luaZ_init (L:(ptr lua_State) z:(ptr ZIO) reader:lua_Reader data:ptr):void
+(defn zio-init (L:(ptr lua_State) z:(ptr ZIO) reader:lua_Reader data:ptr):void
   (set! (z 'L) L)
   (set! (z 'reader) reader)
   (set! (z 'data) data)
@@ -28,14 +28,14 @@
 ; Whether the buffer has a byte, refilling it if it's empty.
 (defn- checkbuffer (z:(ptr ZIO)):bool
   (when (= (z 'n) 0)
-    (when (= (luaZ_fill z) EOZ)
+    (when (= (zio-fill z) EOZ)
       (return false))  ; no more input
-    (set! (z 'n) (+ (z 'n) 1))  ; luaZ_fill took the first byte: put it back
+    (set! (z 'n) (+ (z 'n) 1))  ; zio-fill took the first byte: put it back
     (set! (z 'p) (unsafe/ptr+ (z 'p) -1)))
   (return true))
 
 ; Reads 'n' bytes into 'b', and returns how many were missing.
-(defn luaZ_read (z:(ptr ZIO) b0:ptr n0:usize):usize
+(defn zio-read (z:(ptr ZIO) b0:ptr n0:usize):usize
   (let (b:(ptr i8) (as (ptr i8) b0)
         n:usize n0)
     (while (!= n 0)
@@ -50,7 +50,7 @@
     (return 0)))
 
 ; The address of the next 'n' bytes, consumed, if the buffer holds them whole.
-(defn luaZ_getaddr (z:(ptr ZIO) n:usize):ptr
+(defn zio-getaddr (z:(ptr ZIO) n:usize):ptr
   (when (not (checkbuffer z))
     (return null))  ; no more input
   (when (< (z 'n) n)

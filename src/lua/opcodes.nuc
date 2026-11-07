@@ -102,7 +102,7 @@
      (OP_GETVARG 0 0 0 0 1 iABC) (OP_ERRNNIL 0 0 0 0 0 iABx) (OP_VARARGPREP 0 0 0 0 0 iABC)
      (OP_EXTRAARG 0 0 0 0 0 iAx))))
 
-; luaP_opmodes from the rows: MM<<7 | OT<<6 | IT<<5 | T<<4 | A<<3 | format. The
+; op-modes from the rows: MM<<7 | OT<<6 | IT<<5 | T<<4 | A<<3 | format. The
 ; macro makes the whole defvar: an initializer isn't macroexpanded (ISSUE-036).
 (defmacro defopmodes (rows)
   (let (vals (node-list-new (rows 'line))
@@ -119,20 +119,20 @@
                       (bit-shl ((ast-at r 5) 'i) 3) fmt))
         (node-push vals (node-int v)))
       (set! i (+ i 1)))
-    `(defvar luaP_opmodes:(array ui8 85) (array ui8 ~@vals))))  ; NUM_OPCODES
+    `(defvar op-modes:(array ui8 85) (array ui8 ~@vals))))  ; NUM_OPCODES
 
 (with-opcodes defopmodes)
 
-(defmacro getOpMode (m) `(as i32 (bit-and (aref luaP_opmodes ~m) 7)))
-(defmacro testAMode (m) `(!= (bit-and (aref luaP_opmodes ~m) 0x08) 0))
-(defmacro testTMode (m) `(!= (bit-and (aref luaP_opmodes ~m) 0x10) 0))
-(defmacro testITMode (m) `(!= (bit-and (aref luaP_opmodes ~m) 0x20) 0))
-(defmacro testOTMode (m) `(!= (bit-and (aref luaP_opmodes ~m) 0x40) 0))
-(defmacro testMMMode (m) `(!= (bit-and (aref luaP_opmodes ~m) 0x80) 0))
+(defmacro getOpMode (m) `(as i32 (bit-and (aref op-modes ~m) 7)))
+(defmacro testAMode (m) `(!= (bit-and (aref op-modes ~m) 0x08) 0))
+(defmacro testTMode (m) `(!= (bit-and (aref op-modes ~m) 0x10) 0))
+(defmacro testITMode (m) `(!= (bit-and (aref op-modes ~m) 0x20) 0))
+(defmacro testOTMode (m) `(!= (bit-and (aref op-modes ~m) 0x40) 0))
+(defmacro testMMMode (m) `(!= (bit-and (aref op-modes ~m) 0x80) 0))
 
 ; Whether the instruction uses top: OP_VARARGPREP does, and so do those taking
 ; the values the previous instruction left.
-(defn luaP_isIT (i:Instruction):i32
+(defn op-is-it (i:Instruction):i32
   (let (op:i32 (GET_OPCODE i))
     (cond (= op OP_SETLIST) (return (if (= (GETARG_vB i) 0) 1 0))
           (= op OP_VARARGPREP) (return 1)

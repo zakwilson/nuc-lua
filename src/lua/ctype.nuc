@@ -7,7 +7,7 @@
 
 ; lctype.h's tests, over an int that is EOZ or an unsigned char. The masks are
 ; 1 << ALPHABIT (0), DIGITBIT (1), PRINTBIT (2), SPACEBIT (3), XDIGITBIT (4).
-(defmacro testprop (c mask) `(!= (bit-and (aref luai_ctype_ (+ ~c 1)) ~mask) 0))
+(defmacro testprop (c mask) `(!= (bit-and (aref ctype-table (+ ~c 1)) ~mask) 0))
 (defmacro lislalpha (c) `(testprop ~c 1))
 (defmacro lislalnum (c) `(testprop ~c 3))
 (defmacro lisdigit (c) `(testprop ~c 2))
@@ -20,7 +20,7 @@
 ; Indexed by a character plus one, so that EOZ (-1) has an entry. The bits are
 ; lctype.h's ALPHABIT 0, DIGITBIT 1, PRINTBIT 2, SPACEBIT 3 and XDIGITBIT 4; the
 ; non-ASCII bytes are 0 (NONA, as LUA_UCID is off).
-(defvar luai_ctype_:(array ui8 257)
+(defvar ctype-table:(array ui8 257)
  (array ui8
   0x00  ; EOZ
   0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x08 0x08 0x08 0x08 0x08 0x00 0x00  ; 0.
