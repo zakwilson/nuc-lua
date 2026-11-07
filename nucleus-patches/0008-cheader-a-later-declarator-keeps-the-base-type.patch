@@ -1,0 +1,349 @@
+From a64ac736308fcfd782b0a795c1ceff9abdc17c63 Mon Sep 17 00:00:00 2001
+From: Zak Wilson <zak.wilson@gmail.com>
+Date: Sat, 7 Nov 2026 15:39:00 +0000
+Subject: [PATCH] cheader: a later declarator keeps the base type
+
+struct CallInfo *previous, *next; gave 'next' a bare ptr, so
+((ci 'next) 'previous) was refused. The declarator-list support
+assumed the first declarator's stars consumed the base, which held
+before typed C pointers; c-ptr-to keeps the pointee now, so c-ptr-base
+peels the first declarator's levels and each later declarator applies
+its own stars to that base. int *p, q; and typedef int *a, b; are
+exact instead of refused. Found by the nuc-lua port (its ISSUE-040).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CsC8i2S7yJAHSpzRaddMj3
+---
+ design/progress.md                           | 15 +++++++
+ design/stage16-ergonomics/c-header-layout.md |  4 ++
+ docs/builtins.md                             |  2 +-
+ docs/structs-unions.md                       | 24 +++++-----
+ src/cheader.nuc                              | 46 ++++++++++++++------
+ tests/fixtures/cd-declarators.h              | 16 ++++---
+ tests/fixtures/l1-members.h                  |  6 +--
+ tests/suite-declarators.nuc                  | 27 +++++++++---
+ 8 files changed, 98 insertions(+), 42 deletions(-)
+
+diff --git a/design/progress.md b/design/progress.md
+index 21b97055..2780590e 100644
+--- a/design/progress.md
++++ b/design/progress.md
+@@ -5767,3 +5767,18 @@ Found by the nuc-lua port (its ISSUE-033): a compilation with more than 256 `def
+ died with "defmacro: macro table full". The cap guarded the fixed array of the C
+ implementation; `g-macros` has been a growable `Vector` since, so the check is gone.
+ `s21-many-macros` defines 300.
++
++## Lua-port fixes: a later declarator keeps the base type (lua-bugfixes)
++
++Found by the nuc-lua port (its ISSUE-040): `struct CallInfo *previous, *next;` gave
++`next` a bare `ptr`, so `((ci 'next) 'previous)` was refused as no struct pointer.
++CD-1 and CD-2 treated the first declarator's stars as consuming the base, which was
++true before typed C pointers; `c-ptr-to` now keeps the pointee, so `c-ptr-base` peels
++the first declarator's levels and each later declarator applies its own stars to that
++base. `int *p, q;` and `typedef int *a, b;` are then exact rather than refused; only a
++base the first can't name (`void *p, *q`) stays bare `ptr`. `cd1-later-declarator-base`
++and the CD-2 signatures cover it; the L1 fixture's unreadable-body witness is now an
++anonymous struct holding `__int128`.
++The compiler's own sources read such a declaration, so a compiler built by one without
++the fix emits its types in another order: the fixed point holds from the third round
++(nuctests 1742 passed).
+diff --git a/design/stage16-ergonomics/c-header-layout.md b/design/stage16-ergonomics/c-header-layout.md
+index b6747e8d..4230aae7 100644
+--- a/design/stage16-ergonomics/c-header-layout.md
++++ b/design/stage16-ergonomics/c-header-layout.md
+@@ -1154,6 +1154,10 @@ defined type and `(defvar u:cd_anonarr)` is `[3 x %__carr.cd_anonarr]`.
+ 
+ ### 8.2 What is left, and why it is not a defect
+ 
++> **Superseded (lua-bugfixes, `design/progress.md`).** Typed C pointers made
++> `c-parse-type` keep the pointee, so the first declarator's base is no longer
++> lost: `c-ptr-base` recovers it, and mixed pointer depths are now exact.
++
+ Declarators that **disagree in pointer depth** — `int *p, q;` in a struct body,
+ `typedef int *a, b;` at top level — are refused, for the reason above. A struct
+ gets the located opaque error at every by-value use and no `%X = type` line; a
+diff --git a/docs/builtins.md b/docs/builtins.md
+index fc4d0992..ddb795ac 100644
+--- a/docs/builtins.md
++++ b/docs/builtins.md
+@@ -194,7 +194,7 @@ A struct used directly (not behind `ptr`) as a `defn`/`declare` parameter or ret
+ 
+ ### C header struct ingestion
+ 
+-C headers consumed via `(import-use "foo.h")` or `(import "foo.h" prefix)` now register their `struct Foo { ... };` and `typedef struct { ... } Bar;` definitions as Nucleus structs with the same name. Anonymous inline struct fields are registered as memoized anonymous structs (same `__anon_struct_h<hex>` machinery). Pass-by-value parameters typed as a C struct work through this path. `union { ... }` fields, named unions, and `typedef union` are registered as untagged union types (stage 10 — see [Unions and tagged sums](#unions-and-tagged-sums)); headers like SDL's or pthread's no longer degrade over them. Bit-fields, C11 anonymous members, multi-declarator field lines (`int a, b;`) and flexible array members are all represented; see [Bit-fields](structs-unions.md#bit-fields--bits-w-namet) and [Anonymous members](structs-unions.md#anonymous-members--anon-t). Field types the parser still cannot represent (an array extent that does not fold, a declarator list of mixed pointer depth like `int *p, q;`) cause the whole struct to be skipped — registered as opaque `ptr` at use sites — rather than registering a layout-incompatible partial struct.
++C headers consumed via `(import-use "foo.h")` or `(import "foo.h" prefix)` now register their `struct Foo { ... };` and `typedef struct { ... } Bar;` definitions as Nucleus structs with the same name. Anonymous inline struct fields are registered as memoized anonymous structs (same `__anon_struct_h<hex>` machinery). Pass-by-value parameters typed as a C struct work through this path. `union { ... }` fields, named unions, and `typedef union` are registered as untagged union types (stage 10 — see [Unions and tagged sums](#unions-and-tagged-sums)); headers like SDL's or pthread's no longer degrade over them. Bit-fields, C11 anonymous members, multi-declarator field lines (`int a, b;`) and flexible array members are all represented; see [Bit-fields](structs-unions.md#bit-fields--bits-w-namet) and [Anonymous members](structs-unions.md#anonymous-members--anon-t). Field types the parser still cannot represent (an array extent that does not fold) cause the whole struct to be skipped — registered as opaque `ptr` at use sites — rather than registering a layout-incompatible partial struct.
+ 
+ In inline type positions (the type argument of `as`, `unsafe/cast`, `sizeof`, `alignof`, `alloca`), either the canonical list form or the colon sugar works: `(as (ptr Node) x)` and `(as ptr:Node x)` are equivalent.
+ 
+diff --git a/docs/structs-unions.md b/docs/structs-unions.md
+index 9aa8a65b..aeb2c6d0 100644
+--- a/docs/structs-unions.md
++++ b/docs/structs-unions.md
+@@ -299,11 +299,12 @@ bit-field width:
+ struct cd { int a, b; char *s, *t; int x, y[3]; unsigned p : 3, q : 5; };
+ ```
+ 
+-imports as `%cd = type { i32, i32, ptr, ptr, i32, [3 x i32], [1 x i8] }`. The one
+-shape that is refused is declarators that **disagree in pointer depth**
+-(`int *p, q;`): the first declarator's `*` has already collapsed the base type
+-into `ptr`, so there is nothing left to give `q`, and the struct goes opaque
+-rather than giving `q` the wrong type.
++imports as `%cd = type { i32, i32, ptr, ptr, i32, [3 x i32], [1 x i8] }`. A later
++declarator starts from the base type under the first one's `*`s, so in
++`struct ci { struct ci *previous, *next; };` both fields are pointers to `ci`
++(`((c 'next) 'previous)` works), and in `int *p, q;` `q` is an `int`. Only a base
++the first declarator can't name is lost: after `void *p`, a later `*q` is bare
++`ptr`, and a by-value one is refused.
+ 
+ A declaration may also carry a declarator list **after the body**, and every
+ declarator in it is a type name:
+@@ -323,7 +324,7 @@ declarators are consumed so the declaration after them is read from the right
+ place. An `extern` variable declaration is imported; see
+ [Variables from a C header](compiler.md#variables-from-a-c-header).
+ 
+-A member whose type the parser genuinely cannot represent — an array whose extent does not fold to a compile-time constant, a declarator list of mixed pointer depth, or a by-value use of an unresolvable typedef — makes the **whole struct opaque** (below), with a located error at every by-value use, rather than a layout-incompatible partial struct. (Bit-fields, C11 anonymous members, multi-declarator lines and flexible array members are all represented now — see the sections above.) A size is never guessed: a member reached indirectly, through a typedef the parser could not follow, used to resolve to `ptr` silently, giving a wrong struct *layout* with no diagnostic; it is refused the same way a direct unrepresentable member always was.
++A member whose type the parser genuinely cannot represent — an array whose extent does not fold to a compile-time constant, or a by-value use of an unresolvable typedef — makes the **whole struct opaque** (below), with a located error at every by-value use, rather than a layout-incompatible partial struct. (Bit-fields, C11 anonymous members, multi-declarator lines and flexible array members are all represented now — see the sections above.) A size is never guessed: a member reached indirectly, through a typedef the parser could not follow, used to resolve to `ptr` silently, giving a wrong struct *layout* with no diagnostic; it is refused the same way a direct unrepresentable member always was.
+ 
+ ### Array members
+ 
+@@ -405,8 +406,7 @@ A type stays opaque either because no header in the translation unit defines
+ it — `FILE` is this case: a plain `(import-use "stdio.h")` only ever sees
+ `typedef struct _IO_FILE FILE;`, never `struct _IO_FILE`'s body — or because
+ its definition uses a construct the C declaration parser cannot represent: an
+-array member whose extent does not fold to a compile-time constant, or a
+-declarator list whose declarators disagree in pointer depth (`int *p, q;`). The
++array member whose extent does not fold to a compile-time constant. The
+ five constructs that used to belong on this list — bit-fields, C11 anonymous
+ members, inline function-pointer members, multi-declarator lines, and the
+ flexible array member — are all represented now, so `FILE`, `sigcontext`,
+@@ -603,15 +603,13 @@ shows as its element type. It is a compiler-minted name and is not spellable.
+ its own array extents, and each is recorded:
+ 
+ ```c
+-typedef int  cd_ta, *cd_tb;      /* cd_ta -> i32,  cd_tb -> ptr        */
++typedef int  cd_ta, *cd_tb;      /* cd_ta -> i32,  cd_tb -> (ptr i32)  */
+ typedef long cd_tc, cd_td[4];    /* cd_tc -> i64,  cd_td -> [4 x i64]  */
+ ```
+ 
+ As with a [multi-declarator struct field
+-line](#c-header-struct-ingestion), the one case that is refused is a later
+-declarator whose base the first declarator's `*` already consumed
+-(`typedef int *a, b;` — `b` is recorded known-but-unrepresentable rather than
+-given `a`'s type).
++line](#c-header-struct-ingestion), a later declarator starts from the base under the first one's `*`s:
++`typedef int *a, b;` makes `a` a pointer to `int` and `b` an `int`.
+ 
+ ## A C typedef is a Nucleus type name
+ 
+diff --git a/src/cheader.nuc b/src/cheader.nuc
+index 5ab39a32..124a1b45 100644
+--- a/src/cheader.nuc
++++ b/src/cheader.nuc
+@@ -413,15 +413,32 @@
+               (set! p e)))))
+     (return 0)))
+ 
+-; A `*` in the span c-parse-type consumed belongs to the FIRST declarator and was
+-; already collapsed into `ptr`, so a later one on the same line has no base left
+-; (c-header-layout.md §8.2).
+-(defn c-span-has-star (buf:ptr start:i64 stop:i64):i32
+-  (let (p:i64 start)
++; The `*`s in the span c-parse-type consumed: they belong to the FIRST
++; declarator, so a later one on the same line starts from the base under them.
++(defn c-span-stars (buf:ptr start:i64 stop:i64):i32
++  (let (p:i64 start
++        n:i32 0)
+     (while (< p stop)
+-      (when (= (cstr-byte-at buf p) 42) (return 1))
+-      (set! p (+ p 1))))
+-  (return 0))
++      (when (= (cstr-byte-at buf p) 42) (inc! n))
++      (set! p (+ p 1)))
++    (return n)))
++
++; The base type under the first declarator's `depth` pointers, which c-ptr-to
++; kept, so that `struct S *a, *b;` gives `b` a pointer to `S` too. Null when a
++; level is bare `ptr` (`void *`, an unresolved pointee): that base is lost.
++(defn c-ptr-base (t:ptr depth:i32):ptr
++  (let (acc:ptr t
++        i:i32 0)
++    (while (< i depth)
++      (when (or (= acc null) (= acc (as ptr ty-ptr))) (return null))
++      (let (ty:&Type (unsafe/cast &Type acc))
++        (when (or (!= (ty 'kind) TY-PTR) (= (as ptr (ty 'elem)) null)) (return null))
++        (set! acc (as ptr (ty 'elem))))
++      (inc! i))
++    ; c-ptr-to's char pointees, as the by-value types they stand for.
++    (cond (= acc (as ptr ty-c-char)) (return (as ptr ty-i8))
++          (= acc (as ptr ty-c-uchar)) (return (as ptr ty-ui8))
++          true (return acc))))
+ 
+ ; Stage 16 PK-3: the argument of `aligned(…)`, which C admits as any integer
+ ; constant expression. Two forms carry every occurrence in the headers surveyed:
+@@ -2434,8 +2451,8 @@
+           (do
+             (set! spec-start pos)
+             (set! fty (c-parse-type buf pos len (as &i64 &te)))
+-            (set! base-ty fty)
+-            (when (!= (c-span-has-star buf spec-start te) 0) (set! base-ty null)))
++            (let (stars:i32 (c-span-stars buf spec-start te))
++              (set! base-ty (if (> stars 0) (c-ptr-base fty stars) fty))))
+           ; Continuing `T a, *b;`: the specifiers are the previous declarator's,
+           ; and only this declarator's own stars apply.
+           (let (p2:i64 (c-skip-type-quals buf pos len)
+@@ -2444,7 +2461,7 @@
+               (inc! ns)
+               (set! p2 (c-skip-type-quals buf (+ p2 1) len)))
+             (set! te p2)
+-            (set! fty (if (= ns 0) base-ty ty-ptr))))
++            (set! fty (if (= ns 0) base-ty (c-ptr-to base-ty ns)))))
+         (when (= fty null) (set! bad 1) (set! done 1))
+         ; D1: keeping the `ptr` c-parse-type returns here would give the struct a
+         ; silently wrong layout; abandoning it leaves the name opaque instead.
+@@ -2870,7 +2887,8 @@
+             base0:ptr base
+             bad0:i32 bad
+             plain:i32 0)
+-        (when (!= (c-span-has-star buf te tend) 0) (set! base0 null))
++        (let (stars:i32 (c-span-stars buf te tend))
++          (when (> stars 0) (set! base0 (c-ptr-base base stars))))
+         ; `(*name)(args)` — a function-pointer typedef, which is a pointer
+         ; whatever its return and argument types are. It has to be recognized
+         ; HERE: the naive fallback would take `int` for the declarator of
+@@ -2928,7 +2946,9 @@
+             (while (and (< p len) (= (cstr-byte-at buf p) 42))
+               (inc! ns)
+               (set! p (c-skip-type-quals buf (+ p 1) len)))
+-            (when (> ns 0) (set! dty ty-ptr) (set! dbad 0))
++            ; A pointer is representable whatever its base; an unrepresentable
++            ; base (bad0) is only a placeholder, so it points at nothing known.
++            (when (> ns 0) (set! dty (c-ptr-to (if (!= bad0 0) null base0) ns)) (set! dbad 0))
+             (set! dn2 (c-read-ident buf p len (as &i64 &ne2)))
+             (if (= (symbol-len dn2) 0)
+               (set! p len)
+diff --git a/tests/fixtures/cd-declarators.h b/tests/fixtures/cd-declarators.h
+index c478b132..aad033d8 100644
+--- a/tests/fixtures/cd-declarators.h
++++ b/tests/fixtures/cd-declarators.h
+@@ -18,8 +18,8 @@
+    is why "it compiled" is never the assertion.
+ 
+    `int` / `short` / `char` throughout, so the stated sizes hold on any target
+-   with a 4-byte int. LINE NUMBERS BELOW ARE ASSERTED: `cd1-mixed-pointer-refused`
+-   pins the line `struct cd_mixed_ptr` is declared on. */
++   with a 4-byte int. A later declarator starts from the base under the first
++   one's stars, which c-ptr-to keeps (lua-bugfixes, nuc-lua ISSUE-040). */
+ 
+ /* ---- CD-1: multi-declarator field lines ---------------------------------- */
+ 
+@@ -40,16 +40,20 @@ struct cd_bits { unsigned a : 3, b : 5; int c; };
+    %cd_three = type { i16, i16, i16, i32 }                         sizeof 12 */
+ struct cd_three { short p, q, r; int n; };
+ 
+-/* ---- CD-1's residue: it must fail SAFE, not guess ------------------------ */
++/* ---- CD-1: the base under the first declarator's stars ------------------ */
+ 
+-/* Declarators that disagree in POINTER DEPTH. `*p` has already collapsed the
+-   base into `ptr`, so there is nothing left for `q` — the struct stays opaque
+-   with a located error rather than giving `q` the first declarator's type. */
++/* Declarators that disagree in POINTER DEPTH. `*p` keeps its pointee, so `q`
++   is the `int` under it: %cd_mixed_ptr = type { ptr, i32 }      sizeof 16 */
+ struct cd_mixed_ptr { int *p, q; };
+ 
++/* A later starred declarator points where the first does: `next` is a
++   pointer to cd_link, which the test dereferences, not a bare `ptr`. */
++struct cd_link { struct cd_link *prev, *next; int n; };
++
+ /* ---- CD-2: comma-separated typedef declarator lists ---------------------- */
+ 
+ typedef int cd_ta, *cd_tb;
++typedef int *cd_te, cd_tf;
+ typedef long cd_tc, cd_td[4];
+ 
+ /* ---- CD-3: with-body aggregate array typedefs ---------------------------- */
+diff --git a/tests/fixtures/l1-members.h b/tests/fixtures/l1-members.h
+index 676bfad6..b563770c 100644
+--- a/tests/fixtures/l1-members.h
++++ b/tests/fixtures/l1-members.h
+@@ -40,9 +40,9 @@ struct l1_m_opaque_tag { struct l1_opaque_tag o; int b; };
+ struct l1_m_unknown_tag { struct l1_nowhere_at_all z; int b; };
+ 
+ /* c-parse-type:529 — a by-value aggregate whose `{…}` body the parser could not
+-   read. CD-1 gave `int a, b;` a real body, so the durable subject is CD-1's own
+-   residue: declarators that disagree in pointer depth, reached through a typedef. */
+-typedef struct { int x; int *a, b; } l1_multi_t;
++   read. CD-1, then the recovered base of `int *a, b;`, made the earlier witnesses
++   readable, so the body holds the durable unreadable member, `__int128`. */
++typedef struct { int x; __int128 a; } l1_multi_t;
+ struct l1_m_bad_body { l1_multi_t t; int b; };
+ 
+ /* ---- positive controls --------------------------------------------------- */
+diff --git a/tests/suite-declarators.nuc b/tests/suite-declarators.nuc
+index 374c2216..f82056c5 100644
+--- a/tests/suite-declarators.nuc
++++ b/tests/suite-declarators.nuc
+@@ -26,6 +26,10 @@
+ (defn f_ta (x:cd_ta):i32 (return x))
+ (defn f_tb (x:cd_tb):i32 (return 0))
+ (defn f_tc (x:cd_tc):i32 (return 0))
++(defn f_te (x:cd_te):i32 (return (deref x)))
++(defn f_tf (x:cd_tf):i32 (return x))
++(defn f_q (m:(ptr cd_mixed_ptr)):i32 (return (+ (m 'q) (deref (m 'p)))))
++(defn f_next (l:(ptr cd_link)):i32 (return ((l 'next) 'n)))
+ (defn main ():i32
+   (printf \"cd_plain %lld\\n\" (as i64 (sizeof cd_plain)))
+   (printf \"cd_ptrs %lld\\n\" (as i64 (sizeof cd_ptrs)))
+@@ -33,6 +37,8 @@
+   (printf \"cd_bits %lld\\n\" (as i64 (sizeof cd_bits)))
+   (printf \"cd_three %lld\\n\" (as i64 (sizeof cd_three)))
+   (printf \"cd_td %lld\\n\" (as i64 (sizeof cd_td)))
++  (printf \"cd_mixed_ptr %lld\\n\" (as i64 (sizeof cd_mixed_ptr)))
++  (printf \"cd_link %lld\\n\" (as i64 (sizeof cd_link)))
+   (printf \"cd_tagarr %lld\\n\" (as i64 (sizeof cd_tagarr)))
+   (printf \"cd_anonarr %lld\\n\" (as i64 (sizeof cd_anonarr)))
+   (return 0))
+@@ -48,6 +54,8 @@ int main(void){
+   printf(\"cd_bits %zu\\n\", sizeof(struct cd_bits));
+   printf(\"cd_three %zu\\n\", sizeof(struct cd_three));
+   printf(\"cd_td %zu\\n\", sizeof(cd_td));
++  printf(\"cd_mixed_ptr %zu\\n\", sizeof(struct cd_mixed_ptr));
++  printf(\"cd_link %zu\\n\", sizeof(struct cd_link));
+   printf(\"cd_tagarr %zu\\n\", sizeof(cd_tagarr));
+   printf(\"cd_anonarr %zu\\n\", sizeof(cd_anonarr));
+   return 0;
+@@ -75,12 +83,17 @@ int main(void){
+     (drop &c))
+   (return (ok)))
+ 
+-; CD-1's residue fails SAFE. Declarators that disagree in pointer depth leave
+-; the struct opaque with a located error and no layout: `*p` has already
+-; collapsed the base into `ptr`, and giving `q` that type is exactly the silent
+-; class L1 removed.
+-(deftest cd1-mixed-pointer-refused
+-  (try (check-opaque-at (cd-header) "cd_mixed_ptr" "48"))
++; A later declarator starts from the base under the first one's stars, which
++; c-ptr-to keeps: `int *p, q;` gives `q` the `int`, and `struct cd_link *prev,
++; *next;` makes `next` a pointer to cd_link that `f_next` dereferences, not a
++; bare `ptr` (`(l 'next)` was then refused as no struct pointer).
++(deftest cd1-later-declarator-base
++  (let (c:Compiled (try (compile-source (cd-main-src)))
++        ir:StrView (compiled-ir &c))
++    (try (check-empty (string-as-view (ref c 'raw-text))))
++    (try (check-line ir "%cd_mixed_ptr = type { ptr, i32 }"))
++    (try (check-line ir "%cd_link = type { ptr, ptr, i32 }"))
++    (drop &c))
+   (return (ok)))
+ 
+ ; ---------------------------------------------------------------------------
+@@ -96,6 +109,8 @@ int main(void){
+     (try (check-line ir "define i32 @f_ta(i32 %x.arg) section \".text.f_ta\" {"))
+     (try (check-line ir "define i32 @f_tb(ptr %x.arg) section \".text.f_tb\" {"))
+     (try (check-line ir "define i32 @f_tc(i64 %x.arg) section \".text.f_tc\" {"))
++    (try (check-line ir "define i32 @f_te(ptr %x.arg) section \".text.f_te\" {"))
++    (try (check-line ir "define i32 @f_tf(i32 %x.arg) section \".text.f_tf\" {"))
+     (drop &c))
+   (return (ok)))
+ 
+-- 
+2.47.3
+

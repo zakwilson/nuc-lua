@@ -1,0 +1,579 @@
+; The debug interface: hooks, the stack's frames and their locals, names for
+; values found by reading the bytecode back, and the runtime errors.
+;
+; ldebug.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.debug)
+(set-ir-prefix "")
+(import-use "lstate.h")
+(import-use "lapi.h")
+(import-use "ldebug.h")
+(import-use "ldo.h")
+(import-use "lfunc.h")
+(import-use "lobject.h")
+(import-use "lopcodes.h")
+(import-use "lstring.h")
+(import-use "ltable.h")
+(import-use "ltm.h")
+(import-use "lvm.h")
+(import-use "string.h")
+(import-use lua.util)
+(import-use lua.core)
+(import-use lua.opcodes)
+(import-use lua.code)  ; isvararg
+
+(defconst ABSLINEINFO -0x80)  ; a 'lineinfo' entry whose line is in 'abslineinfo'
+(defconst MAXIWTHABS 128)
+(defconst LUA_ENV "_ENV")  ; llex.h's string macro (ISSUE-012)
+
+(defmacro stack-diff-of (T q p) `(/ (byte-diff ~q ~p) (sizeof ~T)))
+(defmacro pcRel (pc p) `(- (cast_int (stack-diff-of Instruction ~pc (~p 'code))) 1))
+(defmacro resethookcount (L) `(set! (~L 'hookcount) (~L 'basehookcount)))
+(defmacro LuaClosure (f) `(and (!= (as ptr ~f) null) (= ((~f 'c) 'tt) LUA_VLCL)))
+(defmacro ttisclosure (o) `(or (ttisLclosure ~o) (ttisCclosure ~o)))
+(defmacro clvalue (o) `(gco2cl (gcvalue ~o)))
+(defmacro api_incr_top (L) `(set! ((~L 'top) 'p) (p+ ((~L 'top) 'p) 1)))
+(defmacro lineinfo-at (p pc) `(as i32 (deref (p+ (~p 'lineinfo) ~pc))))
+(defmacro code-at (p pc) `(deref (p+ (~p 'code) ~pc)))
+
+; Returned by identity, so callers can tell a local from an upvalue.
+(defvar- strlocal:CStr "local")
+(defvar- strupval:CStr "upvalue")
+
+(defn- currentpc (ci:(ptr CallInfo)):i32
+  (return (pcRel (((ci 'u) 'l) 'savedpc) ((ci_func ci) 'p))))
+
+; A base line to count from to the line of 'pc'. Base lines sit about every
+; MAXIWTHABS instructions, so a division nearly finds it; long runs of blank or
+; comment lines add entries, so the estimate (a lower bound) is corrected.
+(defn- getbaseline (f:(ptr Proto) pc:i32 basepc:(ptr i32)):i32
+  (when (or (= (f 'sizeabslineinfo) 0) (< pc ((f 'abslineinfo) 'pc)))
+    (set! (deref basepc) -1)  ; from the beginning
+    (return (f 'linedefined)))
+  (let (i:i32 (- (/ pc MAXIWTHABS) 1))  ; an estimate
+    (while (and (< (+ i 1) (f 'sizeabslineinfo)) (>= pc ((p+ (f 'abslineinfo) (+ i 1)) 'pc)))
+      (inc! i))  ; too low; adjust it
+    (set! (deref basepc) ((p+ (f 'abslineinfo) i) 'pc))
+    (return ((p+ (f 'abslineinfo) i) 'line))))
+
+; The line of instruction 'pc': a base line, then the increments up to 'pc'.
+(defn luaG_getfuncline (f:(ptr Proto) pc:i32):i32
+  (when (= (as ptr (f 'lineinfo)) null)  ; no debug information?
+    (return -1))
+  (let (basepc:i32 0
+        baseline:i32 (getbaseline f pc &basepc))
+    (while (< basepc pc)
+      (inc! basepc)
+      (set! baseline (+ baseline (lineinfo-at f basepc))))
+    (return baseline)))
+
+(defn- getcurrentline (ci:(ptr CallInfo)):i32
+  (return (luaG_getfuncline ((ci_func ci) 'p) (currentpc ci))))
+
+; Sets 'trap' in every active Lua frame. It may run in a signal handler: a new
+; ci is linked in completely before it joins the active list.
+(defn- settraps (ci0:(ptr CallInfo)):void
+  (let (ci:(ptr CallInfo) ci0)
+    (while (!= (as ptr ci) null)
+      (when (isLua ci)
+        (set! (((ci 'u) 'l) 'trap) 1))
+      (set! ci (ci 'previous)))))
+
+; May run in a signal handler: the counts are only for debugging, 'hookmask'
+; is atomic, and 'hook' is tested before every call (luaD_hook).
+(defn lua_sethook (L:(ptr lua_State) func0:lua_Hook mask0:i32 count:i32):void
+  (let (func:lua_Hook func0
+        mask:i32 mask0)
+    (when (or (= (unsafe/cast ptr func) null) (= mask 0))  ; turn hooks off?
+      (set! mask 0)
+      (set! func (unsafe/cast lua_Hook null)))
+    (set! (L 'hook) func)
+    (set! (L 'basehookcount) count)
+    (resethookcount L)
+    (set! (L 'hookmask) (as i32 (cast_uchar mask)))
+    (when (!= mask 0)
+      (settraps (L 'ci)))))  ; to trace inside luaV_execute
+
+(defn lua_gethook (L:(ptr lua_State)):lua_Hook (return (L 'hook)))
+(defn lua_gethookmask (L:(ptr lua_State)):i32 (return (L 'hookmask)))
+(defn lua_gethookcount (L:(ptr lua_State)):i32 (return (L 'basehookcount)))
+
+(defn lua_getstack (L:(ptr lua_State) level0:i32 ar:(ptr lua_Debug)):i32
+  (when (< level0 0) (return 0))  ; an invalid (negative) level
+  (let (level:i32 level0
+        base:(ptr CallInfo) (ref (L 'base_ci))
+        ci:(ptr CallInfo) (L 'ci))
+    (while (and (> level 0) (!= ci base))
+      (dec! level)
+      (set! ci (ci 'previous)))
+    (if (and (= level 0) (!= ci base))  ; the level found?
+      (do (set! (ar 'i_ci) ci) (return 1))
+      (return 0))))
+
+(defn- upvalname (p:(ptr Proto) uv:i32):CStr
+  (let (s:(ptr TString) ((p+ (p 'upvalues) uv) 'name))
+    (return (if (= (as ptr s) null) (cstr "?") (cstr (getstr s))))))
+
+(defn- findvararg (ci:(ptr CallInfo) n:i32 pos:(ptr StkId)):CStr
+  (when (!= (bit-and (((clLvalue (s2v ((ci 'func) 'p))) 'p) 'flag) PF_VAHID) 0)
+    (let (nextra:i32 (((ci 'u) 'l) 'nextraargs))
+      (when (>= n (- nextra))  ; 'n' is negative
+        (set! (deref pos) (p+ ((ci 'func) 'p) (- (- nextra) (+ n 1))))
+        (return "(vararg)"))))  ; one name for every vararg
+  (return (as CStr null)))
+
+(defn luaG_findlocal (L:(ptr lua_State) ci:(ptr CallInfo) n:i32 pos:(ptr StkId)):CStr
+  (let (base:StkId (p+ ((ci 'func) 'p) 1)
+        name:CStr (as CStr null))
+    (when (isLua ci)
+      (if (< n 0)  ; a vararg?
+        (return (findvararg ci n pos))
+        (set! name (luaF_getlocalname ((ci_func ci) 'p) n (currentpc ci)))))
+    (when (= (as ptr name) null)  ; no name of its own?
+      (let (limit:StkId (if (= ci (L 'ci)) ((L 'top) 'p) (((ci 'next) 'func) 'p)))
+        (if (and (>= (stack-diff limit base) n) (> n 0))  ; a slot of the frame?
+          (set! name (if (isLua ci) (cstr "(temporary)") (cstr "(C temporary)")))
+          (return (as CStr null)))))
+    (when (!= (as ptr pos) null)
+      (set! (deref pos) (p+ base (- n 1))))
+    (return name)))
+
+(defn lua_getlocal (L:(ptr lua_State) ar:(ptr lua_Debug) n:i32):CStr
+  (if (= (as ptr ar) null)  ; a function not active?
+    (if (not (ttisLclosure (s2v (p+ ((L 'top) 'p) -1))))
+      (return (as CStr null))
+      ;; the variables live at the function's start: its parameters
+      (return (luaF_getlocalname ((clLvalue (s2v (p+ ((L 'top) 'p) -1))) 'p) n 0)))
+    (let (pos:StkId null
+          name:CStr (luaG_findlocal L (ar 'i_ci) n &pos))
+      (when (!= (as ptr name) null)
+        (setobjs2s L ((L 'top) 'p) pos)
+        (api_incr_top L))
+      (return name))))
+
+(defn lua_setlocal (L:(ptr lua_State) ar:(ptr lua_Debug) n:i32):CStr
+  (let (pos:StkId null
+        name:CStr (luaG_findlocal L (ar 'i_ci) n &pos))
+    (when (!= (as ptr name) null)
+      (setobjs2s L pos (p+ ((L 'top) 'p) -1))
+      (set! ((L 'top) 'p) (p+ ((L 'top) 'p) -1)))  ; pop the value
+    (return name)))
+
+(defn- funcinfo (ar:(ptr lua_Debug) cl:(ptr Closure)):void
+  (if (not (LuaClosure cl))
+    (do (set! (ar 'source) "=[C]")
+        (set! (ar 'srclen) 4)
+        (set! (ar 'linedefined) -1)
+        (set! (ar 'lastlinedefined) -1)
+        (set! (ar 'what) "C"))
+    (let (p:(ptr Proto) ((cl 'l) 'p))
+      (if (!= (as ptr (p 'source)) null)
+        (do (set! (ar 'source) (cstr (getstr (p 'source))))
+            (set! (ar 'srclen) (tsslen (p 'source))))
+        (do (set! (ar 'source) "=?")
+            (set! (ar 'srclen) 2)))
+      (set! (ar 'linedefined) (p 'linedefined))
+      (set! (ar 'lastlinedefined) (p 'lastlinedefined))
+      (set! (ar 'what) (if (= (ar 'linedefined) 0) (cstr "main") (cstr "Lua")))))
+  (luaO_chunkid (unsafe/cast (ptr i8) (ref (ar 'short_src))) (ar 'source) (ar 'srclen)))
+
+(defn- nextline (p:(ptr Proto) currentline:i32 pc:i32):i32
+  (if (!= (lineinfo-at p pc) ABSLINEINFO)
+    (return (+ currentline (lineinfo-at p pc)))
+    (return (luaG_getfuncline p pc))))
+
+; Pushes a table whose keys are the function's lines with code, or nil for a
+; C function.
+(defn- collectvalidlines (L:(ptr lua_State) f:(ptr Closure)):void
+  (when (not (LuaClosure f))
+    (setnilvalue2s ((L 'top) 'p))
+    (api_incr_top L)
+    (return))
+  (let (p:(ptr Proto) ((f 'l) 'p)
+        currentline:i32 (p 'linedefined)
+        t:(ptr Table) (luaH_new L)
+        v:(ptr TValue) (alloca TValue)
+        i:i32 0)
+    (sethvalue2s L ((L 'top) 'p) t)
+    (api_incr_top L)
+    (when (!= (as ptr (p 'lineinfo)) null)  ; with debug information?
+      (setbtvalue v)  ; true, the value of every line
+      (when (isvararg p)  ; skip OP_VARARGPREP, but not its line
+        (set! currentline (nextline p currentline 0))
+        (set! i 1))
+      (while (< i (p 'sizelineinfo))
+        (set! currentline (nextline p currentline i))
+        (luaH_setint L t (as lua_Integer currentline) v)
+        (inc! i)))))
+
+(defn- getfuncname (L:(ptr lua_State) ci:(ptr CallInfo) name:(ptr CStr)):CStr
+  ;; a known function calls it?
+  (if (and (!= (as ptr ci) null) (= (bit-and (ci 'callstatus) CIST_TAIL) 0))
+    (return (funcnamefromcall L (ci 'previous) name))
+    (return (as CStr null))))  ; no way to find a name
+
+(defn- auxgetinfo (L:(ptr lua_State) what0:CStr ar:(ptr lua_Debug) f:(ptr Closure) ci:(ptr CallInfo)):i32
+  (let (status:i32 1
+        what:(ptr i8) (bytes what0))
+    (while (!= (deref what) 0)
+      (case (as i32 (deref what))
+        83 (funcinfo ar f)  ; 'S'
+        108 (set! (ar 'currentline) (if (and (!= (as ptr ci) null) (isLua ci)) (getcurrentline ci) -1))  ; 'l'
+        117 (do (set! (ar 'nups) (if (= (as ptr f) null) 0 ((f 'c) 'nupvalues)))  ; 'u'
+                (if (not (LuaClosure f))
+                  (do (set! (ar 'isvararg) 1)
+                      (set! (ar 'nparams) 0))
+                  (do (set! (ar 'isvararg) (if (isvararg ((f 'l) 'p)) 1 0))
+                      (set! (ar 'nparams) (((f 'l) 'p) 'numparams)))))
+        116 (if (!= (as ptr ci) null)  ; 't'
+              (do (set! (ar 'istailcall) (if (!= (bit-and (ci 'callstatus) CIST_TAIL) 0) 1 0))
+                  (set! (ar 'extraargs) (cast_uchar (bit-shr (bit-and (ci 'callstatus) MAX_CCMT) CIST_CCMT))))
+              (do (set! (ar 'istailcall) 0)
+                  (set! (ar 'extraargs) 0)))
+        110 (do (set! (ar 'namewhat) (getfuncname L ci (ref (ar 'name))))  ; 'n'
+                (when (= (as ptr (ar 'namewhat)) null)
+                  (set! (ar 'namewhat) "")  ; not found
+                  (set! (ar 'name) (as CStr null))))
+        114 (if (or (= (as ptr ci) null) (= (bit-and (ci 'callstatus) CIST_HOOKED) 0))  ; 'r'
+              (do (set! (ar 'ftransfer) 0)
+                  (set! (ar 'ntransfer) 0))
+              (do (set! (ar 'ftransfer) ((L 'transferinfo) 'ftransfer))
+                  (set! (ar 'ntransfer) ((L 'transferinfo) 'ntransfer))))
+        (:or 76 102) (do)  ; 'L', 'f': lua_getinfo's
+        (set! status 0))  ; an invalid option
+      (set! what (p+ what 1)))
+    (return status)))
+
+(defn lua_getinfo (L:(ptr lua_State) what0:CStr ar:(ptr lua_Debug)):i32
+  (let (what:CStr what0
+        ci:(ptr CallInfo) null
+        func:(ptr TValue) null)
+    (if (= (aref (bytes what) 0) 62)  ; '>': the function is on the top
+      (do (set! func (s2v (p+ ((L 'top) 'p) -1)))
+          (set! what (cstr (p+ (bytes what) 1)))
+          (set! ((L 'top) 'p) (p+ ((L 'top) 'p) -1)))  ; pop it
+      (do (set! ci (ar 'i_ci))
+          (set! func (s2v ((ci 'func) 'p)))))
+    (let (cl:(ptr Closure) (if (ttisclosure func) (clvalue func) (unsafe/cast (ptr Closure) null))
+          status:i32 (auxgetinfo L what ar cl ci))
+      (when (!= (as ptr (strchr what 102)) null)  ; 'f'
+        (setobj2s L ((L 'top) 'p) func)
+        (api_incr_top L))
+      (when (!= (as ptr (strchr what 76)) null)  ; 'L'
+        (collectvalidlines L cl))
+      (return status))))
+
+; ---- symbolic execution ----
+
+(defn- filterpc (pc:i32 jmptarget:i32):i32
+  (return (if (< pc jmptarget) -1 pc)))  ; inside a jump: no telling who set it
+
+; The last instruction before 'lastpc' that changed register 'reg'.
+(defn- findsetreg (p:(ptr Proto) lastpc0:i32 reg:i32):i32
+  (let (lastpc:i32 lastpc0
+        setreg:i32 -1
+        jmptarget:i32 0)  ; code before it is conditional
+    (when (testMMMode (GET_OPCODE (code-at p lastpc)))
+      (dec! lastpc))  ; the previous instruction didn't really run
+    (for (pc:i32 0) (< pc lastpc) (inc! pc)
+      (let (i:Instruction (code-at p pc)
+            op:i32 (GET_OPCODE i)
+            a:i32 (GETARG_A i)
+            change:bool (case op
+                          OP_LOADNIL (let (b:i32 (GETARG_B i)) (and (<= a reg) (<= reg (+ a b))))
+                          OP_TFORCALL (>= reg (+ a 2))  ; every register above its base
+                          (:or OP_CALL OP_TAILCALL) (>= reg a)
+                          OP_JMP (let (dest:i32 (+ pc 1 (GETARG_sJ i)))
+                                   ;; a jump that doesn't skip 'lastpc' moves the target on
+                                   (when (and (<= dest lastpc) (> dest jmptarget))
+                                     (set! jmptarget dest))
+                                   false)
+                          (and (testAMode op) (= reg a))))  ; sets A
+        (when change
+          (set! setreg (filterpc pc jmptarget)))))
+    (return setreg)))
+
+; A name for constant 'index'.
+(defn- kname (p:(ptr Proto) index:i32 name:(ptr CStr)):CStr
+  (let (kvalue:(ptr TValue) (p+ (p 'k) index))
+    (if (ttisstring kvalue)
+      (do (set! (deref name) (cstr (getstr (tsvalue kvalue))))
+          (return "constant"))
+      (do (set! (deref name) "?")
+          (return (as CStr null))))))
+
+(defn- basicgetobjname (p:(ptr Proto) ppc:(ptr i32) reg:i32 name:(ptr CStr)):CStr
+  (set! (deref name) (luaF_getlocalname p (+ reg 1) (deref ppc)))
+  (when (!= (as ptr (deref name)) null)  ; a local?
+    (return strlocal))
+  (let (pc:i32 (findsetreg p (deref ppc) reg))  ; else execute symbolically
+    (set! (deref ppc) pc)
+    (when (!= pc -1)
+      (let (i:Instruction (code-at p pc))
+        (case (GET_OPCODE i)
+          OP_MOVE (let (b:i32 (GETARG_B i))  ; from 'b' to 'a'
+                    (when (< b (GETARG_A i))
+                      (return (basicgetobjname p ppc b name))))
+          OP_GETUPVAL (do (set! (deref name) (upvalname p (GETARG_B i)))
+                          (return strupval))
+          OP_LOADK (return (kname p (GETARG_Bx i) name))
+          OP_LOADKX (return (kname p (GETARG_Ax (code-at p (+ pc 1))) name))
+          (do))))
+    (return (as CStr null))))
+
+; A name for register 'c': a constant's, or "?".
+(defn- rname (p:(ptr Proto) pc0:i32 c:i32 name:(ptr CStr)):void
+  (let (pc:i32 pc0
+        what:CStr (basicgetobjname p &pc c name))
+    (when (not (and (!= (as ptr what) null) (= (aref (bytes what) 0) 99)))  ; not "constant"?
+      (set! (deref name) "?"))))
+
+; Whether the table instruction 'i' indexes is the environment, _ENV.
+(defn- isEnv (p:(ptr Proto) pc0:i32 i:Instruction isup:bool):CStr
+  (let (t:i32 (GETARG_B i)
+        pc:i32 pc0
+        name:CStr (as CStr null))
+    (if isup
+      (set! name (upvalname p t))
+      (let (what:CStr (basicgetobjname p &pc t &name))
+        ;; only a local variable, here or an upvalue, can be _ENV. By identity:
+        ;; = on CStr compares contents, and 'what' may be null (ISSUE-042)
+        (when (and (!= (as ptr what) (as ptr strlocal)) (!= (as ptr what) (as ptr strupval)))
+          (set! name (as CStr null)))))
+    (return (if (and (!= (as ptr name) null) (= (strcmp name LUA_ENV) 0)) (cstr "global") (cstr "field")))))
+
+; basicgetobjname, and table accesses.
+(defn- getobjname (p:(ptr Proto) lastpc0:i32 reg:i32 name:(ptr CStr)):CStr
+  (let (lastpc:i32 lastpc0
+        kind:CStr (basicgetobjname p &lastpc reg name))
+    (when (!= (as ptr kind) null)
+      (return kind))
+    (when (!= lastpc -1)
+      (let (i:Instruction (code-at p lastpc))
+        (case (GET_OPCODE i)
+          OP_GETTABUP (do (kname p (GETARG_C i) name)
+                          (return (isEnv p lastpc i true)))
+          (:or OP_GETTABLE OP_GETVARG) (do (rname p lastpc (GETARG_C i) name)
+                                           (return (isEnv p lastpc i false)))
+          OP_GETI (do (set! (deref name) "integer index")
+                      (return "field"))
+          OP_GETFIELD (do (kname p (GETARG_C i) name)
+                          (return (isEnv p lastpc i false)))
+          OP_SELF (do (kname p (GETARG_C i) name)
+                      (return "method"))
+          (do))))
+    (return (as CStr null))))
+
+; A name for a function from the instruction that called it: what the name is
+; ("for iterator", "method", "metamethod"), with '*name' set to it.
+(defn- funcnamefromcode (L:(ptr lua_State) p:(ptr Proto) pc:i32 name:(ptr CStr)):CStr
+  (let (i:Instruction (code-at p pc)
+        tm:i32 (case (GET_OPCODE i)
+                 (:or OP_CALL OP_TAILCALL) (return (getobjname p pc (GETARG_A i) name))
+                 OP_TFORCALL (do (set! (deref name) "for iterator")
+                                 (return "for iterator"))
+                 ;; the others call through metamethods
+                 (:or OP_SELF OP_GETTABUP OP_GETTABLE OP_GETI OP_GETFIELD) TM_INDEX
+                 (:or OP_SETTABUP OP_SETTABLE OP_SETI OP_SETFIELD) TM_NEWINDEX
+                 (:or OP_MMBIN OP_MMBINI OP_MMBINK) (GETARG_C i)
+                 OP_UNM TM_UNM
+                 OP_BNOT TM_BNOT
+                 OP_LEN TM_LEN
+                 OP_CONCAT TM_CONCAT
+                 OP_EQ TM_EQ  ; OP_EQI and OP_EQK call no metamethod
+                 (:or OP_LT OP_LTI OP_GTI) TM_LT
+                 (:or OP_LE OP_LEI OP_GEI) TM_LE
+                 (:or OP_CLOSE OP_RETURN) TM_CLOSE
+                 (return (as CStr null))))  ; no reasonable name
+    (set! (deref name) (cstr (p+ (getshrstr (aref ((G L) 'tmname) tm)) 2)))  ; past "__"
+    (return "metamethod")))
+
+; A name for a function from how it was called.
+(defn- funcnamefromcall (L:(ptr lua_State) ci:(ptr CallInfo) name:(ptr CStr)):CStr
+  (cond (!= (bit-and (ci 'callstatus) CIST_HOOKED) 0) (do (set! (deref name) "?")
+                                                          (return "hook"))
+        (!= (bit-and (ci 'callstatus) CIST_FIN) 0) (do (set! (deref name) "__gc")
+                                                       (return "metamethod"))  ; reported as one
+        (isLua ci) (return (funcnamefromcode L ((ci_func ci) 'p) (currentpc ci) name))
+        true (return (as CStr null))))
+
+; The index of 'o' in the current function's frame, or -1. 'o' may point
+; outside the stack, so it is compared slot by slot, not against the bounds.
+(defn- instack (ci:(ptr CallInfo) o:(ptr TValue)):i32
+  (let (base:StkId (p+ ((ci 'func) 'p) 1)
+        pos:i32 0)
+    (while (< (as ptr (p+ base pos)) (as ptr ((ci 'top) 'p)))
+      (when (= (as ptr o) (as ptr (s2v (p+ base pos))))
+        (return pos))
+      (inc! pos))
+    (return -1)))
+
+; Whether 'o' is an upvalue's value: only OP_GETTABUP and OP_SETTABUP work on
+; upvalues directly.
+(defn- getupvalname (ci:(ptr CallInfo) o:(ptr TValue) name:(ptr CStr)):CStr
+  (let (c:(ptr LClosure) (ci_func ci))
+    (for (i:i32 0) (< i (as i32 (c 'nupvalues))) (inc! i)
+      (when (= (as ptr (((deref (p+ (unsafe/cast (ptr (ptr UpVal)) (ref (c 'upvals))) i)) 'v) 'p)) (as ptr o))
+        (set! (deref name) (upvalname (c 'p) i))
+        (return strupval)))
+    (return (as CStr null))))
+
+(defn- formatvarinfo (L:(ptr lua_State) kind:CStr name:CStr):CStr
+  (if (= (as ptr kind) null)
+    (return "")  ; no information
+    (return (luaO_pushfstring L " (%s '%s')" kind name))))
+
+; A description of 'o', such as " (local 'x')" or " (upvalue 'y')".
+(defn- varinfo (L:(ptr lua_State) o:(ptr TValue)):CStr
+  (let (ci:(ptr CallInfo) (L 'ci)
+        name:CStr (as CStr null)
+        kind:CStr (as CStr null))
+    (when (isLua ci)
+      (set! kind (getupvalname ci o &name))
+      (when (= (as ptr kind) null)  ; not an upvalue?
+        (let (reg:i32 (instack ci o))
+          (when (>= reg 0)  ; a register?
+            (set! kind (getobjname ((ci_func ci) 'p) (currentpc ci) reg &name))))))
+    (return (formatvarinfo L kind name))))
+
+(defn- typeerror (L:(ptr lua_State) o:(ptr TValue) op:CStr extra:CStr):void :noreturn
+  (luaG_runerror L "attempt to %s a %s value%s" op (luaT_objtypename L o) extra))
+
+; A type error, with what is known about the faulty value (varinfo).
+(defn luaG_typeerror (L:(ptr lua_State) o:(ptr TValue) op:CStr):void :noreturn
+  (typeerror L o op (varinfo L o)))
+
+; Calling what can't be called: a name from how it was called, or else varinfo.
+(defn luaG_callerror (L:(ptr lua_State) o:(ptr TValue)):void :noreturn
+  (let (name:CStr (as CStr null)
+        kind:CStr (funcnamefromcall L (L 'ci) &name))
+    (typeerror L o "call" (if (!= (as ptr kind) null) (formatvarinfo L kind name) (varinfo L o)))))
+
+(defn luaG_forerror (L:(ptr lua_State) o:(ptr TValue) what:CStr):void :noreturn
+  (luaG_runerror L "bad 'for' %s (number expected, got %s)" what (luaT_objtypename L o)))
+
+(defn luaG_concaterror (L:(ptr lua_State) p1:(ptr TValue) p2:(ptr TValue)):void :noreturn
+  (luaG_typeerror L (if (or (ttisstring p1) (ttisnumber p1)) p2 p1) "concatenate"))  ; cvt2str
+
+(defn luaG_opinterror (L:(ptr lua_State) p1:(ptr TValue) p2:(ptr TValue) msg:CStr):void :noreturn
+  (luaG_typeerror L (if (not (ttisnumber p1)) p1 p2) msg))  ; the first operand, if it is wrong
+
+; Both values are numbers, but not both integers.
+(defn luaG_tointerror (L:(ptr lua_State) p1:(ptr TValue) p2:(ptr TValue)):void :noreturn
+  (let (temp:lua_Integer 0)
+    (luaG_runerror L "number%s has no integer representation"
+                   (varinfo L (if (= (luaV_tointegerns p1 &temp F2Ieq) 0) p1 p2)))))
+
+(defn luaG_ordererror (L:(ptr lua_State) p1:(ptr TValue) p2:(ptr TValue)):void :noreturn
+  (let (t1:CStr (luaT_objtypename L p1)
+        t2:CStr (luaT_objtypename L p2))
+    (if (= (strcmp t1 t2) 0)
+      (luaG_runerror L "attempt to compare two %s values" t1)
+      (luaG_runerror L "attempt to compare %s with %s" t1 t2))))
+
+(defn luaG_errnnil (L:(ptr lua_State) cl:(ptr LClosure) k:i32):void :noreturn
+  (let (globalname:CStr "?")  ; when k == 0
+    (when (> k 0)
+      (kname (cl 'p) (- k 1) &globalname))
+    (luaG_runerror L "global '%s' already defined" globalname)))
+
+; 'msg' with "source:line: " before it.
+(defn luaG_addinfo (L:(ptr lua_State) msg:CStr src:(ptr TString) line:i32):CStr
+  (if (= (as ptr src) null)  ; no debug information?
+    (return (luaO_pushfstring L "?:?: %s" msg))
+    (let (buff:(ptr i8) (alloca i8 LUA_IDSIZE))
+      (luaO_chunkid buff (cstr (getstr src)) (tsslen src))
+      (return (luaO_pushfstring L "%s:%d: %s" buff line msg)))))
+
+(defn luaG_errormsg (L:(ptr lua_State)):void :noreturn
+  (when (!= (L 'errfunc) 0)  ; an error handler?
+    (let (errfunc:StkId (restorestack L (L 'errfunc)))
+      (setobjs2s L ((L 'top) 'p) (p+ ((L 'top) 'p) -1))  ; move the argument up
+      (setobjs2s L (p+ ((L 'top) 'p) -1) errfunc)  ; and push the handler under it
+      (api_incr_top L)  ; EXTRA_STACK leaves room
+      (luaD_callnoyield L (p+ ((L 'top) 'p) -2) 1)))
+  (when (ttisnil (s2v (p+ ((L 'top) 'p) -1)))  ; a nil error object?
+    (setsvalue2s L (p+ ((L 'top) 'p) -1) (luaS_newliteral L "<no error object>")))
+  (luaD_throw L LUA_ERRRUN))
+
+(defn luaG_runerror (L:(ptr lua_State) fmt:CStr :varargs argp):void :noreturn
+  (let (ci:(ptr CallInfo) (L 'ci))
+    (luaC_checkGC L)  ; the message needs memory
+    (let (msg:CStr (luaO_pushvfstring L fmt argp))
+      (when (= (as ptr msg) null)
+        (luaD_throw L LUA_ERRMEM))
+      (when (isLua ci)  ; with "source:line: "
+        (luaG_addinfo L msg (((ci_func ci) 'p) 'source) (getcurrentline ci))
+        (setobjs2s L (p+ ((L 'top) 'p) -2) (p+ ((L 'top) 'p) -1))  ; drop 'msg'
+        (set! ((L 'top) 'p) (p+ ((L 'top) 'p) -1))))
+    (luaG_errormsg L)))
+
+; Whether 'newpc' is on another line than 'oldpc' (before it). Near, the
+; deltas are summed; far, an ABSLINEINFO is likely between, so both lines are
+; computed.
+(defn- changedline (p:(ptr Proto) oldpc:i32 newpc:i32):bool
+  (when (= (as ptr (p 'lineinfo)) null)  ; no debug information?
+    (return false))
+  (when (< (- newpc oldpc) (/ MAXIWTHABS 2))
+    (let (delta:i32 0
+          pc:i32 oldpc)
+      (while true
+        (inc! pc)
+        (let (li:i32 (lineinfo-at p pc))
+          (when (= li ABSLINEINFO) (break))  ; no delta to sum
+          (set! delta (+ delta li))
+          (when (= pc newpc)
+            (return (!= delta 0)))))))
+  (return (!= (luaG_getfuncline p oldpc) (luaG_getfuncline p newpc))))
+
+; At a function's first instruction, not after a yield and not vararg (whose
+; VARARGPREP calls it once the varargs are in place), the call hook.
+(defn luaG_tracecall (L:(ptr lua_State)):i32
+  (let (ci:(ptr CallInfo) (L 'ci)
+        p:(ptr Proto) ((ci_func ci) 'p))
+    (set! (((ci 'u) 'l) 'trap) 1)  ; hooks will be checked
+    (when (= (((ci 'u) 'l) 'savedpc) (p 'code))  ; the first instruction, not resuming?
+      (when (isvararg p)
+        (return 0))  ; the hooks start at VARARGPREP
+      (when (= (bit-and (ci 'callstatus) CIST_HOOKYIELD) 0)  ; not yielded?
+        (luaD_hookcall L ci)))
+    (return 1)))  ; keep 'trap' on
+
+; Before each instruction, with debugging on. 'L->oldpc' is the last traced,
+; to see the line change; 'npci' is zero on entering a function, a new line
+; whatever 'oldpc' is. Not protected: 'L->top' must be right before anything
+; that may collect.
+(defn luaG_traceexec (L:(ptr lua_State) pc0:(ptr Instruction)):i32
+  (let (ci:(ptr CallInfo) (L 'ci)
+        mask:i32 (as i32 (cast_uchar (L 'hookmask)))
+        p:(ptr Proto) ((ci_func ci) 'p)
+        pc:(ptr Instruction) (p+ pc0 1)  ; always the next instruction
+        counthook:bool false)
+    (when (= (bit-and mask (bit-or LUA_MASKLINE LUA_MASKCOUNT)) 0)  ; no hooks?
+      (set! (((ci 'u) 'l) 'trap) 0)  ; no need to stop again
+      (return 0))
+    (set! (((ci 'u) 'l) 'savedpc) pc)
+    (when (!= (bit-and mask LUA_MASKCOUNT) 0)
+      (set! (L 'hookcount) (- (L 'hookcount) 1))
+      (set! counthook (= (L 'hookcount) 0)))
+    (cond counthook (resethookcount L)
+          (= (bit-and mask LUA_MASKLINE) 0) (return 1))  ; nothing to do yet
+    (when (!= (bit-and (ci 'callstatus) CIST_HOOKYIELD) 0)  ; the hook yielded last time?
+      (set! (ci 'callstatus) (clearbits (ci 'callstatus) CIST_HOOKYIELD))
+      (return 1))  ; the VM didn't move, so no hook again
+    (when (= (luaP_isIT (deref (p+ (((ci 'u) 'l) 'savedpc) -1))) 0)  ; top unused?
+      (set! ((L 'top) 'p) ((ci 'top) 'p)))
+    (when counthook
+      (luaD_hook L LUA_HOOKCOUNT -1 0 0))
+    (when (!= (bit-and mask LUA_MASKLINE) 0)
+      (let (oldpc:i32 (if (< (L 'oldpc) (p 'sizecode)) (L 'oldpc) 0)  ; may be stale
+            npci:i32 (pcRel pc p))
+        (when (or (<= npci oldpc)  ; a jump back (a loop),
+                  (changedline p oldpc npci))  ; or a new line
+          (luaD_hook L LUA_HOOKLINE (luaG_getfuncline p npci) 0 0))
+        (set! (L 'oldpc) npci)))
+    (when (= (L 'status) LUA_YIELD)  ; the hook yielded?
+      (when counthook
+        (set! (L 'hookcount) 1))  ; undo the decrement to zero
+      (set! (ci 'callstatus) (bit-or (ci 'callstatus) CIST_HOOKYIELD))
+      (luaD_throw L LUA_YIELD))
+    (return 1)))

@@ -60,6 +60,8 @@
 (defmacro uc (c) `(as i32 (cast_uchar ~c)))
 
 ; How many bytes 'q' is past 'p'. Pointers can't be subtracted (ISSUE-021).
+; C's 'x & ~m' for an unsigned 'x': bit-not's -1 won't fit an unsigned type (ISSUE-041).
+(defmacro clearbits (x m) `(bit-and ~x (unsafe/cast ui32 (bit-not (as i64 ~m)))))
 (defmacro byte-diff (q p) `(- (unsafe/cast i64 (as ptr ~q)) (unsafe/cast i64 (as ptr ~p))))
 
 ; luaL_setfuncs over a luaL_Reg list built on the stack, as a function's address

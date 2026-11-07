@@ -1,0 +1,13 @@
+; ISSUE-040: a later declarator in `struct CI *previous, *next;` imported as a bare `ptr`.
+; expect: prints `5`; actual: `set!: operand must be a struct or union, or a pointer to one`
+; run: $NUCLEUSC --cflag=-I$D $P -o $W/p && $W/p
+; fixed-when-output: 5
+(import-use "stdio.h")
+(import-use "issue-040.h")
+(defn main ():i32
+  (let (a:(ptr CI) (alloca CI)
+        b:(ptr CI) (alloca CI))
+    (set! (a 'next) b)
+    (set! ((a 'next) 'x) 5)
+    (printf "%d\n" (b 'x))
+    (return 0)))

@@ -34,15 +34,18 @@ Ranked by porter pain removed per unit of language work.
 | 28 | ISSUE-016 | No byte literal: `\e` is a 32-bit Char and won't convert to `i8` | minor | design | worked-around |
 | 29 | ISSUE-017 | A `CStr` can't be indexed | minor | design | worked-around |
 | 30 | ISSUE-014 | `SIG_DFL` imports as the integer 0 | minor | interop | worked-around |
-| 31 | ISSUE-024 | A `_`-prefixed macro isn't imported, even ISO C's `_IOFBF` | papercut | design | worked-around |
-| 32 | ISSUE-020 | `set!` won't expand a macro in its place | papercut | missing-feature | worked-around |
-| 33 | ISSUE-025 | `sizeof` is a signed integer, so comparing a size with it is refused | papercut | design | worked-around |
-| 34 | ISSUE-035 | `unsafe/cast` from a function pointer to an integer is refused | papercut | bug | worked-around |
-| 35 | ISSUE-036 | A `defvar`'s array initializer isn't macroexpanded before its shape is checked | papercut | bug | worked-around |
-| 36 | ISSUE-037 | A `defstruct` can't complete a struct its header declares without a body | papercut | missing-feature | worked-around |
-| 37 | ISSUE-038 | A parameter named like a special form is accepted, then misparsed at its use | papercut | design | worked-around |
-| 38 | ISSUE-039 | A `build.edn` makes one program, and a second sharing its sources warns at every build | papercut | tooling | worked-around |
-| 39 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
+| 31 | ISSUE-040 | A later declarator in a field list (`*previous, *next`) imported as a bare `ptr` | minor | bug | fixed in nucleus `a64ac73` |
+| 32 | ISSUE-042 | `=` on two `CStr`s compares contents, so a C pointer test ported as written reads through null | minor | design | worked-around |
+| 33 | ISSUE-041 | `bit-not` of an unsigned value is refused: `-1` doesn't fit it | papercut | bug | worked-around |
+| 34 | ISSUE-024 | A `_`-prefixed macro isn't imported, even ISO C's `_IOFBF` | papercut | design | worked-around |
+| 35 | ISSUE-020 | `set!` won't expand a macro in its place | papercut | missing-feature | worked-around |
+| 36 | ISSUE-025 | `sizeof` is a signed integer, so comparing a size with it is refused | papercut | design | worked-around |
+| 37 | ISSUE-035 | `unsafe/cast` from a function pointer to an integer is refused | papercut | bug | worked-around |
+| 38 | ISSUE-036 | A `defvar`'s array initializer isn't macroexpanded before its shape is checked | papercut | bug | worked-around |
+| 39 | ISSUE-037 | A `defstruct` can't complete a struct its header declares without a body | papercut | missing-feature | worked-around |
+| 40 | ISSUE-038 | A parameter named like a special form is accepted, then misparsed at its use | papercut | design | worked-around |
+| 41 | ISSUE-039 | A `build.edn` makes one program, and a second sharing its sources warns at every build | papercut | tooling | worked-around |
+| 42 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
 
 ## ISSUE-001: A C variadic couldn't be defined in Nucleus
 
@@ -625,6 +628,61 @@ is refused at once, plainly: "'field' already names a special form". But
 parameter and fails at the use: "label: name must be symbol", which names neither
 the binding nor the conflict. A binding that can't be used should be refused where
 it is made, with the first message.
+
+## ISSUE-040: A later declarator in a field list imported as a bare `ptr`
+
+- **Severity:** minor
+- **Kind:** bug
+- **Status:** fixed in nucleus `a64ac73`
+- **Probe:** `probes/issue-040.nuc` — expected `5`; actual `set!: operand must be a
+  struct or union, or a pointer to one`
+- **Port sites:** every walk of the CallInfo list: `luaE_extendCI`, `luaE_shrinkCI`
+  in `state.nuc`, then `ldo` and `ldebug`
+- **Workaround:** a typed `let` or `unsafe/cast` at each use of `next` or `previous`;
+  fixed instead, since every CallInfo walk in `ldo` and `ldebug` would need one.
+
+Context: `lstate.h` declares `struct CallInfo *previous, *next;`. `previous` imported
+as a pointer to `CallInfo` and `next` as a bare `ptr`, so `((ci 'next) 'previous)`
+was refused. The importer's declarator-list support assumed the first declarator's
+`*` consumed the base type, which held before typed C pointers; the base is kept now,
+and the later declarator lost it only because the parser didn't look. The layout was
+always right, so nothing failed silently. `int *p, q;` was refused outright for the
+same reason, though the type is plain.
+
+## ISSUE-041: `bit-not` of an unsigned value is refused
+
+- **Severity:** papercut
+- **Kind:** bug
+- **Status:** worked-around
+- **Probe:** `probes/issue-041.nuc` — expected `4286578687`; actual `integer literal -1
+  does not fit ui32`
+- **Port sites:** `luaG_traceexec` in `debug.nuc`, and every `ci->callstatus &= ~CIST_…`
+  in `ldo`
+- **Workaround:** `clearbits` in `util.nuc` widens the mask to `i64`, complements it and
+  casts back.
+
+Context: `bit-not` is a prelude macro, `(_bit-xor x -1)`, documented as "correct at
+any width in two's complement". The literal `-1` takes the other operand's type, and
+no unsigned type holds it, so C's `x & ~m` on an `l_uint32` doesn't compile. An
+all-ones literal of the operand's type, or `(- 0 1)` in it, would do.
+
+## ISSUE-042: `=` on two `CStr`s compares contents, so a C pointer test reads through null
+
+- **Severity:** minor
+- **Kind:** design
+- **Status:** worked-around
+- **Probe:** `probes/issue-042.nuc` — expected `different`; actual a crash in `strcmp`
+- **Port sites:** `isEnv` in `debug.nuc`
+- **Workaround:** compare `(as ptr …)` where C compares pointers.
+
+Context: `ldebug.c` returns `strlocal` or `strupval` and tests the result by identity:
+`what != strlocal && what != strupval`, with `what` possibly `NULL`. Ported as
+written, `!=` on two `CStr`s is a `strcmp` (`docs/types.md`); only a literal `null`
+operand gets a pointer test, so a null held in a variable crashed the suite in
+`errors.lua`, `db.lua`, `math.lua` and `big.lua`, wherever an error named a field of
+a global table. Content equality is a fair default for strings, but the same
+spelling means identity on every other pointer, and nothing marks the difference at
+a comparison of two variables. A null operand could at least compare unequal.
 
 ## ISSUE-039: A `build.edn` makes one program, and a second sharing its sources warns at every build
 

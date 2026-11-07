@@ -31,7 +31,8 @@ fixed point needs a second round), `make`, then `make -k test` and `make bootstr
 
 **Baseline** (lua-bugfixes at `bc1b05d`, before any change of this port's):
 `nuctests: 1725 passed, 0 failed, 0 skipped`, bootstrap fixed point holds.
-Latest (`1ae171b`): 1742 passed, bootstrap holds.
+Latest (`a64ac73`): 1742 passed, bootstrap holds from the third round (a fix the
+compiler's own sources depend on changes the order a compiler built without it emits).
 
 ## Gotchas
 

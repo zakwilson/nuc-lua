@@ -34,7 +34,8 @@ object model, the compiler, execution state, the collector and the VM (§10).
 | 2 Host and libraries | done: `lua.c`, `lauxlib.c`, `linit` and every standard library in Nucleus |
 | 3 Object model | done: `lctype`, `lzio`, `lmem`, `lobject`, `lstring`, `lfunc`, `ltm`, `ltable` |
 | 4 Compiler | done: `lopcodes`, `llex`, `lcode`, `lparser`, `ldump`, `lundump`, `luac.c` |
-| 5–11 | not started |
+| 5 Execution state | in progress: `lstate`, `ldebug` ported; `ldo`, `lapi` left |
+| 6–11 | not started |
 
 ### Nucleus
 
@@ -50,11 +51,14 @@ Compiler: `.nucleus-work` on `lua-bugfixes` (see CLAUDE.md).
 - `f282cfe` an attribute between a function's return type and its name (ISSUE-026);
   `C-MAX-PARAMS` is 64
 - `1ae171b` a field of a union member is a place (ISSUE-032); no 256-macro cap (ISSUE-033)
+- `a64ac73` a later declarator keeps the base type (ISSUE-040); the fixed point
+  holds from the third round
 
 ### Still stock
 
-Execution state, the collector and the VM: every module in `build.edn`'s `:c-sources`
-(`lapi`, `ldebug`, `ldo`, `lgc`, `lstate`, `lvm`). The object model is in `src/lua/`
+Part of execution state, the collector and the VM: every module in `build.edn`'s
+`:c-sources` (`lapi`, `ldo`, `lgc`, `lvm`). `lstate` and `ldebug` are `state.nuc` and
+`debug.nuc`. The object model is in `src/lua/`
 (`ctype`, `zio`, `mem`, `object`, `string`, `func`, `tm`, `table`), and so is the
 compiler (`opcodes`, `lex`, `code`, `parser`, `dump`, `undump`); `luac.c` is
 `src/luac.nuc` (`lua.luac`). Ported before it: `lua.c`
@@ -116,8 +120,8 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
 
 ## Next
 
-M5, execution state: `ldebug`, `lstate`, `ldo` (throw, calls, coroutines and
-continuations), `lapi` (the rest of the variadics), with the suite, `check-bytecode.sh`
+M5, execution state: `ldo` (throw, calls, coroutines and continuations), then
+`lapi` (the rest of the variadics), with the suite, `check-bytecode.sh`
 and the `check-capi.sh` matrix after each. Delete each from both `build.edn` and
 `luac/build.edn`. `code.nuc` holds `lcode.h`'s macros and the `expdesc`
 union accessors (`u`, `set-u`, `ind`, `set-ind`, `uvar`, `set-uvar`) that `parser.nuc`

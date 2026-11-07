@@ -1,0 +1,11 @@
+; ISSUE-042: = on two CStr compares contents, so C's pointer test, ported as written, reads a null.
+; expect: prints `different`; actual: a crash in strcmp
+; run: $NUCLEUSC $P -o $W/p && $W/p
+; fixed-when-output: different
+(import-use "stdio.h")
+(defvar- strlocal:CStr "local")
+(defn kind (found:bool):CStr (return (if found strlocal (as CStr null))))
+(defn main ():i32
+  (let (what:CStr (kind false))
+    (printf "%s\n" (if (!= what strlocal) (as CStr "different") (as CStr "same")))
+    (return 0)))

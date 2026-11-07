@@ -9,8 +9,6 @@
  :libs ["m"]
  :deps {luacapi {:path "../capi"}}
  :c-sources ["../reference/build/src/lapi.c"
-             "../reference/build/src/ldebug.c"
              "../reference/build/src/ldo.c"
              "../reference/build/src/lgc.c"
-             "../reference/build/src/lstate.c"
              "../reference/build/src/lvm.c"]}
