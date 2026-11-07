@@ -1,0 +1,34 @@
+; Opening the standard libraries.
+;
+; linit.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.init)
+(set-ir-prefix "")
+(import-use luacapi)
+(import-use lua.util)
+
+; Requires the library if 'mask' is in 'load', else preloads it if it's in
+; 'preload'. The PRELOAD table is on the top.
+(defn- openlib (L:(ptr lua_State) load:i32 preload:i32 mask:i32 name:CStr f:lua_CFunction):void
+  (cond
+    (!= (bit-and load mask) 0)
+      (do (luaL_requiref L name f 1)
+          (lua_pop L 1))  ; the library
+    (!= (bit-and preload mask) 0)
+      (do (lua_pushcfunction L f)
+          (lua_setfield L -2 name))))
+
+; C walks a luaL_Reg table here; a function's address can't be constant data
+; (ISSUE-004), so the libraries are listed as calls, in the order of their masks.
+(defn luaL_openselectedlibs (L:(ptr lua_State) load:i32 preload:i32):void
+  (luaL_getsubtable L LUA_REGISTRYINDEX LUA_PRELOAD_TABLE)
+  (openlib L load preload LUA_GLIBK LUA_GNAME luaopen_base)
+  (openlib L load preload LUA_LOADLIBK LUA_LOADLIBNAME luaopen_package)
+  (openlib L load preload LUA_COLIBK LUA_COLIBNAME luaopen_coroutine)
+  (openlib L load preload LUA_DBLIBK LUA_DBLIBNAME luaopen_debug)
+  (openlib L load preload LUA_IOLIBK LUA_IOLIBNAME luaopen_io)
+  (openlib L load preload LUA_MATHLIBK LUA_MATHLIBNAME luaopen_math)
+  (openlib L load preload LUA_OSLIBK LUA_OSLIBNAME luaopen_os)
+  (openlib L load preload LUA_STRLIBK LUA_STRLIBNAME luaopen_string)
+  (openlib L load preload LUA_TABLIBK LUA_TABLIBNAME luaopen_table)
+  (openlib L load preload LUA_UTF8LIBK LUA_UTF8LIBNAME luaopen_utf8)
+  (lua_pop L 1))  ; the PRELOAD table

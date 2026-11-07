@@ -1,0 +1,349 @@
+; The package library: require, and loading C libraries with dlopen
+; (LUA_USE_DLOPEN, from LUA_USE_LINUX).
+;
+; loadlib.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.loadlib)
+(set-ir-prefix "")
+(import-use luacapi)
+(import-use lua.util)
+(import-use "dlfcn.h")
+(import-use "stdio.h")
+(import-use "stdlib.h")
+(import-use "string.h")
+
+(defconst LUA_CSUBSEP LUA_DIRSEP)  ; replaces a dot in a submodule's name, for C
+(defconst LUA_LSUBSEP LUA_DIRSEP)  ; and for Lua
+(defconst LUA_POF "luaopen_")  ; the prefix of an open function
+(defconst LUA_OFSEP "_")  ; what a dot becomes in an open function's name
+(defconst LIB_FAIL "open")
+(defconst LUA_PATH_VAR "LUA_PATH")
+(defconst LUA_CPATH_VAR "LUA_CPATH")
+
+; registry[CLIBS] holds the handles of the loaded C libraries.
+(defconst CLIBS "_CLIBS")
+
+; ---- The dlopen system ----
+
+(defn- lsys_unloadlib (lib:ptr):void
+  (dlclose lib))
+
+(defn- lsys_load (L:(ptr lua_State) path:CStr seeglb:bool):ptr
+  (let (lib:ptr (dlopen path (bit-or RTLD_NOW (if seeglb RTLD_GLOBAL RTLD_LOCAL))))
+    (when (= lib null)
+      (lua_pushstring L (dlerror)))
+    (return lib)))
+
+(defn- lsys_sym (L:(ptr lua_State) lib:ptr sym:CStr):lua_CFunction
+  (let (f:lua_CFunction (unsafe/cast lua_CFunction (dlsym lib sym)))
+    (when (= f null)
+      (lua_pushstring L (dlerror)))
+    (return f)))
+
+; ---- Paths ----
+
+; registry.LUA_NOENV, as a boolean.
+(defn- noenv (L:(ptr lua_State)):bool
+  (lua_getfield L LUA_REGISTRYINDEX "LUA_NOENV")
+  (let (b:bool (!= (lua_toboolean L -1) 0))
+    (lua_pop L 1)
+    (return b)))
+
+; Sets package[fieldname] from the environment, or to 'dft', which a ";;" in
+; the variable stands for.
+(defn- setpath (L:(ptr lua_State) fieldname:CStr envname:CStr dft:CStr):void
+  (let (nver:CStr (lua_pushfstring L "%s%s" envname LUA_VERSUFFIX)
+        path:CStr (getenv nver))  ; the versioned name first
+    (when (= (as ptr path) null)
+      (set! path (getenv envname)))
+    (if (or (= (as ptr path) null) (noenv L))
+      (lua_pushexternalstring L dft (strlen dft) null null)  ; the default, a literal
+      (let (dftmark:(ptr i8) (bytes (strstr path ";;")))
+        (if (= dftmark null)
+          (lua_pushstring L path)  ; as it is
+          (let (len:usize (strlen path)
+                p:(ptr i8) (bytes path)
+                pend:(ptr i8) (unsafe/ptr+ p (- (as i64 len) 2))
+                b:&luaL_Buffer (alloca luaL_Buffer))
+            (luaL_buffinit L b)
+            (when (< (byte-diff p dftmark) 0)  ; something before the ';;'?
+              (luaL_addlstring b path (as usize (byte-diff dftmark p)))
+              (luaL_addchar b (ch \;)))
+            (luaL_addstring b dft)
+            (when (< (byte-diff dftmark pend) 0)  ; something after it?
+              (luaL_addchar b (ch \;))
+              (luaL_addlstring b (cstr (unsafe/ptr+ dftmark 2)) (as usize (byte-diff pend dftmark))))
+            (luaL_pushresult b)))))
+    (lua_setfield L -3 fieldname)
+    (lua_pop L 1)))  ; nver
+
+; ---- C libraries ----
+
+; A library is unloaded only after the external strings it made are freed: a
+; "library string" stands for it, and freeing that string closes it.
+
+; registry.CLIBS[path]
+(defn- checkclib (L:(ptr lua_State) path:CStr):ptr
+  (lua_getfield L LUA_REGISTRYINDEX CLIBS)
+  (lua_getfield L -1 path)
+  (let (plib:ptr (lua_touserdata L -1))
+    (lua_pop L 2)
+    (return plib)))
+
+; The deallocator of a library string: unloads its library.
+(defn- freelib (ud:ptr p:ptr osize:usize nsize:usize):ptr
+  (lsys_unloadlib ud)
+  (return null))
+
+(defconst LIBSTR "01234567890")  ; every library string's contents
+
+(defn- createlibstr (L:(ptr lua_State) plib:ptr):void
+  (lua_pushexternalstring L LIBSTR 11 freelib plib))
+
+; registry.CLIBS[path] = plib, and the library string kept in CLIBS so that
+; it's collected only with it.
+(defn- addtoclib (L:(ptr lua_State) path:CStr plib:ptr):void
+  (lua_getfield L LUA_REGISTRYINDEX CLIBS)
+  (lua_pushlightuserdata L plib)
+  (lua_setfield L -2 path)
+  (createlibstr L plib)
+  (luaL_ref L -2)
+  (lua_pop L 1))
+
+(defconst ERRLIB 1)
+(defconst ERRFUNC 2)
+
+; Loads library 'path' unless it's loaded, then pushes its function 'sym', or
+; true when 'sym' is "*". Returns 0, or an error code with a message pushed.
+(defn- lookforfunc (L:(ptr lua_State) path:CStr sym:CStr):i32
+  (let (reg:ptr (checkclib L path)
+        star:bool (= (aref (bytes sym) 0) (ch \*)))
+    (when (= reg null)
+      (set! reg (lsys_load L path star))  ; global symbols for "*"
+      (when (= reg null) (return ERRLIB))
+      (addtoclib L path reg))
+    (when star  ; just the library
+      (lua_pushboolean L 1)
+      (return 0))
+    (let (f:lua_CFunction (lsys_sym L reg sym))
+      (when (= f null) (return ERRFUNC))
+      (lua_pushcfunction L f)
+      (return 0))))
+
+(defn- ll_loadlib (L:(ptr lua_State)):i32
+  (let (path:CStr (luaL_checkstring L 1)
+        init:CStr (luaL_checkstring L 2)
+        stat:i32 (lookforfunc L path init))
+    (when (= stat 0)
+      (return 1))  ; the function
+    (luaL_pushfail L)  ; the message is on the top
+    (lua_insert L -2)
+    (lua_pushstring L (if (= stat ERRLIB) LIB_FAIL "init"))
+    (return 3)))  ; fail, the message, and where
+
+; ---- require ----
+
+(defn- readable (filename:CStr):bool
+  (let (f:(ptr FILE) (fopen filename "r"))
+    (when (= f null) (return false))
+    (fclose f)
+    (return true)))
+
+; The next name of the list "name1;name2;..." at '*path', terminated in place
+; where its ';' was; null at the end.
+(defn- getnextfilename (path:(ptr (ptr i8)) end:(ptr i8)):(ptr i8)
+  (let (name:(ptr i8) (deref path))
+    (when (= name end)
+      (return null))  ; no more names
+    (when (= (deref name) 0)  ; ended by the last call?
+      (set! (deref name) (ch \;))  ; restore the separator
+      (set! name (unsafe/ptr+ name 1)))
+    (let (sep:(ptr i8) (bytes (strchr (cstr name) (ch \;))))
+      (when (= sep null)
+        (set! sep end))  ; the last name
+      (set! (deref sep) 0)
+      (set! (deref path) sep)
+      (return name))))
+
+; For ";a.so;b.so", pushes "no file 'a.so'\n\tno file 'b.so'".
+(defn- pusherrornotfound (L:(ptr lua_State) path:CStr):void
+  (let (b:&luaL_Buffer (alloca luaL_Buffer))
+    (luaL_buffinit L b)
+    (luaL_addstring b "no file '")
+    (luaL_addgsub b path LUA_PATH_SEP "'\n\tno file '")
+    (luaL_addstring b "'")
+    (luaL_pushresult b)))
+
+(defn- searchpath (L:(ptr lua_State) name:CStr path:CStr sep:CStr dirsep:CStr):CStr
+  (let (buff:&luaL_Buffer (alloca luaL_Buffer))
+    ; a separator that appears in the name becomes 'dirsep'
+    (when (and (!= (aref (bytes sep) 0) 0)
+               (!= (strchr name (as i32 (aref (bytes sep) 0))) null))
+      (set! name (luaL_gsub L name sep dirsep)))
+    (luaL_buffinit L buff)
+    (luaL_addgsub buff path LUA_PATH_MARK name)  ; the '?' marks become the name
+    (luaL_addchar buff 0)
+    (let (pathname:(ptr i8) (bytes (luaL_buffaddr buff))  ; the names, writable
+          endpathname:(ptr i8) (unsafe/ptr+ pathname (- (as i64 (luaL_bufflen buff)) 1))
+          filename:(ptr i8) null)
+      (while (!= (set! filename (getnextfilename &pathname endpathname)) null)
+        (when (readable (cstr filename))
+          (return (lua_pushstring L (cstr filename)))))
+      (luaL_pushresult buff)  ; the path, for the message
+      (pusherrornotfound L (lua_tostring L -1))
+      (return (as CStr null)))))
+
+(defn- ll_searchpath (L:(ptr lua_State)):i32
+  (let (f:CStr (searchpath L (luaL_checkstring L 1) (luaL_checkstring L 2)
+                          (luaL_optstring L 3 ".") (luaL_optstring L 4 LUA_DIRSEP)))
+    (when (!= (as ptr f) null)
+      (return 1))
+    (luaL_pushfail L)  ; the message is on the top
+    (lua_insert L -2)
+    (return 2)))
+
+(defn- findfile (L:(ptr lua_State) name:CStr pname:CStr dirsep:CStr):CStr
+  (lua_getfield L (lua_upvalueindex 1) pname)
+  (let (path:CStr (lua_tostring L -1))
+    (when (= (as ptr path) null)
+      (luaL_error L "'package.%s' must be a string" pname))
+    (return (searchpath L name path "." dirsep))))
+
+(defn- checkload (L:(ptr lua_State) stat:bool filename:CStr):i32
+  (when stat
+    (lua_pushstring L filename)  ; the module's second argument
+    (return 2))  ; the open function and the file name
+  (return (luaL_error L "error loading module '%s' from file '%s':\n\t%s"
+                      (lua_tostring L 1) filename (lua_tostring L -1))))
+
+(defn- searcher_Lua (L:(ptr lua_State)):i32
+  (let (name:CStr (luaL_checkstring L 1)
+        filename:CStr (findfile L name "path" LUA_LSUBSEP))
+    (when (= (as ptr filename) null) (return 1))  ; not in this path
+    (return (checkload L (= (luaL_loadfilex L filename "bt") LUA_OK) filename))))
+
+; Looks in 'filename' for the open function of 'modname', dots made '_': for a
+; name "X-Y", luaopen_X, then, for compatibility, luaopen_Y; else
+; luaopen_modname.
+(defn- loadfunc (L:(ptr lua_State) filename:CStr modname:CStr):i32
+  (set! modname (luaL_gsub L modname "." LUA_OFSEP))
+  (let (mark:(ptr i8) (bytes (strchr modname (ch \-))))
+    (when (!= mark null)
+      (let (openfunc:CStr (lua_pushlstring L modname (as usize (byte-diff mark (bytes modname)))))
+        (set! openfunc (lua_pushfstring L "luaopen_%s" openfunc))
+        (let (stat:i32 (lookforfunc L filename openfunc))
+          (when (!= stat ERRFUNC) (return stat))
+          (set! modname (cstr (unsafe/ptr+ mark 1))))))  ; try the old-style name
+    (return (lookforfunc L filename (lua_pushfstring L "luaopen_%s" modname)))))
+
+(defn- searcher_C (L:(ptr lua_State)):i32
+  (let (name:CStr (luaL_checkstring L 1)
+        filename:CStr (findfile L name "cpath" LUA_CSUBSEP))
+    (when (= (as ptr filename) null) (return 1))  ; not in this path
+    (return (checkload L (= (loadfunc L filename name) 0) filename))))
+
+(defn- searcher_Croot (L:(ptr lua_State)):i32
+  (let (name:CStr (luaL_checkstring L 1)
+        p:(ptr i8) (bytes (strchr name (ch \.))))
+    (when (= p null) (return 0))  ; a root
+    (lua_pushlstring L name (as usize (byte-diff p (bytes name))))
+    (let (filename:CStr (findfile L (lua_tostring L -1) "cpath" LUA_CSUBSEP))
+      (when (= (as ptr filename) null) (return 1))  ; the root isn't there
+      (let (stat:i32 (loadfunc L filename name))
+        (when (!= stat 0)
+          (when (!= stat ERRFUNC)
+            (return (checkload L false filename)))  ; a real error
+          (lua_pushfstring L "no module '%s' in file '%s'" name filename)  ; no open function
+          (return 1)))
+      (lua_pushstring L filename)  ; the module's second argument
+      (return 2))))
+
+(defn- searcher_preload (L:(ptr lua_State)):i32
+  (let (name:CStr (luaL_checkstring L 1))
+    (lua_getfield L LUA_REGISTRYINDEX LUA_PRELOAD_TABLE)
+    (when (= (lua_getfield L -1 name) LUA_TNIL)
+      (lua_pushfstring L "no field package.preload['%s']" name)
+      (return 1))
+    (lua_pushliteral L ":preload:")
+    (return 2)))
+
+; Leaves the loader for 'name' and its data on the stack, or raises an error
+; collecting what every searcher said.
+(defn- findloader (L:(ptr lua_State) name:CStr):void
+  (let (msg:&luaL_Buffer (alloca luaL_Buffer))
+    (when (!= (lua_getfield L (lua_upvalueindex 1) "searchers") LUA_TTABLE)  ; at index 3
+      (luaL_error L "'package.searchers' must be a table"))
+    (luaL_buffinit L msg)
+    (luaL_addstring msg "\n\t")  ; the first message's prefix
+    (for (i:lua_Integer 1) true (inc! i)
+      (when (= (lua_rawgeti L 3 i) LUA_TNIL)  ; no more searchers?
+        (lua_pop L 1)
+        (luaL_buffsub msg 2)  ; the last prefix
+        (luaL_pushresult msg)
+        (luaL_error L "module '%s' not found:%s" name (lua_tostring L -1)))
+      (lua_pushstring L name)
+      (lua_call L 1 2)
+      (cond
+        (lua_isfunction L -2) (return)  ; a loader
+        (!= (lua_isstring L -2) 0)  ; a message
+          (do (lua_pop L 1)
+              (luaL_addvalue msg)
+              (luaL_addstring msg "\n\t"))
+        true (lua_pop L 2)))))  ; nothing
+
+(defn- ll_require (L:(ptr lua_State)):i32
+  (let (name:CStr (luaL_checkstring L 1))
+    (lua_settop L 1)  ; LOADED goes at index 2
+    (lua_getfield L LUA_REGISTRYINDEX LUA_LOADED_TABLE)
+    (lua_getfield L 2 name)  ; LOADED[name]
+    (when (!= (lua_toboolean L -1) 0)
+      (return 1))  ; already loaded
+    (lua_pop L 1)
+    (findloader L name)
+    (lua_rotate L -2 1)  ; the loader below its data
+    (lua_pushvalue L 1)  ; the name and
+    (lua_pushvalue L -3)  ; the data are the loader's arguments
+    (lua_call L 2 1)  ; stack: data, result
+    (if (not (lua_isnil L -1))
+      (lua_setfield L 2 name)  ; LOADED[name] = result
+      (lua_pop L 1))
+    (when (= (lua_getfield L 2 name) LUA_TNIL)  ; the module set nothing?
+      (lua_pushboolean L 1)
+      (lua_copy L -1 -2)
+      (lua_setfield L 2 name))  ; LOADED[name] = true
+    (lua_rotate L -2 1)  ; the result, then the data
+    (return 2)))
+
+; package.searchers, each closed over 'package'.
+(defn- createsearcherstable (L:(ptr lua_State)):void
+  (lua_createtable L 4 0)
+  (addsearcher L searcher_preload 1)
+  (addsearcher L searcher_Lua 2)
+  (addsearcher L searcher_C 3)
+  (addsearcher L searcher_Croot 4)
+  (lua_setfield L -2 "searchers"))
+
+(defn- addsearcher (L:(ptr lua_State) f:lua_CFunction i:lua_Integer):void
+  (lua_pushvalue L -2)  ; 'package', the upvalue
+  (lua_pushcclosure L f 1)
+  (lua_rawseti L -2 i))
+
+(defn luaopen_package (L:(ptr lua_State)):i32
+  (luaL_getsubtable L LUA_REGISTRYINDEX CLIBS)  ; create CLIBS
+  (lua_pop L 1)
+  (lua-newlib L
+    ("loadlib" ll_loadlib) ("searchpath" ll_searchpath) ("preload" null) ("cpath" null)
+    ("path" null) ("searchers" null) ("loaded" null))  ; placeholders
+  (createsearcherstable L)
+  (setpath L "path" LUA_PATH_VAR LUA_PATH_DEFAULT)
+  (setpath L "cpath" LUA_CPATH_VAR LUA_CPATH_DEFAULT)
+  (lua_pushliteral L "/\n;\n?\n!\n-\n")  ; the configuration
+  (lua_setfield L -2 "config")
+  (luaL_getsubtable L LUA_REGISTRYINDEX LUA_LOADED_TABLE)
+  (lua_setfield L -2 "loaded")
+  (luaL_getsubtable L LUA_REGISTRYINDEX LUA_PRELOAD_TABLE)
+  (lua_setfield L -2 "preload")
+  (lua_pushglobaltable L)
+  (lua_pushvalue L -2)  ; 'package', require's upvalue
+  (lua-setfuncs L 1 ("require" ll_require))
+  (lua_pop L 1)  ; the global table
+  (return 1))

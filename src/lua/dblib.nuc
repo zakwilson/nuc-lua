@@ -1,0 +1,328 @@
+; The debug library.
+;
+; ldblib.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.dblib)
+(set-ir-prefix "")
+(import-use luacapi)
+(import-use lua.util)
+(import-use "stdio.h")
+(import-use "stdlib.h")
+(import-use "string.h")
+
+; registry[HOOKKEY] maps each thread to its hook function.
+(defconst HOOKKEY "_HOOKKEY")
+
+; L1 may be in any state when it isn't L, so a push onto it must be checked.
+(defn- checkstack (L:(ptr lua_State) L1:(ptr lua_State) n:i32):void
+  (when (and (!= L L1) (= (lua_checkstack L1 n) 0))
+    (luaL_error L "stack overflow")))
+
+(defn- db_getregistry (L:(ptr lua_State)):i32
+  (lua_pushvalue L LUA_REGISTRYINDEX)
+  (return 1))
+
+(defn- db_getmetatable (L:(ptr lua_State)):i32
+  (luaL_checkany L 1)
+  (when (= (lua_getmetatable L 1) 0)
+    (lua_pushnil L))  ; no metatable
+  (return 1))
+
+(defn- db_setmetatable (L:(ptr lua_State)):i32
+  (let (t:i32 (lua_type L 2))
+    (luaL_argexpected L (or (= t LUA_TNIL) (= t LUA_TTABLE)) 2 "nil or table")
+    (lua_settop L 2)
+    (lua_setmetatable L 1)
+    (return 1)))  ; the first argument
+
+(defn- db_getuservalue (L:(ptr lua_State)):i32
+  (let (n:i32 (cast_int (luaL_optinteger L 2 1)))
+    (cond
+      (!= (lua_type L 1) LUA_TUSERDATA) (luaL_pushfail L)
+      (!= (lua_getiuservalue L 1 n) LUA_TNONE)
+        (do (lua_pushboolean L 1)
+            (return 2)))
+    (return 1)))
+
+(defn- db_setuservalue (L:(ptr lua_State)):i32
+  (let (n:i32 (cast_int (luaL_optinteger L 3 1)))
+    (luaL_checktype L 1 LUA_TUSERDATA)
+    (luaL_checkany L 2)
+    (lua_settop L 2)
+    (when (= (lua_setiuservalue L 1 n) 0)
+      (luaL_pushfail L))
+    (return 1)))
+
+; An optional thread as the first argument: sets 'arg' to 1 if it's there, so
+; that the caller can skip it.
+(defn- getthread (L:(ptr lua_State) arg:&i32):(ptr lua_State)
+  (when (lua_isthread L 1)
+    (set! (deref arg) 1)
+    (return (lua_tothread L 1)))
+  (set! (deref arg) 0)
+  (return L))  ; the current thread
+
+; Setting fields of the table on the top, for db_getinfo.
+(defn- settabss (L:(ptr lua_State) k:CStr v:CStr):void
+  (lua_pushstring L v)
+  (lua_setfield L -2 k))
+
+(defn- settabsi (L:(ptr lua_State) k:CStr v:i32):void
+  (lua_pushinteger L (as lua_Integer v))
+  (lua_setfield L -2 k))
+
+(defn- settabsb (L:(ptr lua_State) k:CStr v:i32):void
+  (lua_pushboolean L v)
+  (lua_setfield L -2 k))
+
+; lua_getinfo may have pushed an object before the result table was made; this
+; brings it above the table and stores it there.
+(defn- treatstackoption (L:(ptr lua_State) L1:(ptr lua_State) fname:CStr):void
+  (if (= L L1)
+    (lua_rotate L -2 1)  ; swap the object and the table
+    (lua_xmove L1 L 1))  ; the object, onto this stack
+  (lua_setfield L -2 fname))
+
+; lua_getinfo's results in a new table. L1 needs room for an optional input and
+; two optional outputs.
+(defn- db_getinfo (L:(ptr lua_State)):i32
+  (let (ar:&lua_Debug (alloca lua_Debug)
+        arg:i32 0
+        L1:(ptr lua_State) (getthread L &arg)
+        options:CStr (luaL_optstring L (+ arg 2) "flnSrtu"))
+    (checkstack L L1 3)
+    (luaL_argcheck L (!= (aref (bytes options) 0) (ch \>)) (+ arg 2) "invalid option '>'")
+    (if (lua_isfunction L (+ arg 1))  ; about a function?
+      (do (set! options (lua_pushfstring L ">%s" options))
+          (lua_pushvalue L (+ arg 1))  ; the function, onto L1
+          (lua_xmove L L1 1))
+      (when (= (lua_getstack L1 (cast_int (luaL_checkinteger L (+ arg 1))) ar) 0)  ; a level
+        (luaL_pushfail L)  ; out of range
+        (return 1)))
+    (when (= (lua_getinfo L1 options ar) 0)
+      (return (luaL_argerror L (+ arg 2) "invalid option")))
+    (lua_newtable L)  ; for the results
+    (when (!= (strchr options (ch \S)) null)
+      (lua_pushlstring L (cstr (ar 'source)) (ar 'srclen))
+      (lua_setfield L -2 "source")
+      (settabss L "short_src" (cstr (ref ar 'short_src)))
+      (settabsi L "linedefined" (ar 'linedefined))
+      (settabsi L "lastlinedefined" (ar 'lastlinedefined))
+      (settabss L "what" (cstr (ar 'what))))
+    (when (!= (strchr options (ch \l)) null)
+      (settabsi L "currentline" (ar 'currentline)))
+    (when (!= (strchr options (ch \u)) null)
+      (settabsi L "nups" (as i32 (ar 'nups)))
+      (settabsi L "nparams" (as i32 (ar 'nparams)))
+      (settabsb L "isvararg" (as i32 (ar 'isvararg))))
+    (when (!= (strchr options (ch \n)) null)
+      (settabss L "name" (cstr (ar 'name)))
+      (settabss L "namewhat" (cstr (ar 'namewhat))))
+    (when (!= (strchr options (ch \r)) null)
+      (settabsi L "ftransfer" (as i32 (ar 'ftransfer)))
+      (settabsi L "ntransfer" (as i32 (ar 'ntransfer))))
+    (when (!= (strchr options (ch \t)) null)
+      (settabsb L "istailcall" (as i32 (ar 'istailcall)))
+      (settabsi L "extraargs" (ar 'extraargs)))
+    (when (!= (strchr options (ch \L)) null)
+      (treatstackoption L L1 "activelines"))
+    (when (!= (strchr options (ch \f)) null)
+      (treatstackoption L L1 "func"))
+    (return 1)))
+
+(defn- db_getlocal (L:(ptr lua_State)):i32
+  (let (arg:i32 0
+        L1:(ptr lua_State) (getthread L &arg)
+        nvar:i32 (cast_int (luaL_checkinteger L (+ arg 2))))  ; the local's index
+    (when (lua_isfunction L (+ arg 1))  ; a function?
+      (lua_pushvalue L (+ arg 1))
+      (lua_pushstring L (lua_getlocal L null nvar))  ; its parameter's name
+      (return 1))  ; only the name: there is no value
+    (let (ar:&lua_Debug (alloca lua_Debug)
+          level:i32 (cast_int (luaL_checkinteger L (+ arg 1))))
+      (when (= (lua_getstack L1 level ar) 0)
+        (return (luaL_argerror L (+ arg 1) "level out of range")))
+      (checkstack L L1 1)
+      (let (name:CStr (lua_getlocal L1 ar nvar))
+        (when (= (as ptr name) null)
+          (luaL_pushfail L)  ; no name, nor value
+          (return 1))
+        (lua_xmove L1 L 1)  ; the value
+        (lua_pushstring L name)
+        (lua_rotate L -2 1)  ; name first
+        (return 2)))))
+
+(defn- db_setlocal (L:(ptr lua_State)):i32
+  (let (arg:i32 0
+        L1:(ptr lua_State) (getthread L &arg)
+        ar:&lua_Debug (alloca lua_Debug)
+        level:i32 (cast_int (luaL_checkinteger L (+ arg 1)))
+        nvar:i32 (cast_int (luaL_checkinteger L (+ arg 2))))
+    (when (= (lua_getstack L1 level ar) 0)
+      (return (luaL_argerror L (+ arg 1) "level out of range")))
+    (luaL_checkany L (+ arg 3))
+    (lua_settop L (+ arg 3))
+    (checkstack L L1 1)
+    (lua_xmove L L1 1)
+    (let (name:CStr (lua_setlocal L1 ar nvar))
+      (when (= (as ptr name) null)
+        (lua_pop L1 1))  ; lua_setlocal didn't take the value
+      (lua_pushstring L name)
+      (return 1))))
+
+; Gets or sets an upvalue of a closure.
+(defn- auxupvalue (L:(ptr lua_State) get:i32):i32
+  (let (n:i32 (cast_int (luaL_checkinteger L 2)))  ; the upvalue's index
+    (luaL_checktype L 1 LUA_TFUNCTION)
+    (let (name:CStr (if (!= get 0) (lua_getupvalue L 1 n) (lua_setupvalue L 1 n)))
+      (when (= (as ptr name) null) (return 0))
+      (lua_pushstring L name)
+      (lua_insert L (- 0 (+ get 1)))  ; a no-op for a set
+      (return (+ get 1)))))
+
+(defn- db_getupvalue (L:(ptr lua_State)):i32
+  (return (auxupvalue L 1)))
+
+(defn- db_setupvalue (L:(ptr lua_State)):i32
+  (luaL_checkany L 3)
+  (return (auxupvalue L 0)))
+
+; The id of an upvalue of a closure, which must exist when 'pnup' is given.
+(defn- checkupval (L:(ptr lua_State) argf:i32 argnup:i32 pnup:(ptr i32)):ptr
+  (let (nup:i32 (cast_int (luaL_checkinteger L argnup)))
+    (luaL_checktype L argf LUA_TFUNCTION)
+    (let (id:ptr (lua_upvalueid L argf nup))
+      (when (!= pnup null)
+        (luaL_argcheck L (!= id null) argnup "invalid upvalue index")
+        (set! (deref pnup) nup))
+      (return id))))
+
+(defn- db_upvalueid (L:(ptr lua_State)):i32
+  (let (id:ptr (checkupval L 1 2 null))
+    (if (!= id null)
+      (lua_pushlightuserdata L id)
+      (luaL_pushfail L))
+    (return 1)))
+
+(defn- db_upvaluejoin (L:(ptr lua_State)):i32
+  (let (n1:i32 0
+        n2:i32 0)
+    (checkupval L 1 2 &n1)
+    (checkupval L 3 4 &n2)
+    (luaL_argcheck L (= (lua_iscfunction L 1) 0) 1 "Lua function expected")
+    (luaL_argcheck L (= (lua_iscfunction L 3) 0) 3 "Lua function expected")
+    (lua_upvaluejoin L 1 n1 3 n2)
+    (return 0)))
+
+(defvar- hooknames:(array CStr 5) (array CStr "call" "return" "line" "count" "tail call"))
+
+; Calls the hook function the hook table holds for this thread, if any.
+(defn- hookf (L:(ptr lua_State) ar:(ptr lua_Debug)):void
+  (lua_getfield L LUA_REGISTRYINDEX HOOKKEY)
+  (lua_pushthread L)
+  (when (= (lua_rawget L -2) LUA_TFUNCTION)  ; a hook function?
+    (lua_pushstring L (aref hooknames (ar 'event)))
+    (if (>= (ar 'currentline) 0)
+      (lua_pushinteger L (as lua_Integer (ar 'currentline)))
+      (lua_pushnil L))
+    (lua_call L 2 0)))
+
+; sethook's string mask as a bit mask.
+(defn- makemask (smask:CStr count:i32):i32
+  (let (mask:i32 0)
+    (when (!= (strchr smask (ch \c)) null) (set! mask (bit-or mask LUA_MASKCALL)))
+    (when (!= (strchr smask (ch \r)) null) (set! mask (bit-or mask LUA_MASKRET)))
+    (when (!= (strchr smask (ch \l)) null) (set! mask (bit-or mask LUA_MASKLINE)))
+    (when (> count 0) (set! mask (bit-or mask LUA_MASKCOUNT)))
+    (return mask)))
+
+; A bit mask as gethook's string mask.
+(defn- unmakemask (mask:i32 smask:(ptr i8)):CStr
+  (let (i:i32 0)
+    (when (!= (bit-and mask LUA_MASKCALL) 0) (set! (aref smask i) (ch \c)) (inc! i))
+    (when (!= (bit-and mask LUA_MASKRET) 0) (set! (aref smask i) (ch \r)) (inc! i))
+    (when (!= (bit-and mask LUA_MASKLINE) 0) (set! (aref smask i) (ch \l)) (inc! i))
+    (set! (aref smask i) 0)
+    (return (cstr smask))))
+
+(defn- db_sethook (L:(ptr lua_State)):i32
+  (let (arg:i32 0
+        L1:(ptr lua_State) (getthread L &arg)
+        func:lua_Hook null
+        mask:i32 0
+        count:i32 0)
+    (if (lua_isnoneornil L (+ arg 1))  ; no hook: turn hooks off
+      (lua_settop L (+ arg 1))
+      (let (smask:CStr (luaL_checkstring L (+ arg 2)))
+        (luaL_checktype L (+ arg 1) LUA_TFUNCTION)
+        (set! count (cast_int (luaL_optinteger L (+ arg 3) 0)))
+        (set! func hookf)
+        (set! mask (makemask smask count))))
+    (when (= (luaL_getsubtable L LUA_REGISTRYINDEX HOOKKEY) 0)
+      ; a new table: weak keys, being its own metatable
+      (lua_pushliteral L "k")
+      (lua_setfield L -2 "__mode")
+      (lua_pushvalue L -1)
+      (lua_setmetatable L -2))
+    (checkstack L L1 1)
+    (lua_pushthread L1)
+    (lua_xmove L1 L 1)  ; the key: the thread
+    (lua_pushvalue L (+ arg 1))  ; the value: the hook function
+    (lua_rawset L -3)  ; hooktable[L1] = hook
+    (lua_sethook L1 func mask count)
+    (return 0)))
+
+(defn- db_gethook (L:(ptr lua_State)):i32
+  (let (arg:i32 0
+        L1:(ptr lua_State) (getthread L &arg)
+        buff:(ptr i8) (alloca i8 5)
+        mask:i32 (lua_gethookmask L1)
+        hook:lua_Hook (lua_gethook L1))
+    (cond
+      (= hook null)  ; no hook?
+        (do (luaL_pushfail L)
+            (return 1))
+      (!= hook hookf)  ; set from C
+        (lua_pushliteral L "external hook")
+      true  ; the hook table exists
+        (do (lua_getfield L LUA_REGISTRYINDEX HOOKKEY)
+            (checkstack L L1 1)
+            (lua_pushthread L1)
+            (lua_xmove L1 L 1)
+            (lua_rawget L -2)  ; hooktable[L1]
+            (lua_remove L -2)))  ; the hook table
+    (lua_pushstring L (unmakemask mask buff))
+    (lua_pushinteger L (as lua_Integer (lua_gethookcount L1)))
+    (return 3)))
+
+(defn- db_debug (L:(ptr lua_State)):i32
+  (let (buffer:(ptr i8) (alloca i8 250))
+    (while true
+      (lua_writestringerror "%s" "lua_debug> ")
+      (when (or (= (fgets buffer 250 stdin) null) (= (strcmp (cstr buffer) "cont\n") 0))
+        (return 0))
+      (when (or (!= (luaL_loadbufferx L (cstr buffer) (strlen (cstr buffer)) "=(debug command)" "t") 0)
+                (!= (lua_pcall L 0 0 0) 0))
+        (lua_writestringerror "%s\n" (luaL_tolstring L -1 null)))
+      (lua_settop L 0)))  ; drop any results
+  (return 0))
+
+(defn- db_traceback (L:(ptr lua_State)):i32
+  (let (arg:i32 0
+        L1:(ptr lua_State) (getthread L &arg)
+        msg:CStr (lua_tostring L (+ arg 1)))
+    (if (and (= (as ptr msg) null) (not (lua_isnoneornil L (+ arg 1))))  ; not a string?
+      (lua_pushvalue L (+ arg 1))  ; returned untouched
+      (let (level:i32 (cast_int (luaL_optinteger L (+ arg 2) (if (= L L1) 1 0))))
+        (luaL_traceback L L1 msg level)))
+    (return 1)))
+
+(defn luaopen_debug (L:(ptr lua_State)):i32
+  (lua-newlib L
+    ("debug" db_debug) ("getuservalue" db_getuservalue) ("gethook" db_gethook)
+    ("getinfo" db_getinfo) ("getlocal" db_getlocal) ("getregistry" db_getregistry)
+    ("getmetatable" db_getmetatable) ("getupvalue" db_getupvalue)
+    ("upvaluejoin" db_upvaluejoin) ("upvalueid" db_upvalueid)
+    ("setuservalue" db_setuservalue) ("sethook" db_sethook) ("setlocal" db_setlocal)
+    ("setmetatable" db_setmetatable) ("setupvalue" db_setupvalue)
+    ("traceback" db_traceback))
+  (return 1))

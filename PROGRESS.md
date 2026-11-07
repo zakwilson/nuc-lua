@@ -27,7 +27,7 @@ object model, the compiler, execution state, the collector and the VM (§10).
 |---|---|
 | 0 Setup | done: env and setup scripts, reference and suite, spike, probes, hybrid build |
 | 1 Binding and first library | done: `capi/` (both layers), layout gate, `libs/mayi`, `tests/capi/capi.c`, stock column |
-| 2 Host and libraries | in progress: `lua.c`, `lauxlib.c`, `lbaselib`, `lcorolib`, `lmathlib`, `lutf8lib` ported |
+| 2 Host and libraries | in progress: `lua.c`, `lauxlib.c`, `linit` and every library but `lstrlib` ported |
 | 3–11 | not started |
 
 ### Nucleus
@@ -45,8 +45,9 @@ Compiler: `.nucleus-work` on `lua-bugfixes` (see CLAUDE.md).
 ### Still stock
 
 Everything but `lua.c` (`src/main.nuc`, namespace `lua.host`), `lauxlib.c`
-(`src/lua/aux.nuc`, `lua.aux`) and the libraries in `src/lua/` (`baselib`, `corolib`,
-`mathlib`, `utf8lib`). A library's `luaL_Reg` table is built on the stack by
+(`src/lua/aux.nuc`, `lua.aux`), `linit.c` (`src/lua/init.nuc`) and the libraries in
+`src/lua/`: `baselib`, `corolib`, `dblib`, `iolib`, `loadlib`, `mathlib`, `oslib`,
+`tablib`, `utf8lib`. A library's `luaL_Reg` table is built on the stack by
 `lua.util/lua-newlib` (ISSUE-004). `luac.c` isn't built yet. `src/lua/util.nuc` holds what
 the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `cstr`,
 `errno`, `set-errno`, `byte-diff`, the `cast_*` family).
@@ -78,8 +79,7 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
 
 ## Next
 
-M2: the libraries, one at a time, each followed by `check-suite.sh`: `ldblib`,
-`liolib`, `loadlib`, `loslib`, `lstrlib`, `ltablib`, `linit`. Then the M2 gate and commit.
+M2: `lstrlib`, then the M2 gate and commit. Then the M2 gate and commit.
 
 ## Open questions
 

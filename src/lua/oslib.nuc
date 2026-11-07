@@ -1,0 +1,215 @@
+; The operating system library, in its POSIX configuration (LUA_USE_LINUX).
+;
+; loslib.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.oslib)
+(set-ir-prefix "")
+(import-use luacapi)
+(import-use lua.util)
+(import-use "errno.h")
+(import-use "limits.h")
+(import-use "locale.h")
+(import-use "stdlib.h")
+(import-use "string.h")
+(import-use "time.h")
+(import-use "unistd.h")
+
+; strftime's conversions, grouped by length; each group after the first starts
+; with a '|'.
+(defconst LUA_STRFTIMEOPTIONS
+  "aAbBcCdDeFgGhHIjmMnprRStTuUVwWxXyYzZ%||EcECExEXEyEYOdOeOHOIOmOMOSOuOUOVOwOWOy")
+
+(defconst LUA_TMPNAMBUFSIZE 32)
+(defconst LUA_TMPNAMTEMPLATE "/tmp/lua_XXXXXX")
+
+(defn- os_execute (L:(ptr lua_State)):i32
+  (let (cmd:CStr (luaL_optstring L 1 (as CStr null)))
+    (set-errno 0)
+    (let (stat:i32 (system cmd))
+      (when (!= (as ptr cmd) null)
+        (return (luaL_execresult L stat)))
+      (lua_pushboolean L stat)  ; whether there is a shell
+      (return 1))))
+
+(defn- os_remove (L:(ptr lua_State)):i32
+  (let (filename:CStr (luaL_checkstring L 1))
+    (set-errno 0)
+    (return (luaL_fileresult L (if (= (remove filename) 0) 1 0) filename))))
+
+(defn- os_rename (L:(ptr lua_State)):i32
+  (let (fromname:CStr (luaL_checkstring L 1)
+        toname:CStr (luaL_checkstring L 2))
+    (set-errno 0)
+    (return (luaL_fileresult L (if (= (rename fromname toname) 0) 1 0) (as CStr null)))))
+
+(defn- os_tmpname (L:(ptr lua_State)):i32
+  (let (buff:(ptr i8) (alloca i8 LUA_TMPNAMBUFSIZE))
+    (strcpy buff LUA_TMPNAMTEMPLATE)
+    (let (fd:i32 (mkstemp buff))
+      (when (= fd -1)
+        (return (luaL_error L "unable to generate a unique filename")))
+      (close fd))
+    (lua_pushstring L (cstr buff))
+    (return 1)))
+
+(defn- os_getenv (L:(ptr lua_State)):i32
+  (lua_pushstring L (getenv (luaL_checkstring L 1)))  ; nil when it's unset
+  (return 1))
+
+(defn- os_clock (L:(ptr lua_State)):i32
+  (lua_pushnumber L (/ (unsafe/cast lua_Number (clock)) (unsafe/cast lua_Number CLOCKS_PER_SEC)))
+  (return 1))
+
+; ---- Dates: { year=%Y, month=%m, day=%d, hour=%H, min=%M, sec=%S, wday=%w+1,
+; yday=%j, isdst=? } ----
+
+; With time as a lua_Integer no field can overflow, so C's check isn't needed.
+(defn- setfield (L:(ptr lua_State) key:CStr value:i32 delta:i32):void
+  (lua_pushinteger L (+ (as lua_Integer value) delta))
+  (lua_setfield L -2 key))
+
+(defn- setboolfield (L:(ptr lua_State) key:CStr value:i32):void
+  (when (< value 0) (return))  ; undefined: no field
+  (lua_pushboolean L value)
+  (lua_setfield L -2 key))
+
+; Sets the fields of the table on the top from 'stm'.
+(defn- setallfields (L:(ptr lua_State) stm:(ptr tm)):void
+  (setfield L "year" (stm 'tm_year) 1900)
+  (setfield L "month" (stm 'tm_mon) 1)
+  (setfield L "day" (stm 'tm_mday) 0)
+  (setfield L "hour" (stm 'tm_hour) 0)
+  (setfield L "min" (stm 'tm_min) 0)
+  (setfield L "sec" (stm 'tm_sec) 0)
+  (setfield L "yday" (stm 'tm_yday) 1)
+  (setfield L "wday" (stm 'tm_wday) 1)
+  (setboolfield L "isdst" (stm 'tm_isdst)))
+
+(defn- getboolfield (L:(ptr lua_State) key:CStr):i32
+  (let (res:i32 (if (= (lua_getfield L -1 key) LUA_TNIL) -1 (lua_toboolean L -1)))
+    (lua_pop L 1)
+    (return res)))
+
+(defn- getfield (L:(ptr lua_State) key:CStr d:i32 delta:i32):i32
+  (let (isnum:i32 0
+        t:i32 (lua_getfield L -1 key)
+        res:lua_Integer (lua_tointegerx L -1 &isnum))
+    (if (= isnum 0)  ; not an integer?
+      (cond
+        (!= t LUA_TNIL) (return (luaL_error L "field '%s' is not an integer" key))
+        (< d 0) (return (luaL_error L "field '%s' missing in date table" key))  ; no default
+        true (set! res (as lua_Integer d)))
+      (do (when (not (if (>= res 0)
+                       (<= (- res delta) INT_MAX)
+                       (<= (+ INT_MIN delta) res)))
+            (return (luaL_error L "field '%s' is out-of-bound" key)))
+          (set! res (- res delta))))
+    (lua_pop L 1)
+    (return (cast_int res))))
+
+; Copies the conversion at 'conv' into 'buff' if it's a valid one, and returns
+; what follows it.
+(defn- checkoption (L:(ptr lua_State) conv:(ptr i8) convlen:usize buff:(ptr i8)):(ptr i8)
+  (let (option:(ptr i8) (bytes LUA_STRFTIMEOPTIONS)
+        oplen:ui32 1)  ; the length of the options being checked
+    (while (and (!= (deref option) 0) (<= (as usize oplen) convlen))
+      (cond
+        (= (deref option) (ch \|)) (inc! oplen)  ; the next group is one longer
+        (= (memcmp conv option (as usize oplen)) 0)
+          (do (memcpy buff conv (as usize oplen))
+              (set! (aref buff oplen) 0)
+              (return (unsafe/ptr+ conv (as i64 oplen)))))
+      (set! option (unsafe/ptr+ option (as i64 oplen))))
+    (luaL_argerror L 1 (lua_pushfstring L "invalid conversion specifier '%%%s'" conv))
+    (return conv)))
+
+; time_t is a lua_Integer here, so every integer fits.
+(defn- l_checktime (L:(ptr lua_State) arg:i32):time_t
+  (return (luaL_checkinteger L arg)))
+
+(defconst SIZETIMEFMT 250)  ; the most one strftime conversion may produce
+
+(defn- os_date (L:(ptr lua_State)):i32
+  (let (slen:usize 0
+        s:(ptr i8) (bytes (luaL_optlstring L 1 "%c" &slen))
+        t:time_t (luaL_opt L l_checktime 2 (time null))
+        se:(ptr i8) (unsafe/ptr+ s (as i64 slen))  ; the end
+        tmr:&tm (alloca tm)
+        stm:(ptr tm) null)
+    (if (= (deref s) (ch \!))  ; UTC?
+      (do (set! stm (gmtime_r &t tmr))
+          (set! s (unsafe/ptr+ s 1)))
+      (set! stm (localtime_r &t tmr)))
+    (when (= stm null)
+      (return (luaL_error L "date result cannot be represented in this installation")))
+    (if (= (strcmp (cstr s) "*t") 0)
+      (do (lua_createtable L 0 9)  ; nine fields
+          (setallfields L stm))
+      (let (cc:(ptr i8) (alloca i8 4)  ; one conversion specifier
+            b:&luaL_Buffer (alloca luaL_Buffer))
+        (set! (aref cc 0) (ch \%))
+        (luaL_buffinit L b)
+        (while (< (byte-diff s se) 0)
+          (if (!= (deref s) (ch \%))  ; not a conversion?
+            (do (luaL_addchar b (deref s))
+                (set! s (unsafe/ptr+ s 1)))
+            (let (buff:CStr (luaL_prepbuffsize b SIZETIMEFMT))
+              (set! s (unsafe/ptr+ s 1))  ; past the '%'
+              (set! s (checkoption L s (as usize (byte-diff se s)) (unsafe/ptr+ cc 1)))
+              (luaL_addsize b (strftime (bytes buff) SIZETIMEFMT (cstr cc) stm)))))
+        (luaL_pushresult b)))
+    (return 1)))
+
+(defn- os_time (L:(ptr lua_State)):i32
+  (let (t:time_t 0)
+    (if (lua_isnoneornil L 1)  ; no arguments?
+      (set! t (time null))  ; now
+      (let (ts:&tm (alloca tm))
+        (luaL_checktype L 1 LUA_TTABLE)
+        (lua_settop L 1)  ; the table on the top
+        (set! (ts 'tm_year) (getfield L "year" -1 1900))
+        (set! (ts 'tm_mon) (getfield L "month" -1 1))
+        (set! (ts 'tm_mday) (getfield L "day" -1 0))
+        (set! (ts 'tm_hour) (getfield L "hour" 12 0))
+        (set! (ts 'tm_min) (getfield L "min" 0 0))
+        (set! (ts 'tm_sec) (getfield L "sec" 0 0))
+        (set! (ts 'tm_isdst) (getboolfield L "isdst"))
+        (set! t (mktime ts))
+        (setallfields L ts)))  ; the normalized values
+    (when (= t -1)
+      (return (luaL_error L "time result cannot be represented in this installation")))
+    (lua_pushinteger L t)
+    (return 1)))
+
+(defn- os_difftime (L:(ptr lua_State)):i32
+  (let (t1:time_t (l_checktime L 1)
+        t2:time_t (l_checktime L 2))
+    (lua_pushnumber L (difftime t1 t2))
+    (return 1)))
+
+(defvar- lc-cat:(array i32 6)
+  (array i32 LC_ALL LC_COLLATE LC_CTYPE LC_MONETARY LC_NUMERIC LC_TIME))
+(defvar- lc-catnames:(array CStr 7)
+  (array CStr "all" "collate" "ctype" "monetary" "numeric" "time" (as CStr null)))
+
+(defn- os_setlocale (L:(ptr lua_State)):i32
+  (let (l:CStr (luaL_optstring L 1 (as CStr null))
+        op:i32 (luaL_checkoption L 2 "all" lc-catnames))
+    (lua_pushstring L (setlocale (aref lc-cat op) l))
+    (return 1)))
+
+(defn- os_exit (L:(ptr lua_State)):i32
+  (let (status:i32 (if (lua_isboolean L 1)
+                     (if (!= (lua_toboolean L 1) 0) EXIT_SUCCESS EXIT_FAILURE)
+                     (cast_int (luaL_optinteger L 1 EXIT_SUCCESS))))
+    (when (!= (lua_toboolean L 2) 0)
+      (lua_close L))
+    (exit status)
+    (return 0)))
+
+(defn luaopen_os (L:(ptr lua_State)):i32
+  (lua-newlib L
+    ("clock" os_clock) ("date" os_date) ("difftime" os_difftime)
+    ("execute" os_execute) ("exit" os_exit) ("getenv" os_getenv) ("remove" os_remove)
+    ("rename" os_rename) ("setlocale" os_setlocale) ("time" os_time)
+    ("tmpname" os_tmpname))
+  (return 1))

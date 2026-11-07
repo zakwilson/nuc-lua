@@ -1,0 +1,263 @@
+; The table library.
+;
+; ltablib.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.tablib)
+(set-ir-prefix "")
+(import-use luacapi)
+(import-use lua.util)
+(import-use "limits.h")
+(import-use "string.h")
+
+; What an object must support to stand in for a table.
+(defconst TAB_R 1)  ; read
+(defconst TAB_W 2)  ; write
+(defconst TAB_L 4)  ; length
+(defconst TAB_RW 3)
+
+(defn- checkfield (L:(ptr lua_State) key:CStr n:i32):bool
+  (lua_pushstring L key)
+  (return (!= (lua_rawget L (- 0 n)) LUA_TNIL)))
+
+; Checks that 'arg' is a table, or has a metatable with the metamethods 'what'
+; needs.
+(defn- checktab (L:(ptr lua_State) arg:i32 what:i32):void
+  (let (tp:i32 (lua_type L arg))
+    (when (!= tp LUA_TTABLE)
+      (let (n:i32 1)  ; how many to pop
+        (if (and (!= (lua_getmetatable L arg) 0)
+                 (or (= (bit-and what TAB_R) 0) (checkfield L "__index" (inc! n)))
+                 (or (= (bit-and what TAB_W) 0) (checkfield L "__newindex" (inc! n)))
+                 (or (= (bit-and what TAB_L) 0)
+                     (= tp LUA_TSTRING)  ; a string has a length without __len
+                     (checkfield L "__len" (inc! n))))
+          (lua_pop L n)  ; the metatable and the metamethods
+          (luaL_checktype L arg LUA_TTABLE))))))  ; raise the error
+
+(defn- aux_getn (L:(ptr lua_State) n:i32 w:i32):lua_Integer
+  (checktab L n (bit-or w TAB_L))
+  (return (luaL_len L n)))
+
+(defn- tcreate (L:(ptr lua_State)):i32
+  (let (sizeseq:lua_Unsigned (l_castS2U (luaL_checkinteger L 1))
+        sizerest:lua_Unsigned (l_castS2U (luaL_optinteger L 2 0)))
+    (luaL_argcheck L (<= sizeseq INT_MAX) 1 "out of range")
+    (luaL_argcheck L (<= sizerest INT_MAX) 2 "out of range")
+    (lua_createtable L (cast_int sizeseq) (cast_int sizerest))
+    (return 1)))
+
+(defn- tinsert (L:(ptr lua_State)):i32
+  (let (e:lua_Integer (luaL_intop + (aux_getn L 1 TAB_RW) 1)  ; the first empty slot
+        pos:lua_Integer 0
+        nargs:i32 (lua_gettop L))
+    (cond
+      (= nargs 2) (set! pos e)  ; at the end
+      (= nargs 3)
+        (do (set! pos (luaL_checkinteger L 2))
+            (luaL_argcheck L (< (- (l_castS2U pos) 1) (l_castS2U e)) 2  ; pos in [1, e]?
+                           "position out of bounds")
+            (for (i:lua_Integer e) (> i pos) (dec! i)  ; move the rest up
+              (lua_geti L 1 (- i 1))
+              (lua_seti L 1 i)))  ; t[i] = t[i - 1]
+      true (return (luaL_error L "wrong number of arguments to 'insert'")))
+    (lua_seti L 1 pos)  ; t[pos] = v
+    (return 0)))
+
+(defn- tremove (L:(ptr lua_State)):i32
+  (let (size:lua_Integer (aux_getn L 1 TAB_RW)
+        pos:lua_Integer (luaL_optinteger L 2 size))
+    (when (!= pos size)  ; a given position must be in [1, size + 1]
+      (luaL_argcheck L (<= (- (l_castS2U pos) 1) (l_castS2U size)) 2
+                     "position out of bounds"))
+    (lua_geti L 1 pos)  ; the result
+    (while (< pos size)
+      (lua_geti L 1 (+ pos 1))
+      (lua_seti L 1 pos)  ; t[pos] = t[pos + 1]
+      (inc! pos))
+    (lua_pushnil L)
+    (lua_seti L 1 pos)  ; remove t[pos]
+    (return 1)))
+
+; Copies a1[f..e] to tt[t..]. In increasing order when it can, which rehashes
+; better: when the ranges don't overlap that way, or the tables differ.
+(defn- tmove (L:(ptr lua_State)):i32
+  (let (f:lua_Integer (luaL_checkinteger L 2)
+        e:lua_Integer (luaL_checkinteger L 3)
+        t:lua_Integer (luaL_checkinteger L 4)
+        tt:i32 (if (lua_isnoneornil L 5) 1 5))  ; the destination
+    (checktab L 1 TAB_R)
+    (checktab L tt TAB_W)
+    (when (>= e f)  ; anything to move?
+      (luaL_argcheck L (or (> f 0) (< e (+ LUA_MAXINTEGER f))) 3 "too many elements to move")
+      (let (n:lua_Integer (+ (- e f) 1))
+        (luaL_argcheck L (<= t (+ (- LUA_MAXINTEGER n) 1)) 4 "destination wrap around")
+        (if (or (> t e) (<= t f) (and (!= tt 1) (= (lua_compare L 1 tt LUA_OPEQ) 0)))
+          (for (i:lua_Integer 0) (< i n) (inc! i)
+            (lua_geti L 1 (+ f i))
+            (lua_seti L tt (+ t i)))
+          (for (i:lua_Integer (- n 1)) (>= i 0) (dec! i)
+            (lua_geti L 1 (+ f i))
+            (lua_seti L tt (+ t i))))))
+    (lua_pushvalue L tt)  ; the destination table
+    (return 1)))
+
+(defn- addfield (L:(ptr lua_State) b:(ptr luaL_Buffer) i:lua_Integer):void
+  (lua_geti L 1 i)
+  (when (= (lua_isstring L -1) 0)
+    (luaL_error L "invalid value (%s) at index %I in table for 'concat'"
+                (luaL_typename L -1) i))
+  (luaL_addvalue b))
+
+(defn- tconcat (L:(ptr lua_State)):i32
+  (let (b:&luaL_Buffer (alloca luaL_Buffer)
+        last:lua_Integer (aux_getn L 1 TAB_R)
+        lsep:usize 0
+        sep:CStr (luaL_optlstring L 2 "" &lsep)
+        i:lua_Integer (luaL_optinteger L 3 1))
+    (set! last (luaL_optinteger L 4 last))
+    (luaL_buffinit L b)
+    (while (< i last)
+      (addfield L b i)
+      (luaL_addlstring b sep lsep)
+      (inc! i))
+    (when (= i last)  ; the last value, unless the interval was empty
+      (addfield L b i))
+    (luaL_pushresult b)
+    (return 1)))
+
+; ---- pack and unpack ----
+
+(defn- tpack (L:(ptr lua_State)):i32
+  (let (n:i32 (lua_gettop L))
+    (lua_createtable L n 1)
+    (lua_insert L 1)  ; the table, below the elements
+    (for (i:i32 n) (>= i 1) (dec! i)
+      (lua_seti L 1 (as lua_Integer i)))
+    (lua_pushinteger L (as lua_Integer n))
+    (lua_setfield L 1 "n")  ; t.n
+    (return 1)))
+
+(defn- tunpack (L:(ptr lua_State)):i32
+  (let (len:lua_Integer (aux_getn L 1 TAB_R)
+        i:lua_Integer (luaL_optinteger L 2 1)
+        e:lua_Integer (luaL_opt L luaL_checkinteger 3 len))
+    (when (> i e) (return 0))  ; an empty range
+    (let (n:lua_Unsigned (- (l_castS2U e) (l_castS2U i)))  ; the count, minus 1
+      (when (or (>= n INT_MAX) (= (lua_checkstack L (cast_int (inc! n))) 0))
+        (return (luaL_error L "too many results to unpack")))
+      (while (< i e)  ; up to e - 1, so as not to overflow
+        (lua_geti L 1 i)
+        (inc! i))
+      (lua_geti L 1 e)
+      (return (cast_int n)))))
+
+; ---- Quicksort (from Sedgewick, "Algorithms in Modula-3", 1993) ----
+
+; Indices stay below INT_MAX, so they fit a lua_Integer either way.
+(deftype IdxT ui32)
+
+(defmacro- geti (L idt idx) `(lua_geti ~L ~idt (as lua_Integer ~idx)))
+(defmacro- seti (L idt idx) `(lua_seti ~L ~idt (as lua_Integer ~idx)))
+
+(defconst RANLIMIT 100)  ; above this many, a pivot may be randomized
+
+(defn- set2 (L:(ptr lua_State) i:IdxT j:IdxT):void
+  (seti L 1 i)
+  (seti L 1 j))
+
+; Whether the value at 'a' sorts before the one at 'b'.
+(defn- sort_comp (L:(ptr lua_State) a:i32 b:i32):bool
+  (when (lua_isnil L 2)  ; no function?
+    (return (!= (lua_compare L a b LUA_OPLT) 0)))
+  (lua_pushvalue L 2)
+  (lua_pushvalue L (- a 1))  ; past the function
+  (lua_pushvalue L (- b 2))  ; past the function and 'a'
+  (lua_call L 2 1)
+  (let (res:bool (!= (lua_toboolean L -1) 0))
+    (lua_pop L 1)
+    (return res)))
+
+; Partitions around the pivot P on the top, given a[lo] <= P == a[up-1] <= a[up].
+; Leaves a[lo..i-1] <= a[i] == P <= a[i+1..up] and returns i.
+(defn- partition (L:(ptr lua_State) lo:IdxT up:IdxT):IdxT
+  (let (i:IdxT lo  ; incremented before its first use
+        j:IdxT (- up 1))  ; decremented before its first use
+    (while true  ; invariant: a[lo..i] <= P <= a[j..up]
+      (while (do (geti L 1 (inc! i)) (sort_comp L -1 -2))  ; while a[i] < P
+        (when (= i (- up 1))  ; a[up-1] < P == a[up-1]
+          (luaL_error L "invalid order function for sorting"))
+        (lua_pop L 1))
+      ; a[i] >= P and a[lo..i-1] < P
+      (while (do (geti L 1 (dec! j)) (sort_comp L -3 -1))  ; while P < a[j]
+        (when (< j i)  ; contradicts the line above
+          (luaL_error L "invalid order function for sorting"))
+        (lua_pop L 1))
+      ; a[j] <= P and a[j+1..up] >= P
+      (when (< j i)  ; nothing out of place
+        (lua_pop L 1)  ; a[j]
+        (set2 L (- up 1) i)  ; the pivot goes to a[i]
+        (return i))
+      (set2 L i j)))  ; swap, to restore the invariant
+  (return 0))
+
+; A pivot in the middle half of [lo,up], "randomized" by 'rnd'.
+(defn- choosePivot (lo:IdxT up:IdxT rnd:ui32):IdxT
+  (let (r4:IdxT (/ (- up lo) 4))
+    (return (+ (% (bit-xor rnd lo up) (* r4 2)) (+ lo r4)))))
+
+(defn- auxsort (L:(ptr lua_State) lo:IdxT up:IdxT rnd:ui32):void
+  (while (< lo up)  ; the loop is the tail call
+    (let (p:IdxT 0
+          n:IdxT 0)
+      ; sort a[lo], a[p] and a[up]
+      (geti L 1 lo)
+      (geti L 1 up)
+      (if (sort_comp L -1 -2)  ; a[up] < a[lo]?
+        (set2 L lo up)
+        (lua_pop L 2))
+      (when (= (- up lo) 1)  ; two elements: sorted
+        (return))
+      (if (or (< (- up lo) RANLIMIT) (= rnd 0))
+        (set! p (/ (+ lo up) 2))  ; the middle is a good pivot
+        (set! p (choosePivot lo up rnd)))  ; a large interval: randomize
+      (geti L 1 p)
+      (geti L 1 lo)
+      (if (sort_comp L -2 -1)  ; a[p] < a[lo]?
+        (set2 L p lo)
+        (do (lua_pop L 1)  ; a[lo]
+            (geti L 1 up)
+            (if (sort_comp L -1 -2)  ; a[up] < a[p]?
+              (set2 L p up)
+              (lua_pop L 2))))
+      (when (= (- up lo) 2)  ; three elements: sorted
+        (return))
+      (geti L 1 p)  ; the pivot
+      (lua_pushvalue L -1)
+      (geti L 1 (- up 1))
+      (set2 L p (- up 1))  ; swap the pivot with a[up - 1]
+      (set! p (partition L lo up))
+      ; a[lo..p-1] <= a[p] == P <= a[p+1..up]: recurse on the smaller side
+      (if (< (- p lo) (- up p))
+        (do (auxsort L lo (- p 1) rnd)
+            (set! n (- p lo))
+            (set! lo (+ p 1)))
+        (do (auxsort L (+ p 1) up rnd)
+            (set! n (- up p))
+            (set! up (- p 1))))
+      (when (> (/ (- up lo) 128) n)  ; too unbalanced?
+        (set! rnd (luaL_makeseed L))))))  ; randomize from now on
+
+(defn- tsort (L:(ptr lua_State)):i32
+  (let (n:lua_Integer (aux_getn L 1 TAB_RW))
+    (when (> n 1)  ; anything to sort?
+      (luaL_argcheck L (< n INT_MAX) 1 "array too big")
+      (when (not (lua_isnoneornil L 2))
+        (luaL_checktype L 2 LUA_TFUNCTION))
+      (lua_settop L 2)  ; exactly two arguments
+      (auxsort L 1 (unsafe/cast IdxT n) 0))
+    (return 0)))
+
+(defn luaopen_table (L:(ptr lua_State)):i32
+  (lua-newlib L
+    ("concat" tconcat) ("create" tcreate) ("insert" tinsert) ("pack" tpack)
+    ("unpack" tunpack) ("remove" tremove) ("move" tmove) ("sort" tsort))
+  (return 1))

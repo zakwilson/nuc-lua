@@ -17,8 +17,8 @@
              "reference/build/src/ltm.c" "reference/build/src/lundump.c"
              "reference/build/src/lvm.c" "reference/build/src/lzio.c"
 
- "reference/build/src/ldblib.c"
-             "reference/build/src/liolib.c"
-             "reference/build/src/loadlib.c" "reference/build/src/loslib.c"
-             "reference/build/src/lstrlib.c" "reference/build/src/ltablib.c"
- "reference/build/src/linit.c"]}
+
+
+
+             "reference/build/src/lstrlib.c"
+]}
