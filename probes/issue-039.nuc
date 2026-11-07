@@ -1,0 +1,8 @@
+; ISSUE-039: a build.edn makes one program; a second, sharing the sources, warns at every build.
+; expect: a second project that shares the first's sources builds quietly; actual: a warning per path
+; run: mkdir -p $W/p/two && cp $P $W/p/main.nuc && printf '{:name "two" :entry "../main.nuc" :source-root ".."}' > $W/p/two/build.edn && cd $W/p/two && $(dirname $NUCLEUSC)/nucleus build 2>&1 | grep -c "outside the project"
+; fixed-when-output: 0
+(import-use "stdio.h")
+(defn main ():i32
+  (printf "two\n")
+  (return 0))

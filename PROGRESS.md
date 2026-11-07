@@ -18,6 +18,10 @@ is that the remaining C is compiled by the build tool with `-O2` and
 `-DLUA_USE_LINUX`, not by stock `make`, so a timing comparison against the
 reference is only meaningful at the end.
 
+`luac` is a second project, `luac/build.edn`, whose entry is `src/luac.nuc` and whose
+source root is the port's `src/`: a `build.edn` makes one program (ISSUE-039). It
+lists the same stock `:c-sources`, and its paths warn at every build.
+
 Order: `lua.c`, `lauxlib.c` and the libraries first (public API only), then the
 object model, the compiler, execution state, the collector and the VM (§10).
 
@@ -29,7 +33,7 @@ object model, the compiler, execution state, the collector and the VM (§10).
 | 1 Binding and first library | done: `capi/` (both layers), layout gate, `libs/mayi`, `tests/capi/capi.c`, stock column |
 | 2 Host and libraries | done: `lua.c`, `lauxlib.c`, `linit` and every standard library in Nucleus |
 | 3 Object model | done: `lctype`, `lzio`, `lmem`, `lobject`, `lstring`, `lfunc`, `ltm`, `ltable` |
-| 4 Compiler | in progress: `lopcodes`, `llex`, `lcode`, `lparser`, `ldump`, `lundump` ported; `luac.c` left |
+| 4 Compiler | done: `lopcodes`, `llex`, `lcode`, `lparser`, `ldump`, `lundump`, `luac.c` |
 | 5–11 | not started |
 
 ### Nucleus
@@ -49,13 +53,15 @@ Compiler: `.nucleus-work` on `lua-bugfixes` (see CLAUDE.md).
 
 ### Still stock
 
-The core except the object model: every module in `build.edn`'s `:c-sources`.
-The object model is in `src/lua/` (`ctype`, `zio`, `mem`, `object`, `string`, `func`,
-`tm`, `table`). Ported before it: `lua.c`
+Execution state, the collector and the VM: every module in `build.edn`'s `:c-sources`
+(`lapi`, `ldebug`, `ldo`, `lgc`, `lstate`, `lvm`). The object model is in `src/lua/`
+(`ctype`, `zio`, `mem`, `object`, `string`, `func`, `tm`, `table`), and so is the
+compiler (`opcodes`, `lex`, `code`, `parser`, `dump`, `undump`); `luac.c` is
+`src/luac.nuc` (`lua.luac`). Ported before it: `lua.c`
 (`src/main.nuc`, namespace `lua.host`), `lauxlib.c` (`src/lua/aux.nuc`, `lua.aux`),
 `linit.c` (`src/lua/init.nuc`) and the libraries in `src/lua/`: `baselib`, `corolib`,
 `dblib`, `iolib`, `loadlib`, `mathlib`, `oslib`, `strlib`, `tablib`, `utf8lib`. A library's `luaL_Reg` table is built on the stack by
-`lua.util/lua-newlib` (ISSUE-004). `luac.c` isn't built yet. `src/lua/util.nuc` holds what
+`lua.util/lua-newlib` (ISSUE-004). `src/lua/util.nuc` holds what
 the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `cstr`,
 `errno`, `set-errno`, `byte-diff`, `offsetof`, the `cast_*` family).
 
@@ -81,7 +87,11 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
   constructors, calls, concatenations, assignment lists) fails or compiles as stock does.
   After `ldump` and `lundump`, loading every truncation of a dump and every byte of it
   set to 0, 0x80 and 0xff (`tests/bytecode/badload.lua`, 1696 results) reads as stock
-  does, and `capi.c` reloads a dump from a fixed buffer.
+  does, and `capi.c` reloads a dump from a fixed buffer. The port's `luac` dumps every
+  suite and stress file as `string.dump` does, stripped and not, lists them (`-l -l`,
+  addresses masked) as stock `luac` does, and answers 21 option cases (usage, `-v`,
+  `--`, `-`, `-o -`, `luac.out`, errors) byte for byte. Compiling all of them ten times
+  takes 2.28 s against stock `luac`'s 2.21 s.
 - The spike: a Nucleus `luaopen_` module whose function raises with `luaL_error`
   (a real C variadic call) is caught by `pcall` in stock `lua`.
 
@@ -98,17 +108,21 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
   line info, folding corners, every variable kind), stripped and not, must be
   byte-identical to stock's; names the first differing function; cross-loads both ways;
   `tests/bytecode/errors.lua`'s compile errors and `tests/bytecode/badload.lua`'s
-  corrupted loads must read the same.
+  corrupted loads must read the same. The port's `luac` (built by `nucleus build` in
+  `luac/`; `PLUAC=` picks another) must dump as `string.dump`, list as stock `luac`, and
+  answer its options as stock does.
 - `scripts/check-tables.sh`: `luaP_opmodes` and `luai_ctype_` byte-identical to stock's.
 - `scripts/check-suite.sh` runs the official suite (`LUA=` picks the binary).
 
 ## Next
 
-M4, the compiler: `luac.c`, a second executable, its opcode names from the
-`with-opcodes` rows. `code.nuc` holds `lcode.h`'s macros and the `expdesc`
+M5, execution state: `ldebug`, `lstate`, `ldo` (throw, calls, coroutines and
+continuations), `lapi` (the rest of the variadics), with the suite, `check-bytecode.sh`
+and the `check-capi.sh` matrix after each. Delete each from both `build.edn` and
+`luac/build.edn`. `code.nuc` holds `lcode.h`'s macros and the `expdesc`
 union accessors (`u`, `set-u`, `ind`, `set-ind`, `uvar`, `set-uvar`) that `parser.nuc`
 uses; `parser.nuc`'s `Block` is C's `BlockCnt` (ISSUE-037). `opcodes.nuc` generates `luaP_opmodes` from one
-opcode row table (`with-opcodes`); `luac`'s opcode names come from the same rows.
+opcode row table (`with-opcodes`); `luac`'s `opnames` come from the same rows.
 
 The core modules import the internal headers (`-Ireference/build/src` in `:cflags`) for
 their layouts. `src/lua/core.nuc` holds the internal headers' macros (`lobject.h`,

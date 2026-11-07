@@ -41,7 +41,8 @@ Ranked by porter pain removed per unit of language work.
 | 35 | ISSUE-036 | A `defvar`'s array initializer isn't macroexpanded before its shape is checked | papercut | bug | worked-around |
 | 36 | ISSUE-037 | A `defstruct` can't complete a struct its header declares without a body | papercut | missing-feature | worked-around |
 | 37 | ISSUE-038 | A parameter named like a special form is accepted, then misparsed at its use | papercut | design | worked-around |
-| 38 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
+| 38 | ISSUE-039 | A `build.edn` makes one program, and a second sharing its sources warns at every build | papercut | tooling | worked-around |
+| 39 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
 
 ## ISSUE-001: A C variadic couldn't be defined in Nucleus
 
@@ -625,6 +626,26 @@ parameter and fails at the use: "label: name must be symbol", which names neithe
 the binding nor the conflict. A binding that can't be used should be refused where
 it is made, with the first message.
 
+## ISSUE-039: A `build.edn` makes one program, and a second sharing its sources warns at every build
+
+- **Severity:** papercut
+- **Kind:** tooling
+- **Status:** worked-around
+- **Probe:** `probes/issue-039.nuc` — expected no warning; actual one per path that
+  leaves the project
+- **Port sites:** `luac/build.edn`
+- **Workaround:** `luac` is its own project under `luac/`, whose `:entry`,
+  `:source-root` and `:c-sources` climb to the port's; the eight warnings are ignored.
+
+Context: Lua builds two programs, `lua` and `luac`, from one core. `build.edn` has one
+`:entry` and one `:name`, and a target can't set either, so a second program needs a
+second project. Sharing the first one's sources is then exactly the path the tool
+warns about ("is outside the project … a local path belongs in build-local.edn"),
+although the path is committed and holds in every checkout. The alternative, the core
+as a `:kind :library`, archives it, so `lua` would need `--whole-archive` to keep the
+API symbols that C modules call. A `:programs` map (name to entry), sharing the rest
+of the settings, would cover both.
+
 ## What worked well
 
 - `(import-use "lua.h")`, once ISSUE-002 was fixed: every type, function and
@@ -639,3 +660,9 @@ it is made, with the first message.
   userdata metatable from one form, so the function table can't fall out of step.
 - The layout gate came out right first time: 112 sizes, offsets and constants of
   the public structs, `luaL_Buffer`'s 16-byte `long double` alignment included.
+- One opcode row set (`with-opcodes`) makes both `luaP_opmodes` and `luac`'s
+  `opnames`: a macro walks the rows and strips `OP_` from each name, so C's three
+  hand-kept lists (`lopcodes.h`, `lopcodes.c`, `lopnames.h`) are one.
+- `!T` fits `luac`'s option parser (PROMPT §9): it is self-contained, so `doargs`
+  returns `(Result i32 CStr)`, the first file's index or what `usage` should say,
+  and only `main` exits. A throw that crosses Lua's frames still needs `longjmp`.

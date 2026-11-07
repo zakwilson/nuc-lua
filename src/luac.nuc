@@ -1,0 +1,383 @@
+; The Lua compiler: saves precompiled chunks to a file, and lists bytecodes.
+; It reaches into the internals (Proto, the opcodes), as luac.c does.
+;
+; luac.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.luac)
+(set-ir-prefix "")
+(import-use luacapi)
+(import lua.aux)  ; luaL_newstate, luaL_loadfile
+(import lua.ctype)  ; the core
+(import lua.zio)
+(import lua.mem)
+(import lua.object)
+(import lua.string)
+(import lua.func)
+(import lua.tm)
+(import lua.table)
+(import-use lua.opcodes)  ; the compiler; its macros list the code
+(import lua.lex)
+(import-use lua.code)  ; isvararg
+(import lua.parser)
+(import lua.dump)
+(import lua.undump)
+(import-use lua.util)
+(import-use lua.core)
+(import-use "lstate.h")
+(import-use "lobject.h")
+(import-use "lopcodes.h")
+(import-use "ldebug.h")
+(import-use "lundump.h")
+(import-use "stdio.h")
+(import-use "stdlib.h")
+(import-use "string.h")
+(import-use "errno.h")
+(import-use "ctype.h")
+(import-ct nucleus.node)
+(import-ct nucleus.intern)
+
+(defconst PROGNAME "luac")
+(defconst OUTPUT "luac.out")  ; the default output file
+(defconst COMMENT "\t; ")
+
+(defvar- listing:i32 0)    ; list bytecodes? twice: the full listing
+(defvar- dumping:i32 1)    ; dump bytecodes?
+(defvar- stripping:i32 0)  ; strip debug information?
+(defvar- output:CStr OUTPUT)  ; null: stdout
+(defvar- progname:CStr PROGNAME)
+(defvar- gstate:(ptr global_State) null)  ; for the metamethod names
+
+; The opcode names, from the rows lopcodes uses, without their "OP_".
+(defmacro defopnames (rows)
+  (let (names (node-list-new (rows 'line))
+        n (ast-len rows)
+        i 0)
+    (while (< i n)
+      (let (s (alloc-node)
+            op ((ast-at (ast-at rows i) 0) 's))
+        (set! (s 'kind) NODE-STR)
+        (set! (s 's) (symbol-from-cstr (as CStr (as ptr (unsafe/ptr+ (as (ptr i8) (as ptr (symbol-as-cstr op))) 3)))))
+        (node-push names s))
+      (set! i (+ i 1)))
+    `(defvar- opnames:(array CStr 85) (array CStr ~@names))))  ; NUM_OPCODES
+
+(with-opcodes defopnames)
+
+(defn- fatal (message:CStr):void :noreturn
+  (fprintf stderr "%s: %s\n" progname message)
+  (exit EXIT_FAILURE))
+
+(defn- cannot (what:CStr):void :noreturn
+  (fprintf stderr "%s: cannot %s %s: %s\n" progname what output (strerror (errno)))
+  (exit EXIT_FAILURE))
+
+; A message that starts with '-' is the option not recognized.
+(defn- usage (message:CStr):void :noreturn
+  (if (= (aref (bytes message) 0) 45)  ; '-'
+    (fprintf stderr "%s: unrecognized option '%s'\n" progname message)
+    (fprintf stderr "%s: %s\n" progname message))
+  (fprintf stderr "usage: %s [options] [filenames]\n" progname)
+  (fputs "Available options are:\n" stderr)
+  (fputs "  -l       list (use -l -l for full listing)\n" stderr)
+  (fprintf stderr "  -o name  output to file 'name' (default is \"%s\")\n" OUTPUT)
+  (fputs "  -p       parse only\n" stderr)
+  (fputs "  -s       strip debug information\n" stderr)
+  (fputs "  -v       show version information\n" stderr)
+  (fputs "  --       stop handling options\n" stderr)
+  (fputs "  -        stop handling options and process stdin\n" stderr)
+  (exit EXIT_FAILURE))
+
+; The options, setting the flags above; the index of the first file, or what
+; usage should say. Self-contained, so a Result carries its failure.
+(defn- doargs (argc:i32 argv:(ptr CStr)):(Result i32 CStr)
+  (let (i:i32 1
+        version:i32 0)
+    (when (and (!= (as ptr (aref argv 0)) null) (!= (aref (bytes (aref argv 0)) 0) 0))
+      (set! progname (aref argv 0)))
+    (while (< i argc)
+      (let (a:CStr (aref argv i))
+        (cond (!= (aref (bytes a) 0) 45) (break)  ; not '-': the end of the options; keep it
+              (= a "--") (do (inc! i)  ; the end of the options; skip it
+                             (when (!= version 0) (inc! version))
+                             (break))
+              (= a "-") (break)  ; the end of the options; use stdin
+              (= a "-l") (inc! listing)
+              (= a "-o") (do (inc! i)
+                             (set! output (aref argv i))
+                             (when (or (= (as ptr output) null) (= (aref (bytes output) 0) 0)
+                                       (and (= (aref (bytes output) 0) 45) (!= (aref (bytes output) 1) 0)))
+                               (return (err "'-o' needs argument")))
+                             (when (= output "-") (set! output (as CStr null))))
+              (= a "-p") (set! dumping 0)
+              (= a "-s") (set! stripping 1)
+              (= a "-v") (inc! version)
+              true (return (err a))))
+      (inc! i))
+    (when (and (= i argc) (or (!= listing 0) (= dumping 0)))
+      (set! dumping 0)  ; only listing: luac.out is the input
+      (dec! i)
+      (set! (aref argv i) OUTPUT))
+    (when (!= version 0)
+      (printf "%s\n" LUA_COPYRIGHT)
+      (when (= version (- argc 1)) (exit EXIT_SUCCESS)))
+    (return (ok i))))
+
+(defconst FUNCTION "(function()end)();\n")
+
+; Gives FUNCTION as many times as the counter says: a main calling each file's.
+(defn- reader (L:(ptr lua_State) ud:ptr size:(ptr usize)):CStr
+  (let (n:(ptr i32) (unsafe/cast (ptr i32) ud))
+    (if (!= (deref n) 0)
+      (do (set! (deref n) (- (deref n) 1))
+          (set! (deref size) (strlen FUNCTION))
+          (return FUNCTION))
+      (do (set! (deref size) 0)
+          (return (as CStr null))))))
+
+(defmacro toproto (L i) `((clLvalue (s2v (p+ ((~L 'top) 'p) ~i))) 'p))
+
+; One file's function, or a main whose functions are the files' (their upvalue
+; _ENV no longer on the stack).
+(defn- combine (L:(ptr lua_State) n:i32):(ptr Proto)
+  (when (= n 1)
+    (return (toproto L -1)))
+  (let (i:i32 n)
+    (when (!= (lua_load L reader (as ptr &i) "=(luac)" (as CStr null)) LUA_OK)
+      (fatal (lua_tolstring L -1 null)))
+    (let (f:(ptr Proto) (toproto L -1))
+      (for (j:i32 0) (< j n) (inc! j)
+        (let (p:(ptr Proto) (toproto L (- j n 1)))
+          (set! (deref (p+ (f 'p) j)) p)
+          (when (> (p 'sizeupvalues) 0)
+            (set! ((p 'upvalues) 'instack) 0))))
+      (return f))))
+
+(defn- writer (L:(ptr lua_State) p:ptr size:usize u:ptr):i32
+  (return (if (and (!= (fwrite p size 1 (unsafe/cast (ptr FILE) u)) 1) (!= size 0)) 1 0)))
+
+(defn- pmain (L:(ptr lua_State)):i32
+  (let (argc:i32 (cast_int (lua_tointegerx L 1 null))
+        argv:(ptr CStr) (unsafe/cast (ptr CStr) (lua_touserdata L 2)))
+    (set! gstate (G L))
+    (when (= (lua_checkstack L argc) 0)
+      (fatal "too many input files"))
+    (for (i:i32 0) (< i argc) (inc! i)
+      (let (filename:CStr (if (= (aref argv i) "-") (as CStr null) (aref argv i)))
+        (when (!= (luaL_loadfilex L filename (as CStr null)) LUA_OK)
+          (fatal (lua_tolstring L -1 null)))))
+    (let (f:(ptr Proto) (combine L argc))
+      (when (!= listing 0)
+        (PrintFunction f (> listing 1)))
+      (when (!= dumping 0)
+        (let (D:(ptr FILE) (if (= (as ptr output) null) stdout (fopen output "wb")))
+          (when (= (as ptr D) null) (cannot "open"))
+          (luaU_dump L f writer (as ptr D) stripping)
+          (when (!= (ferror D) 0) (cannot "write"))
+          (when (!= (fclose D) 0) (cannot "close")))))
+    (return 0)))
+
+(defn main (argc:i32 argv:(ptr CStr)):i32
+  (match (doargs argc argv)
+    ((err message) (usage message))
+    ((ok i)
+     (let (n:i32 (- argc i)
+           files:(ptr CStr) (p+ argv i))
+       (when (<= n 0) (usage "no input files given"))
+       (if-some (L (as ?&lua_State (luaL_newstate)))
+         (do
+           (lua_pushcfunction L pmain)
+           (lua_pushinteger L (as lua_Integer n))
+           (lua_pushlightuserdata L (as ptr files))
+           (when (!= (lua_pcall L 2 0 0) LUA_OK)
+             (fatal (lua_tolstring L -1 null)))
+           (lua_close L))
+         (fatal "cannot create state: not enough memory")))))
+  (return EXIT_SUCCESS))
+
+; ---- the listing ----
+
+(defmacro upvalname (f x)
+  `(let (n:(ptr TString) ((p+ (~f 'upvalues) ~x) 'name))
+     (if (= (as ptr n) null) (cstr "-") (cstr (getstr n)))))
+(defmacro eventname (i) `(getstr (aref (gstate 'tmname) ~i)))
+
+; A string constant as Lua reads it back: escapes for the controls, and
+; decimal escapes for the bytes isprint refuses.
+(defn- PrintString (ts:(ptr TString)):void
+  (let (s:(ptr ui8) (unsafe/cast (ptr ui8) (getstr ts))
+        n:usize (tsslen ts))
+    (printf "\"")
+    (for (i:usize 0) (< i n) (inc! i)
+      (let (c:i32 (as i32 (deref (p+ s i))))
+        (case c
+          34 (printf "\\\"")
+          92 (printf "\\\\")
+          7 (printf "\\a")
+          8 (printf "\\b")
+          12 (printf "\\f")
+          10 (printf "\\n")
+          13 (printf "\\r")
+          9 (printf "\\t")
+          11 (printf "\\v")
+          (if (!= (isprint c) 0) (printf "%c" c) (printf "\\%03d" c)))))
+    (printf "\"")))
+
+(defn- PrintType (f:(ptr Proto) i:i32):void
+  (let (tt:i32 (as i32 (ttypetag (p+ (f 'k) i))))
+    (case tt
+      LUA_VNIL (printf "N")
+      (:or LUA_VFALSE LUA_VTRUE) (printf "B")
+      LUA_VNUMFLT (printf "F")
+      LUA_VNUMINT (printf "I")
+      (:or LUA_VSHRSTR LUA_VLNGSTR) (printf "S")
+      (printf "?%d" tt))  ; can't happen
+    (printf "\t")))
+
+(defn- PrintConstant (f:(ptr Proto) i:i32):void
+  (let (o:(ptr TValue) (p+ (f 'k) i)
+        tt:i32 (as i32 (ttypetag o))
+        buff:(ptr i8) (alloca i8 100))
+    (case tt
+      LUA_VNIL (printf "nil")
+      LUA_VFALSE (printf "false")
+      LUA_VTRUE (printf "true")
+      LUA_VNUMFLT (do (sprintf buff LUA_NUMBER_FMT (fltvalue o))
+                      (printf "%s" buff)
+                      (when (= (deref (p+ buff (strspn (cstr buff) "-0123456789"))) 0)
+                        (printf ".0")))  ; looks like an integer: say it isn't
+      LUA_VNUMINT (printf LUA_INTEGER_FMT (ivalue o))
+      (:or LUA_VSHRSTR LUA_VLNGSTR) (PrintString (tsvalue o))
+      (printf "?%d" tt))))  ; can't happen
+
+; Each instruction: its number, line, name and operands, and a comment that
+; reads the operands (a constant, an upvalue's name, a jump's target).
+(defn- PrintCode (f:(ptr Proto)):void
+  (let (code:(ptr Instruction) (f 'code)
+        n:i32 (f 'sizecode))
+    (for (pc:i32 0) (< pc n) (inc! pc)
+      (let (i:Instruction (deref (p+ code pc))
+            o:i32 (GET_OPCODE i)
+            a:i32 (GETARG_A i)
+            b:i32 (GETARG_B i)
+            c:i32 (GETARG_C i)
+            ax:i32 (GETARG_Ax i)
+            bx:i32 (GETARG_Bx i)
+            sb:i32 (GETARG_sB i)
+            sc:i32 (GETARG_sC i)
+            vb:i32 (GETARG_vB i)
+            vc:i32 (GETARG_vC i)
+            sbx:i32 (GETARG_sBx i)
+            isk:i32 (GETARG_k i)
+            k:CStr (if (!= isk 0) (cstr "k") (cstr ""))
+            line:i32 (luaG_getfuncline f pc))
+        (macrolet ((konst (x) `(PrintConstant f ~x))
+                   (extraarg () `(GETARG_Ax (deref (p+ code (+ pc 1)))))
+                   (extraargc () `(* (extraarg) (+ MAXARG_C 1))))
+          (printf "\t%d\t" (+ pc 1))
+          (if (> line 0) (printf "[%d]\t" line) (printf "[-]\t"))
+          (printf "%-9s\t" (aref opnames o))
+          (case o
+            (:or OP_MOVE OP_UNM OP_BNOT OP_NOT OP_LEN OP_CONCAT) (printf "%d %d" a b)
+            (:or OP_LOADI OP_LOADF) (printf "%d %d" a sbx)
+            OP_LOADK (do (printf "%d %d" a bx) (printf COMMENT) (konst bx))
+            OP_LOADKX (do (printf "%d" a) (printf COMMENT) (konst (extraarg)))
+            (:or OP_LOADFALSE OP_LFALSESKIP OP_LOADTRUE OP_CLOSE OP_TBC OP_RETURN1 OP_VARARGPREP)
+            (printf "%d" a)
+            OP_LOADNIL (printf "%d %d\t; %d out" a b (+ b 1))
+            (:or OP_GETUPVAL OP_SETUPVAL) (printf "%d %d\t; %s" a b (upvalname f b))
+            OP_GETTABUP (do (printf "%d %d %d\t; %s " a b c (upvalname f b)) (konst c))
+            (:or OP_GETTABLE OP_GETI OP_ADD OP_SUB OP_MUL OP_MOD OP_POW OP_DIV OP_IDIV
+                 OP_BAND OP_BOR OP_BXOR OP_SHL OP_SHR OP_GETVARG)
+            (printf "%d %d %d" a b c)
+            (:or OP_GETFIELD OP_ADDK OP_SUBK OP_MULK OP_MODK OP_POWK OP_DIVK OP_IDIVK
+                 OP_BANDK OP_BORK OP_BXORK)
+            (do (printf "%d %d %d" a b c) (printf COMMENT) (konst c))
+            OP_SETTABUP (do (printf "%d %d %d%s\t; %s " a b c k (upvalname f a))
+                            (konst b)
+                            (when (!= isk 0) (printf " ") (konst c)))
+            (:or OP_SETTABLE OP_SETI OP_SELF)
+            (do (printf "%d %d %d%s" a b c k)
+                (when (!= isk 0) (printf COMMENT) (konst c)))
+            OP_SETFIELD (do (printf "%d %d %d%s" a b c k)
+                            (printf COMMENT) (konst b)
+                            (when (!= isk 0) (printf " ") (konst c)))
+            OP_NEWTABLE (printf "%d %d %d%s\t; %d" a vb vc k (+ vc (extraargc)))
+            (:or OP_ADDI OP_SHLI OP_SHRI) (printf "%d %d %d" a b sc)
+            OP_MMBIN (printf "%d %d %d\t; %s" a b c (eventname c))
+            OP_MMBINI (do (printf "%d %d %d %d\t; %s" a sb c isk (eventname c))
+                          (when (!= isk 0) (printf " flip")))
+            OP_MMBINK (do (printf "%d %d %d %d\t; %s " a b c isk (eventname c))
+                          (konst b)
+                          (when (!= isk 0) (printf " flip")))
+            OP_JMP (printf "%d\t; to %d" (GETARG_sJ i) (+ (GETARG_sJ i) pc 2))
+            (:or OP_EQ OP_LT OP_LE OP_TESTSET) (printf "%d %d %d" a b isk)
+            OP_EQK (do (printf "%d %d %d" a b isk) (printf COMMENT) (konst b))
+            (:or OP_EQI OP_LTI OP_LEI OP_GTI OP_GEI) (printf "%d %d %d" a sb isk)
+            OP_TEST (printf "%d %d" a isk)
+            OP_CALL (do (printf "%d %d %d" a b c)
+                        (printf COMMENT)
+                        (if (= b 0) (printf "all in ") (printf "%d in " (- b 1)))
+                        (if (= c 0) (printf "all out") (printf "%d out" (- c 1))))
+            OP_TAILCALL (printf "%d %d %d%s\t; %d in" a b c k (- b 1))
+            OP_RETURN (do (printf "%d %d %d%s" a b c k)
+                          (printf COMMENT)
+                          (if (= b 0) (printf "all out") (printf "%d out" (- b 1))))
+            OP_RETURN0 (do)
+            (:or OP_FORLOOP OP_TFORLOOP) (printf "%d %d\t; to %d" a bx (+ (- pc bx) 2))
+            OP_FORPREP (printf "%d %d\t; exit to %d" a bx (+ pc bx 3))
+            OP_TFORPREP (printf "%d %d\t; to %d" a bx (+ pc bx 2))
+            OP_TFORCALL (printf "%d %d" a c)
+            OP_SETLIST (do (printf "%d %d %d%s" a vb vc k)
+                           (when (!= isk 0) (printf "\t; %d" (+ c (extraargc)))))
+            OP_CLOSURE (printf "%d %d\t; %p" a bx (as ptr (deref (p+ (f 'p) bx))))
+            OP_VARARG (do (printf "%d %d %d%s" a b c k)
+                          (printf COMMENT)
+                          (if (= c 0) (printf "all out") (printf "%d out" (- c 1))))
+            OP_ERRNNIL (do (printf "%d %d" a bx)
+                           (printf COMMENT)
+                           (if (= bx 0) (printf "?") (konst (- bx 1))))
+            OP_EXTRAARG (printf "%d" ax)
+            (do))
+          (printf "\n"))))))
+
+(defmacro plural (x) `(if (= ~x 1) (cstr "") (cstr "s")))
+
+(defn- PrintHeader (f:(ptr Proto)):void
+  (let (src:CStr (if (= (as ptr (f 'source)) null) (cstr "=?") (cstr (getstr (f 'source))))
+        c:i32 (as i32 (aref (bytes src) 0))
+        s:CStr (cond (or (= c 64) (= c 61)) (cstr (p+ (bytes src) 1))  ; '@' or '='
+                     (= c (as i32 (aref (bytes LUA_SIGNATURE) 0))) (cstr "(bstring)")
+                     true (cstr "(string)")))
+    (printf "\n%s <%s:%d,%d> (%d instruction%s at %p)\n"
+            (if (= (f 'linedefined) 0) (cstr "main") (cstr "function")) s
+            (f 'linedefined) (f 'lastlinedefined)
+            (f 'sizecode) (plural (f 'sizecode)) (as ptr f))
+    (printf "%d%s param%s, %d slot%s, %d upvalue%s, "
+            (as i32 (f 'numparams)) (if (isvararg f) (cstr "+") (cstr "")) (plural (as i32 (f 'numparams)))
+            (as i32 (f 'maxstacksize)) (plural (as i32 (f 'maxstacksize)))
+            (f 'sizeupvalues) (plural (f 'sizeupvalues)))
+    (printf "%d local%s, %d constant%s, %d function%s\n"
+            (f 'sizelocvars) (plural (f 'sizelocvars)) (f 'sizek) (plural (f 'sizek))
+            (f 'sizep) (plural (f 'sizep)))))
+
+(defn- PrintDebug (f:(ptr Proto)):void
+  (printf "constants (%d) for %p:\n" (f 'sizek) (as ptr f))
+  (for (i:i32 0) (< i (f 'sizek)) (inc! i)
+    (printf "\t%d\t" i)
+    (PrintType f i)
+    (PrintConstant f i)
+    (printf "\n"))
+  (printf "locals (%d) for %p:\n" (f 'sizelocvars) (as ptr f))
+  (for (i:i32 0) (< i (f 'sizelocvars)) (inc! i)
+    (let (lv:(ptr LocVar) (p+ (f 'locvars) i))
+      (printf "\t%d\t%s\t%d\t%d\n" i (getstr (lv 'varname)) (+ (lv 'startpc) 1) (+ (lv 'endpc) 1))))
+  (printf "upvalues (%d) for %p:\n" (f 'sizeupvalues) (as ptr f))
+  (for (i:i32 0) (< i (f 'sizeupvalues)) (inc! i)
+    (let (up:(ptr Upvaldesc) (p+ (f 'upvalues) i))
+      (printf "\t%d\t%s\t%d\t%d\n" i (upvalname f i) (as i32 (up 'instack)) (as i32 (up 'idx))))))
+
+(defn- PrintFunction (f:(ptr Proto) full:bool):void
+  (PrintHeader f)
+  (PrintCode f)
+  (when full (PrintDebug f))
+  (for (i:i32 0) (< i (f 'sizep)) (inc! i)
+    (PrintFunction (deref (p+ (f 'p) i)) full)))
