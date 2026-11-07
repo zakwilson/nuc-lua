@@ -28,7 +28,7 @@ object model, the compiler, execution state, the collector and the VM (§10).
 | 0 Setup | done: env and setup scripts, reference and suite, spike, probes, hybrid build |
 | 1 Binding and first library | done: `capi/` (both layers), layout gate, `libs/mayi`, `tests/capi/capi.c`, stock column |
 | 2 Host and libraries | done: `lua.c`, `lauxlib.c`, `linit` and every standard library in Nucleus |
-| 3 Object model | in progress: `lctype`, `lzio`, `lmem`, `lobject` ported; `lstring`, `lfunc`, `ltm`, `ltable` left |
+| 3 Object model | in progress: `lctype`, `lzio`, `lmem`, `lobject`, `lstring` ported; `lfunc`, `ltm`, `ltable` left |
 | 4–11 | not started |
 
 ### Nucleus
@@ -42,11 +42,8 @@ Compiler: `.nucleus-work` on `lua-bugfixes` (see CLAUDE.md).
   header struct (ISSUE-003)
 - `5dab7cb` an imported file defines a function its header declares (ISSUE-013)
 - `0081d2a` an array field of a nested place decays into the place (ISSUE-023)
-- uncommitted in `.nucleus-work`: `cheader.nuc` skips an attribute after a return type
-  (ISSUE-026), and `C-MAX-PARAMS` is 64. Gate reruns failed `w3b-sdl`, then `w3b-skip`;
-  both are fixed (the `w3b-skip` fixture now has 65 parameters) and pass alone. The full
-  gate needs one more run. Once it passes: commit, fast-forward `../nucleus`,
-  format-patch as 0006, and set ISSUE-026's sha in ISSUES.md.
+- `f282cfe` an attribute between a function's return type and its name (ISSUE-026);
+  `C-MAX-PARAMS` is 64
 
 ### Still stock
 
@@ -56,7 +53,7 @@ The core: every module in `build.edn`'s `:c-sources`. Ported so far: `lua.c`
 `dblib`, `iolib`, `loadlib`, `mathlib`, `oslib`, `strlib`, `tablib`, `utf8lib`. A library's `luaL_Reg` table is built on the stack by
 `lua.util/lua-newlib` (ISSUE-004). `luac.c` isn't built yet. `src/lua/util.nuc` holds what
 the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `cstr`,
-`errno`, `set-errno`, `byte-diff`, the `cast_*` family).
+`errno`, `set-errno`, `byte-diff`, `offsetof`, the `cast_*` family).
 
 `src/lua.dynlist` limits the executable's dynamic table to `lua_*`, `luaL_*` and
 `luaopen_*`, so a module loaded by `require` binds only the API, as with stock `lua`.
@@ -85,7 +82,7 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
 
 ## Next
 
-M3, the object model: `lstring`, `lfunc`, `ltm`, `ltable`, with the suite after each.
+M3, the object model: `lfunc`, `ltm`, `ltable`, with the suite after each.
 The core modules import the internal headers (`-Ireference/build/src` in `:cflags`) for
 their layouts; `src/lua/core.nuc` holds the `lobject.h`/`lstate.h` macros, with the
 variant tags written out (ISSUE-029); `src/lua/ctype.nuc` holds `lctype.h`'s. These share layouts with the stock core, so each

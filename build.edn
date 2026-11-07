@@ -13,6 +13,6 @@
              "reference/build/src/llex.c"
              "reference/build/src/lopcodes.c"
              "reference/build/src/lparser.c" "reference/build/src/lstate.c"
-             "reference/build/src/lstring.c" "reference/build/src/ltable.c"
+             "reference/build/src/ltable.c"
              "reference/build/src/ltm.c" "reference/build/src/lundump.c"
              "reference/build/src/lvm.c"]}

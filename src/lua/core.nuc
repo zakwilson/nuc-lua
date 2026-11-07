@@ -142,6 +142,18 @@
     `(let ((~a (ptr TString)) ~ts)
        (if (strisshr ~a) (cast_sizet (~a 'shrlen)) ((~a 'u) 'lnglen)))))
 
+(defmacro sizestrshr (l) `(+ (offsetof TString contents) ~l 1))
+
+; A userdata's memory follows its user values, or the header when it has none.
+(defmacro udatamemoffset (nuv)
+  `(if (= ~nuv 0)
+     (offsetof Udata0 bindata)
+     (+ (offsetof Udata uv) (* (cast_sizet (sizeof UValue)) (cast_sizet ~nuv)))))
+(defmacro sizeudata (nuv nb) `(+ (udatamemoffset ~nuv) ~nb))
+
+; 's' modulo a power of two.
+(defmacro lmod (s size) `(bit-and (cast_uint ~s) (cast_uint (- ~size 1))))
+
 ; ---- lvm.h ----
 ; Float 'n' from a number, without string coercion; false if it isn't one.
 (defmacro tonumberns (o n)
@@ -163,6 +175,68 @@
 ; Whether the state is fully built: its nilvalue is a nil only then.
 (defmacro completestate (g) `(ttisnil (ref (~g 'nilvalue))))
 
+; ---- lgc.h: colours ----
+(defconst WHITEBITS 0x18)  ; bit2mask(WHITE0BIT, WHITE1BIT)
+(defmacro iswhite (x) `(!= (bit-and (~x 'marked) WHITEBITS) 0))
+(defmacro otherwhite (g) `(bit-xor (~g 'currentwhite) WHITEBITS))
+(defmacro isdead (g v) `(!= (bit-and (~v 'marked) (otherwhite ~g)) 0))
+(defmacro changewhite (x) `(set! (~x 'marked) (bit-xor (~x 'marked) WHITEBITS)))
+
+(defconst BLACKMASK 0x20)  ; bitmask(BLACKBIT)
+(defmacro isblack (x) `(!= (bit-and (~x 'marked) BLACKMASK) 0))
+(defmacro nw2black (x) `(set! (~x 'marked) (bit-or (~x 'marked) BLACKMASK)))
+
+; A black object pointing to a white one must be fixed up for the collector.
+(defmacro luaC_objbarrier (L p o)
+  `(when (and (isblack ~p) (iswhite ~o))
+     (luaC_barrier_ ~L (obj2gco ~p) (obj2gco ~o))))
+(defmacro luaC_barrier (L p v)
+  (let (a (gensym))
+    `(let ((~a (ptr TValue)) ~v)
+       (when (iscollectable ~a) (luaC_objbarrier ~L ~p (gcvalue ~a))))))
+(defmacro luaC_objbarrierback (L p o)
+  `(when (and (isblack ~p) (iswhite ~o))
+     (luaC_barrierback_ ~L (obj2gco ~p))))
+(defmacro luaC_barrierback (L p v)
+  (let (a (gensym))
+    `(let ((~a (ptr TValue)) ~v)
+       (when (iscollectable ~a) (luaC_objbarrierback ~L ~p (gcvalue ~a))))))
+
+; Row 'i' of the API's string cache. A C 2-D array's row won't decay (ISSUE-031).
+(defmacro strcache-row (g i) `(unsafe/cast (ptr (ptr TString)) (ref (aref (~g 'strcache) ~i))))
+
 ; ---- lmem.h ----
 (defmacro luaM_error (L) `(luaD_throw ~L LUA_ERRMEM))
 (defmacro luaM_freemem (L b s) `(luaM_free_ ~L ~b ~s))
+(defmacro luaM_newvector (L n t)
+  `(unsafe/cast (ptr ~t) (luaM_malloc_ ~L (* (cast_sizet ~n) (cast_sizet (sizeof ~t))) 0)))
+(defmacro luaM_reallocvector (L v oldn n t)
+  `(unsafe/cast (ptr ~t) (luaM_realloc_ ~L (as ptr ~v)
+                                         (* (cast_sizet ~oldn) (cast_sizet (sizeof ~t)))
+                                         (* (cast_sizet ~n) (cast_sizet (sizeof ~t))))))
+
+; ---- lstring.h ----
+(defmacro luaS_newliteral (L s) `(luaS_newlstr ~L ~s (strlen ~s)))
+(defmacro luaM_free (L b T) `(luaM_free_ ~L (as ptr ~b) (cast_sizet (sizeof ~T))))
+; The element type is an argument: there's no sizeof of an expression (ISSUE-011).
+(defmacro luaM_freearray (L b n T)
+  `(luaM_free_ ~L (as ptr ~b) (* (cast_sizet ~n) (cast_sizet (sizeof ~T)))))
+
+; ---- ldo.h ----
+; A stack position as a byte offset, which survives the stack's reallocation.
+(defmacro savestack (L pt) `(byte-diff ~pt ((~L 'stack) 'p)))
+(defmacro restorestack (L n)
+  `(unsafe/cast (ptr StackValue) (p+ (unsafe/cast (ptr i8) ((~L 'stack) 'p)) ~n)))
+; How many slots 'q' is above 'p' (ISSUE-021).
+(defmacro stack-diff (q p) `(/ (byte-diff ~q ~p) (sizeof StackValue)))
+
+; ---- lfunc.h ----
+(defmacro sizeCclosure (n)
+  `(+ (offsetof CClosure upvalue) (* (cast_sizet (sizeof TValue)) (cast_sizet ~n))))
+(defmacro sizeLclosure (n)
+  `(+ (offsetof LClosure upvals) (* (cast_sizet (sizeof (ptr UpVal))) (cast_sizet ~n))))
+; Whether the thread is in the list of threads with open upvalues.
+(defmacro isintwups (L) `(!= (~L 'twups) ~L))
+; An open upvalue points into the stack; a closed one at its own 'value'.
+(defmacro upisopen (up) `(!= ((~up 'v) 'p) (ref ((~up 'u) 'value))))
+(defmacro uplevel (up) `(unsafe/cast (ptr StackValue) ((~up 'v) 'p)))

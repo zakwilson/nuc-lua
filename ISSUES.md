@@ -6,7 +6,7 @@ Ranked by porter pain removed per unit of language work.
 |---|---|---|---|---|---|
 | 1 | ISSUE-005 | A library's public `defn` is preempted by any same-named symbol in the process | major | design | open |
 | 2 | ISSUE-023 | An array field of a nested place decayed to a copy's address, losing every store | major | bug | fixed in nucleus `0081d2a` |
-| 3 | ISSUE-026 | A declaration with an attribute between its return type and its name was skipped | blocker | bug | fixed in nucleus `PENDING` |
+| 3 | ISSUE-026 | A declaration with an attribute between its return type and its name was skipped | blocker | bug | fixed in nucleus `f282cfe` |
 | 4 | ISSUE-022 | A definition that misses its header's prototype silently becomes a mangled overload | major | design | worked-around |
 | 5 | ISSUE-004 | A function's address isn't a constant in an aggregate initializer | major | missing-feature | worked-around |
 | 6 | ISSUE-013 | An imported file can't define a function its header declares | blocker | bug | fixed in nucleus `5dab7cb` |
@@ -21,19 +21,20 @@ Ranked by porter pain removed per unit of language work.
 | 15 | ISSUE-028 | `bit-not` of an unsigned operand is refused | minor | bug | worked-around |
 | 16 | ISSUE-029 | A constant macro built with a function-like macro isn't imported: `LUA_VNUMINT` | minor | known-limitation | worked-around |
 | 17 | ISSUE-030 | A `defconst` over a header constant is refused once a `defstruct` uses it as an array length | minor | bug | worked-around |
-| 18 | ISSUE-018 | A header's expression macros aren't imported: `errno`, `WIFEXITED` | minor | known-limitation | worked-around |
-| 19 | ISSUE-007 | A shared library is always named `lib<name>.so` | minor | tooling | worked-around |
-| 20 | ISSUE-010 | There is no `offsetof` | minor | missing-feature | worked-around |
-| 21 | ISSUE-012 | A header's string macros aren't imported | minor | known-limitation | worked-around |
-| 22 | ISSUE-011 | No `sizeof` of an expression, so no array length | minor | missing-feature | worked-around |
-| 23 | ISSUE-015 | Only the entry file can export a strong symbol | minor | design | worked-around |
-| 24 | ISSUE-016 | No byte literal: `\e` is a 32-bit Char and won't convert to `i8` | minor | design | worked-around |
-| 25 | ISSUE-017 | A `CStr` can't be indexed | minor | design | worked-around |
-| 26 | ISSUE-014 | `SIG_DFL` imports as the integer 0 | minor | interop | worked-around |
-| 27 | ISSUE-024 | A `_`-prefixed macro isn't imported, even ISO C's `_IOFBF` | papercut | design | worked-around |
-| 28 | ISSUE-020 | `set!` won't expand a macro in its place | papercut | missing-feature | worked-around |
-| 29 | ISSUE-025 | `sizeof` is a signed integer, so comparing a size with it is refused | papercut | design | worked-around |
-| 30 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
+| 18 | ISSUE-031 | A row of a header's 2-D array field doesn't decay, so it can't be indexed | minor | bug | worked-around |
+| 19 | ISSUE-018 | A header's expression macros aren't imported: `errno`, `WIFEXITED` | minor | known-limitation | worked-around |
+| 20 | ISSUE-007 | A shared library is always named `lib<name>.so` | minor | tooling | worked-around |
+| 21 | ISSUE-010 | There is no `offsetof` | minor | missing-feature | worked-around |
+| 22 | ISSUE-012 | A header's string macros aren't imported | minor | known-limitation | worked-around |
+| 23 | ISSUE-011 | No `sizeof` of an expression, so no array length | minor | missing-feature | worked-around |
+| 24 | ISSUE-015 | Only the entry file can export a strong symbol | minor | design | worked-around |
+| 25 | ISSUE-016 | No byte literal: `\e` is a 32-bit Char and won't convert to `i8` | minor | design | worked-around |
+| 26 | ISSUE-017 | A `CStr` can't be indexed | minor | design | worked-around |
+| 27 | ISSUE-014 | `SIG_DFL` imports as the integer 0 | minor | interop | worked-around |
+| 28 | ISSUE-024 | A `_`-prefixed macro isn't imported, even ISO C's `_IOFBF` | papercut | design | worked-around |
+| 29 | ISSUE-020 | `set!` won't expand a macro in its place | papercut | missing-feature | worked-around |
+| 30 | ISSUE-025 | `sizeof` is a signed integer, so comparing a size with it is refused | papercut | design | worked-around |
+| 31 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
 
 ## ISSUE-001: A C variadic couldn't be defined in Nucleus
 
@@ -170,10 +171,11 @@ Context: the three outputs are separate compiler runs over the same source.
 - **Severity:** minor
 - **Kind:** missing-feature
 - **Status:** worked-around
-- **Port sites:** `scripts/check-layout.sh`; Lua's `offsetof` uses (`lfunc.h`'s
-  `sizeofCclosure`, `lstring.h`'s `sizelstring`, `ltable.c`) will follow
-- **Workaround:** a global of the struct, and the field's address minus the
-  struct's: `(- (unsafe/cast i64 (ref g 'f)) (unsafe/cast i64 &g))`
+- **Port sites:** `scripts/check-layout.sh`; `string.nuc` (`sizestrshr`,
+  `luaS_sizelngstr`, `udatamemoffset`); `lfunc.h`'s `sizeofCclosure` and `ltable.c` will follow
+- **Workaround:** the layout gate takes a global of the struct and subtracts its
+  address from the field's. The core has `offsetof` in `util.nuc`, which reads the
+  field's address off a struct pointer cast from the constant 4096; it folds to a constant.
 
 Context: the layout gate needs every field offset of `luaL_Buffer` and `lua_Debug`.
 The compiler has the number; the docs say `make layout-test` compares Nucleus's
@@ -403,7 +405,7 @@ target; the docs call it "a pointer-sized integer (size_t)", meaning its width. 
 
 - **Severity:** blocker
 - **Kind:** bug
-- **Status:** fixed in nucleus `PENDING`
+- **Status:** fixed in nucleus `f282cfe`
 - **Probe:** `probes/issue-026.nuc`
 - **Port sites:** every call into `ldebug.h`'s and `ldo.h`'s error functions, starting
   with `lmem`'s `luaG_runerror` and `luaD_throw`
@@ -477,6 +479,25 @@ LUA_N2SBUFFSZ 95))` to 219, until a `(defstruct S … b:(array i8 X))` names it.
 known at compile time -- use defvar". The struct's layout is presumably resolved in a
 prescan that sees the constant before the header's constants are in, as with ISSUE-003,
 and the message blames the `defconst`, not the struct that triggered it.
+
+## ISSUE-031: A row of a header's 2-D array field doesn't decay, so it can't be indexed
+
+- **Severity:** minor
+- **Kind:** bug
+- **Status:** worked-around
+- **Probe:** `probes/issue-031.nuc`
+- **Port sites:** `global_State.strcache` in `string.nuc` (`luaS_new`, `luaS_init`,
+  `luaS_clearcache`)
+- **Workaround:** `strcache-row` in `core.nuc`: the row's address, `unsafe/cast` to a
+  pointer to its element, as C's `TString **p = g->strcache[i]`.
+
+Context: `TString *strcache[STRCACHE_N][STRCACHE_M]` imports, and `(g 'strcache)` decays
+to `&(array (ptr TString) 2)`. `(aref (g 'strcache) i)` is then an `(array (ptr TString)
+2)` *value*, which `aref` refuses ("operand must be typed pointer"). Nucleus's own
+diagnostic says an array "decays to &T when it is read", and a field does, but an element
+of an array of arrays doesn't. `as` from `&(array T 2)` to `&T` is refused as a
+reinterpretation, so the workaround needs `unsafe/cast`. Nucleus can't declare an array
+of arrays itself, so only an imported type reaches this.
 
 ## What worked well
 

@@ -1,0 +1,164 @@
+From f282cfe879a93c82f1f09a0200fe119fdb48e32e Mon Sep 17 00:00:00 2001
+From: Zak Wilson <zak.wilson@gmail.com>
+Date: Sat, 7 Nov 2026 14:18:50 +0000
+Subject: [PATCH] cheader: skip an attribute after a function's return type
+
+GCC admits an attribute between a declaration's return type and its name,
+where Lua's `l_noret` puts `__attribute__((noreturn))`, so every error
+function in Lua's internal headers (luaG_runerror, luaD_throw) was skipped
+with `__attribute__` read as the name. c-parse-func-decl now skips that
+attribute run too (nuc-lua ISSUE-026). `lua-header-shapes` covers it.
+
+That makes clang intrinsics with `__DEFAULT_FN_ATTRS` in that place
+readable, and `_mm512_set_epi8` has 64 parameters, so C-MAX-PARAMS is 64
+and `w3b-skip`'s fixture is widened to 65.
+
+Gate: nuctests 1740 passed, 0 failed, 0 skipped; bootstrap fixed point holds.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CsC8i2S7yJAHSpzRaddMj3
+---
+ design/progress.md          | 12 ++++++++++++
+ docs/structs-unions.md      |  4 +++-
+ src/cheader.nuc             |  7 +++++--
+ tests/fixtures/lua-shapes.c |  7 +++++++
+ tests/fixtures/lua-shapes.h |  3 ++-
+ tests/fixtures/w3b-skip.h   |  2 +-
+ tests/suite-cdecl.nuc       |  2 +-
+ tests/suite-cimport.nuc     |  6 ++++--
+ 8 files changed, 35 insertions(+), 8 deletions(-)
+
+diff --git a/design/progress.md b/design/progress.md
+index e8457d54..f1121f30 100644
+--- a/design/progress.md
++++ b/design/progress.md
+@@ -5740,3 +5740,15 @@ dead temporary. nuc-doom ISSUE-040 had fixed this for a binding receiver only.
+ 
+ `s21-array-field-of-nested-place` covers struct and union members, `field`, and an
+ element receiver.
++
++## Lua-port fixes: an attribute after the return type (lua-bugfixes)
++
++Found by the nuc-lua port (its ISSUE-026): Lua's `l_noret` expands to `void
++__attribute__((noreturn))`, so every error function in its internal headers
++(`luaG_runerror`, `luaD_throw`) was skipped: `__attribute__` read as the name.
++`c-parse-func-decl` now skips an attribute run after the return type, as it already
++did before the declaration and after the parameters. `lua-header-shapes` covers it.
++
++That makes clang's intrinsics readable where `__DEFAULT_FN_ATTRS` sat between the type
++and the name, and `_mm512_set_epi8` takes 64 parameters: `C-MAX-PARAMS` is now 64, so
++`w3b-sdl` stays silent.
+diff --git a/docs/structs-unions.md b/docs/structs-unions.md
+index 63d8b66e..f0062354 100644
+--- a/docs/structs-unions.md
++++ b/docs/structs-unions.md
+@@ -781,7 +781,9 @@ site emits.
+ ## Recognized libc function attributes: `noreturn` and `returns_twice`
+ 
+ A C header carries no attribute metadata the importer trusts — even an
+-explicit `__attribute__((noreturn))` is discarded — so a small set of
++explicit `__attribute__((noreturn))` is discarded, wherever GCC admits it: before
++the declaration, after it, or between the return type and the name (`void
++__attribute__((noreturn)) f(void);`, Lua's `l_noret`) — so a small set of
+ well-known libc functions is recognized **by name** instead and gets the
+ matching LLVM attribute on its `declare`: `exit`, `abort`, `_exit`, `_Exit`,
+ `quick_exit`, `abort_handler_s`, `longjmp` and `siglongjmp` get `noreturn` (a
+diff --git a/src/cheader.nuc b/src/cheader.nuc
+index 506ae2ad..5ab39a32 100644
+--- a/src/cheader.nuc
++++ b/src/cheader.nuc
+@@ -867,7 +867,8 @@
+ ; and the gate's cap: a declaration with more parameters than this is skipped
+ ; rather than silently truncated. Before W3b the array was 16 entries and
+ ; `num-params` was incremented past it, so `type-set-params` read off the end.
+-(defconst C-MAX-PARAMS 32)
++; 64 is clang's widest, `_mm512_set_epi8`.
++(defconst C-MAX-PARAMS 64)
+ 
+ ; Record that `fname`'s declaration was skipped, and — when `loud` — say so on
+ ; stderr immediately. `g-cheader-skipped` (declared in nucleusc.nuc, above
+@@ -1358,7 +1359,9 @@
+     ; C decays an array in a parameter or return position; a struct MEMBER keeps
+     ; its extent, which is why the call is here and not in c-parse-type.
+     (set! ret-type (as ptr (array-decay ret-type)))
+-    (set! pos (c-skip-ws buf pos len))
++    ; GCC admits attributes between the return type and the name, where Lua's
++    ; `l_noret` puts `__attribute__((noreturn))`; they read as the name otherwise.
++    (set! pos (c-skip-attributes buf pos len))
+     (when (and (< pos len) (= (cstr-byte-at buf pos) 40))
+       (let (fr:i32 (c-parse-fnret-decl buf pos len ret-type out-end decl-start))
+         (when (>= fr 0) (return fr))))
+diff --git a/tests/fixtures/lua-shapes.c b/tests/fixtures/lua-shapes.c
+index a61d0b83..cf506591 100644
+--- a/tests/fixtures/lua-shapes.c
++++ b/tests/fixtures/lua-shapes.c
+@@ -1,3 +1,10 @@
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
+ #include "lua-shapes.h"
+ long long (ls_twice) (long long n) { return 2 * n; }
+ const char *(ls_name) (int i) { return i ? "one" : "zero"; }
++void ls_die (const char *fmt, ...) {
++  va_list ap; va_start(ap, fmt); vprintf(fmt, ap); va_end(ap);
++  exit(0);
++}
+diff --git a/tests/fixtures/lua-shapes.h b/tests/fixtures/lua-shapes.h
+index 23f8c2d1..6e93dc0d 100644
+--- a/tests/fixtures/lua-shapes.h
++++ b/tests/fixtures/lua-shapes.h
+@@ -1,6 +1,7 @@
+-/* Two shapes lua.h and lauxlib.h use throughout (nuc-lua ISSUE-002, ISSUE-003). */
++/* Shapes Lua's headers use throughout (nuc-lua ISSUE-002, ISSUE-003, ISSUE-026). */
+ typedef struct LS LS;
+ typedef int (*LCF)(LS *L);
+ extern long long (ls_twice) (long long n);
+ extern const char *(ls_name) (int i);
+ typedef struct LReg { const char *name; LCF func; } LReg;
++extern void __attribute__((noreturn)) ls_die (const char *fmt, ...);
+diff --git a/tests/fixtures/w3b-skip.h b/tests/fixtures/w3b-skip.h
+index 76e36622..7d9a3fb0 100644
+--- a/tests/fixtures/w3b-skip.h
++++ b/tests/fixtures/w3b-skip.h
+@@ -26,4 +26,4 @@ void w3b_skip_void(int a, void b);
+ /* More parameters than the fixed parameter array holds: the arity is counted
+  * past the cap so the gate sees the real count and skips, rather than silently
+  * registering a truncated signature. */
+-void w3b_skip_many(int a1, int a2, int a3, int a4, int a5, int a6, int a7, int a8, int a9, int a10, int a11, int a12, int a13, int a14, int a15, int a16, int a17, int a18, int a19, int a20, int a21, int a22, int a23, int a24, int a25, int a26, int a27, int a28, int a29, int a30, int a31, int a32, int a33);
++void w3b_skip_many(int a1, int a2, int a3, int a4, int a5, int a6, int a7, int a8, int a9, int a10, int a11, int a12, int a13, int a14, int a15, int a16, int a17, int a18, int a19, int a20, int a21, int a22, int a23, int a24, int a25, int a26, int a27, int a28, int a29, int a30, int a31, int a32, int a33, int a34, int a35, int a36, int a37, int a38, int a39, int a40, int a41, int a42, int a43, int a44, int a45, int a46, int a47, int a48, int a49, int a50, int a51, int a52, int a53, int a54, int a55, int a56, int a57, int a58, int a59, int a60, int a61, int a62, int a63, int a64, int a65);
+diff --git a/tests/suite-cdecl.nuc b/tests/suite-cdecl.nuc
+index 40d96c11..7030c386 100644
+--- a/tests/suite-cdecl.nuc
++++ b/tests/suite-cdecl.nuc
+@@ -120,7 +120,7 @@
+     (try (check-warning-at ds "./tests/fixtures/w3b-skip.h" 24
+            "skipping C declaration 'w3b_skip_void': a 'void' parameter"))
+     (try (check-warning-at ds "./tests/fixtures/w3b-skip.h" 29
+-           "skipping C declaration 'w3b_skip_many': more than 32 parameters"))
++           "skipping C declaration 'w3b_skip_many': more than 64 parameters"))
+     (try (check-ir-parses iv))
+     (drop &c))
+   (return (ok)))
+diff --git a/tests/suite-cimport.nuc b/tests/suite-cimport.nuc
+index f5fe96b0..e96feeb9 100644
+--- a/tests/suite-cimport.nuc
++++ b/tests/suite-cimport.nuc
+@@ -912,11 +912,13 @@ int main(void){
+ (defn main ():i32
+   (printf \"%lld %s %zu %d\\n\" (ls_twice 21) (ls_name 1) (sizeof LReg)
+           (if (= ((aref regs 1) 'func) null) 0 1))
+-  (return 0))
++  (fflush stdout)
++  (ls_die \"%s %d\\n\" \"died\" 7)
++  (return 1))
+ "))
+         got:String (try (build-run-file "" "--link-arg=tests/fixtures/lua-shapes.c"
+                                         (string-as-view &p))))
+-    (try (check-golden (string-as-view &got) "42 one 16 0\n"))
++    (try (check-golden (string-as-view &got) "42 one 16 0\ndied 7\n"))
+     (drop &got)
+     (drop &p)
+     (return (ok))))
+-- 
+2.47.3
+

@@ -47,6 +47,11 @@
 ; The largest size that fits both size_t and lua_Integer (llimits.h's MAX_SIZE).
 (defmacro MAX_SIZE () `(cast_sizet LUA_MAXINTEGER))
 
+; C's offsetof, read off a struct placed at a fixed address: offsetof itself is
+; missing, and a field's offset can't be had otherwise (ISSUE-010).
+(defmacro offsetof (T f)
+  `(unsafe/cast usize (- (unsafe/cast i64 (as ptr (ref ((unsafe/cast (ptr ~T) 4096) '~f)))) 4096)))
+
 ; 'p' moved by 'n' elements, whatever integer type 'n' is.
 (defmacro p+ (p n) `(unsafe/ptr+ ~p (unsafe/cast i64 ~n)))
 

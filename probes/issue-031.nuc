@@ -1,0 +1,11 @@
+; ISSUE-031: a row of a header's 2-D array field doesn't decay, so it can't be indexed.
+; expect: prints `21`; actual: `(aref a i) place: operand must be typed pointer`
+; run: $NUCLEUSC --cflag=-I$D $P -o $W/p && $W/p
+; fixed-when-output: 21
+(import-use "stdio.h")
+(import-use "issue-031.h")
+(defn main ():i32
+  (let (g:(ptr Grid) (alloca Grid))
+    (set! (aref (aref (g 'a) 2) 1) 21)
+    (printf "%d\n" (aref (aref (g 'a) 2) 1))
+    (return 0)))
