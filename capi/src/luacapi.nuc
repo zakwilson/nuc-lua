@@ -48,6 +48,10 @@
 
 ; --- lua.h ---
 
+; `extern const char lua_ident[]`: the importer skips an array variable
+; (ISSUE-046). Its length is unknown here; only its address is read.
+(extern lua_ident:(array i8 1))
+
 (defmacro lua_upvalueindex (i) `(- LUA_REGISTRYINDEX ~i))
 (defmacro lua_call (L n r) `(lua_callk ~L ~n ~r 0 null))
 (defmacro lua_pcall (L n r f) `(lua_pcallk ~L ~n ~r ~f 0 null))

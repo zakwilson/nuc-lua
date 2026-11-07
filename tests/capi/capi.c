@@ -125,8 +125,13 @@ static void t_stack(lua_State *L) {
   stack(L, "copy+pushvalue");
   lua_pop(L, 2);
   stack(L, "pop");
-  say("stringtonumber %zu %zu %zu\n", lua_stringtonumber(L, "0x10"),
-      lua_stringtonumber(L, " 1e2 "), lua_stringtonumber(L, "zz"));
+  {
+    /* in turn: as arguments of one call, their pushes come in any order */
+    size_t s1 = lua_stringtonumber(L, "0x10");
+    size_t s2 = lua_stringtonumber(L, " 1e2 ");
+    size_t s3 = lua_stringtonumber(L, "zz");
+    say("stringtonumber %zu %zu %zu\n", s1, s2, s3);
+  }
   stack(L, "stringtonumber");
   {
     char nb[LUA_N2SBUFFSZ];

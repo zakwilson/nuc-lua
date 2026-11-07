@@ -40,15 +40,16 @@ Ranked by porter pain removed per unit of language work.
 | 34 | ISSUE-042 | `=` on two `CStr`s compares contents, so a C pointer test ported as written reads through null | minor | design | worked-around |
 | 35 | ISSUE-041 | `bit-not` of an unsigned value is refused: `-1` doesn't fit it | papercut | bug | worked-around |
 | 36 | ISSUE-044 | A global `i8` array takes no string initializer, so `lua_ident` is spelled out in bytes | papercut | missing-feature | worked-around |
-| 37 | ISSUE-024 | A `_`-prefixed macro isn't imported, even ISO C's `_IOFBF` | papercut | design | worked-around |
-| 38 | ISSUE-020 | `set!` won't expand a macro in its place | papercut | missing-feature | worked-around |
-| 39 | ISSUE-025 | `sizeof` is a signed integer, so comparing a size with it is refused | papercut | design | worked-around |
-| 40 | ISSUE-035 | `unsafe/cast` from a function pointer to an integer is refused | papercut | bug | worked-around |
-| 41 | ISSUE-036 | A `defvar`'s array initializer isn't macroexpanded before its shape is checked | papercut | bug | worked-around |
-| 42 | ISSUE-037 | A `defstruct` can't complete a struct its header declares without a body | papercut | missing-feature | worked-around |
-| 43 | ISSUE-038 | A parameter named like a special form is accepted, then misparsed at its use | papercut | design | worked-around |
-| 44 | ISSUE-039 | A `build.edn` makes one program, and a second sharing its sources warns at every build | papercut | tooling | worked-around |
-| 45 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
+| 37 | ISSUE-046 | A header's array variable, `extern const char lua_ident[]`, isn't imported | papercut | known-limitation | worked-around |
+| 38 | ISSUE-024 | A `_`-prefixed macro isn't imported, even ISO C's `_IOFBF` | papercut | design | worked-around |
+| 39 | ISSUE-020 | `set!` won't expand a macro in its place | papercut | missing-feature | worked-around |
+| 40 | ISSUE-025 | `sizeof` is a signed integer, so comparing a size with it is refused | papercut | design | worked-around |
+| 41 | ISSUE-035 | `unsafe/cast` from a function pointer to an integer is refused | papercut | bug | worked-around |
+| 42 | ISSUE-036 | A `defvar`'s array initializer isn't macroexpanded before its shape is checked | papercut | bug | worked-around |
+| 43 | ISSUE-037 | A `defstruct` can't complete a struct its header declares without a body | papercut | missing-feature | worked-around |
+| 44 | ISSUE-038 | A parameter named like a special form is accepted, then misparsed at its use | papercut | design | worked-around |
+| 45 | ISSUE-039 | A `build.edn` makes one program, and a second sharing its sources warns at every build | papercut | tooling | worked-around |
+| 46 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
 
 ## ISSUE-001: A C variadic couldn't be defined in Nucleus
 
@@ -411,6 +412,22 @@ filled once into a global it runs at 0.97. The global is written on first use, s
 threads starting their first Lua call at once race to store the same values. A local
 array, or `label-addr` in a `defconst`/`defvar` aggregate inside the function, would
 let the compiler emit C's constant table.
+
+## ISSUE-046: A header's array variable, `extern const char lua_ident[]`, isn't imported
+
+- **Severity:** papercut
+- **Kind:** known-limitation
+- **Status:** worked-around
+- **Probe:** `probes/issue-046.nuc` — expected `UTC`; actual `undefined: 'tzname' — its
+  C header declaration was skipped (/usr/include/time.h:224: an array variable)`
+- **Port sites:** `capi/src/luacapi.nuc`, for `tests/capi/nuc`
+- **Workaround:** `(extern lua_ident:(array i8 1))` in the binding: the length is a
+  guess, which is harmless while only the address is read.
+
+Context: `lua.h` declares one variable, `extern const char lua_ident[]`, and the
+importer skips it, saying why (to its credit). The Nucleus test module is the first
+code to read it from outside the core. An unsized array could import as an `extern`
+of `(array T 0)`, or as a pointer-valued name, as C's decay treats it.
 
 ## ISSUE-024: A `_`-prefixed macro isn't imported, even ISO C's `_IOFBF`
 

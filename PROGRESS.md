@@ -38,7 +38,8 @@ object model, the compiler, execution state, the collector and the VM (§10).
 | 5 Execution state | done: `lstate`, `ldebug`, `ldo`, `lapi` |
 | 6 The collector | done: `lgc`; the suite passes collecting as often as it can, in both modes |
 | 7 The VM | done: `lvm`, threaded dispatch; no stock object linked; benchmarked; user test request below |
-| 8–11 | not started |
+| 8 Nucleus libraries | in progress: `tests/capi/nuc` (capi.c in Nucleus) passes the matrix in both hosts |
+| 9–11 | not started |
 
 ### Nucleus
 
@@ -109,6 +110,10 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
 - M7: with `lvm` in Nucleus, every gate passes (suite, both stressed runs, matrix,
   bytecode, tables, probes) and `check-nm.sh` finds no stock object in either program.
   The benchmark below runs at 0.92 to 1.14 times stock.
+- M8 so far: `tests/capi/nuc`, capi.c in Nucleus on the binding alone, prints the C
+  module's 127-line transcript in stock `lua` and the port. It found one line of
+  capi.c that depended on gcc's argument order (three `lua_stringtonumber` pushes as
+  arguments of one `printf`), now sequenced.
 - The spike: a Nucleus `luaopen_` module whose function raises with `luaL_error`
   (a real C variadic call) is caught by `pcall` in stock `lua`.
 

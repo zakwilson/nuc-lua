@@ -1,0 +1,13 @@
+; ISSUE-046: a header's array variable, C's `extern char *tzname[2]` or lua.h's
+; `extern const char lua_ident[]`, isn't imported.
+; expect: prints `UTC`; actual: `undefined: 'tzname' — its C header declaration was skipped (… an array variable)`
+; run: $NUCLEUSC $P -o $W/p && $W/p
+; fixed-when-output: UTC
+(import-use "stdio.h")
+(import-use "stdlib.h")
+(import-use "time.h")
+(defn main ():i32
+  (setenv "TZ" "UTC" 1)
+  (tzset)
+  (printf "%s\n" (aref tzname 0))
+  (return 0))

@@ -1,0 +1,7 @@
+;; tests/capi/capi.c in Nucleus (PROMPT.md §7.3): the same module, built on the
+;; binding alone, printing the same transcript.
+{:kind :library
+ :name "capi"
+ :version "1.0"
+ :shared true
+ :deps {luacapi {:path "../../../capi"}}}

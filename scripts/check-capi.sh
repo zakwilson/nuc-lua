@@ -64,7 +64,7 @@ for host in $hosts; do
     echo x | cell "mayi-$kind-ready" "$host" "$ROOT/tests/capi/mayi.lua" "so/$kind" ready
   done
   for kind in c n; do
-    [ -f "$ROOT/build/so/$kind/capi.so" ] || { [ $kind = n ] && continue; bad "build/so/$kind/capi.so is missing"; continue; }
+    [ -f "$ROOT/build/so/$kind/capi.so" ] || { bad "build/so/$kind/capi.so is missing (setup.sh, build-libs.sh)"; continue; }
     sleep 0.2 | cell "capi-$kind" "$host" "$ROOT/tests/capi/driver.lua" "so/$kind"
   done
 done
