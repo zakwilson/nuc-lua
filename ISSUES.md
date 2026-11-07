@@ -7,45 +7,46 @@ Ranked by porter pain removed per unit of language work.
 | 1 | ISSUE-005 | A library's public `defn` is preempted by any same-named symbol in the process | major | design | open |
 | 2 | ISSUE-023 | An array field of a nested place decayed to a copy's address, losing every store | major | bug | fixed in nucleus `0081d2a` |
 | 3 | ISSUE-032 | A store to a field of a union member was refused as a temporary | major | bug | fixed in nucleus `1ae171b` |
-| 4 | ISSUE-033 | A compilation could hold at most 256 macros | blocker | bug | fixed in nucleus `1ae171b` |
-| 5 | ISSUE-026 | A declaration with an attribute between its return type and its name was skipped | blocker | bug | fixed in nucleus `f282cfe` |
-| 6 | ISSUE-022 | A definition that misses its header's prototype silently becomes a mangled overload | major | design | worked-around |
-| 7 | ISSUE-004 | A function's address isn't a constant in an aggregate initializer | major | missing-feature | worked-around |
-| 8 | ISSUE-013 | An imported file can't define a function its header declares | blocker | bug | fixed in nucleus `5dab7cb` |
-| 9 | ISSUE-001 | A C variadic couldn't be defined in Nucleus | major | known-limitation | fixed in nucleus `336a93b` |
-| 10 | ISSUE-002 | `RET (name)(args)`, how Lua declares every function, was skipped by a header import | blocker | known-limitation | fixed in nucleus `beb0472` |
-| 11 | ISSUE-006 | Calling a C variadic by `declare` passed the tail unpromoted, with `%al` unset | major | bug | fixed in nucleus `cd516e6` |
-| 12 | ISSUE-003 | A `defvar` array of a header's struct was refused as opaque | major | bug | fixed in nucleus `beb0472` |
-| 13 | ISSUE-008 | Integer to float takes `unsafe/cast` | major | design | worked-around |
-| 14 | ISSUE-027 | Unary minus on a float is `0 - x`, so `(- 0.0)` is `0.0`, not `-0.0` | major | bug | worked-around |
-| 15 | ISSUE-019 | A header's `char *` is `(ptr i8)`, and an `if` won't join it with a string literal | minor | design | worked-around |
-| 16 | ISSUE-021 | Pointers can't be subtracted | minor | missing-feature | worked-around |
-| 17 | ISSUE-028 | `bit-not` of an unsigned operand is refused | minor | bug | worked-around |
-| 18 | ISSUE-029 | A constant macro built with a function-like macro isn't imported: `LUA_VNUMINT` | minor | known-limitation | worked-around |
-| 19 | ISSUE-030 | A `defconst` over a header constant is refused once a `defstruct` uses it as an array length | minor | bug | worked-around |
-| 20 | ISSUE-031 | A row of a header's 2-D array field doesn't decay, so it can't be indexed | minor | bug | worked-around |
-| 21 | ISSUE-034 | In a namespaced file, a header type named like a prelude type is silently the prelude's | minor | design | worked-around |
-| 22 | ISSUE-018 | A header's expression macros aren't imported: `errno`, `WIFEXITED` | minor | known-limitation | worked-around |
-| 23 | ISSUE-007 | A shared library is always named `lib<name>.so` | minor | tooling | worked-around |
-| 24 | ISSUE-010 | There is no `offsetof` | minor | missing-feature | worked-around |
-| 25 | ISSUE-012 | A header's string macros aren't imported | minor | known-limitation | worked-around |
-| 26 | ISSUE-011 | No `sizeof` of an expression, so no array length | minor | missing-feature | worked-around |
-| 27 | ISSUE-015 | Only the entry file can export a strong symbol | minor | design | worked-around |
-| 28 | ISSUE-016 | No byte literal: `\e` is a 32-bit Char and won't convert to `i8` | minor | design | worked-around |
-| 29 | ISSUE-017 | A `CStr` can't be indexed | minor | design | worked-around |
-| 30 | ISSUE-014 | `SIG_DFL` imports as the integer 0 | minor | interop | worked-around |
-| 31 | ISSUE-040 | A later declarator in a field list (`*previous, *next`) imported as a bare `ptr` | minor | bug | fixed in nucleus `a64ac73` |
-| 32 | ISSUE-042 | `=` on two `CStr`s compares contents, so a C pointer test ported as written reads through null | minor | design | worked-around |
-| 33 | ISSUE-041 | `bit-not` of an unsigned value is refused: `-1` doesn't fit it | papercut | bug | worked-around |
-| 34 | ISSUE-024 | A `_`-prefixed macro isn't imported, even ISO C's `_IOFBF` | papercut | design | worked-around |
-| 35 | ISSUE-020 | `set!` won't expand a macro in its place | papercut | missing-feature | worked-around |
-| 36 | ISSUE-025 | `sizeof` is a signed integer, so comparing a size with it is refused | papercut | design | worked-around |
-| 37 | ISSUE-035 | `unsafe/cast` from a function pointer to an integer is refused | papercut | bug | worked-around |
-| 38 | ISSUE-036 | A `defvar`'s array initializer isn't macroexpanded before its shape is checked | papercut | bug | worked-around |
-| 39 | ISSUE-037 | A `defstruct` can't complete a struct its header declares without a body | papercut | missing-feature | worked-around |
-| 40 | ISSUE-038 | A parameter named like a special form is accepted, then misparsed at its use | papercut | design | worked-around |
-| 41 | ISSUE-039 | A `build.edn` makes one program, and a second sharing its sources warns at every build | papercut | tooling | worked-around |
-| 42 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
+| 4 | ISSUE-043 | A place under a macro call, `&G(L)->mainth.l`, gave the address of a copy | major | bug | fixed in nucleus `275b612` |
+| 5 | ISSUE-033 | A compilation could hold at most 256 macros | blocker | bug | fixed in nucleus `1ae171b` |
+| 6 | ISSUE-026 | A declaration with an attribute between its return type and its name was skipped | blocker | bug | fixed in nucleus `f282cfe` |
+| 7 | ISSUE-022 | A definition that misses its header's prototype silently becomes a mangled overload | major | design | worked-around |
+| 8 | ISSUE-004 | A function's address isn't a constant in an aggregate initializer | major | missing-feature | worked-around |
+| 9 | ISSUE-013 | An imported file can't define a function its header declares | blocker | bug | fixed in nucleus `5dab7cb` |
+| 10 | ISSUE-001 | A C variadic couldn't be defined in Nucleus | major | known-limitation | fixed in nucleus `336a93b` |
+| 11 | ISSUE-002 | `RET (name)(args)`, how Lua declares every function, was skipped by a header import | blocker | known-limitation | fixed in nucleus `beb0472` |
+| 12 | ISSUE-006 | Calling a C variadic by `declare` passed the tail unpromoted, with `%al` unset | major | bug | fixed in nucleus `cd516e6` |
+| 13 | ISSUE-003 | A `defvar` array of a header's struct was refused as opaque | major | bug | fixed in nucleus `beb0472` |
+| 14 | ISSUE-008 | Integer to float takes `unsafe/cast` | major | design | worked-around |
+| 15 | ISSUE-027 | Unary minus on a float is `0 - x`, so `(- 0.0)` is `0.0`, not `-0.0` | major | bug | worked-around |
+| 16 | ISSUE-019 | A header's `char *` is `(ptr i8)`, and an `if` won't join it with a string literal | minor | design | worked-around |
+| 17 | ISSUE-021 | Pointers can't be subtracted | minor | missing-feature | worked-around |
+| 18 | ISSUE-028 | `bit-not` of an unsigned operand is refused | minor | bug | worked-around |
+| 19 | ISSUE-029 | A constant macro built with a function-like macro isn't imported: `LUA_VNUMINT` | minor | known-limitation | worked-around |
+| 20 | ISSUE-030 | A `defconst` over a header constant is refused once a `defstruct` uses it as an array length | minor | bug | worked-around |
+| 21 | ISSUE-031 | A row of a header's 2-D array field doesn't decay, so it can't be indexed | minor | bug | worked-around |
+| 22 | ISSUE-034 | In a namespaced file, a header type named like a prelude type is silently the prelude's | minor | design | worked-around |
+| 23 | ISSUE-018 | A header's expression macros aren't imported: `errno`, `WIFEXITED` | minor | known-limitation | worked-around |
+| 24 | ISSUE-007 | A shared library is always named `lib<name>.so` | minor | tooling | worked-around |
+| 25 | ISSUE-010 | There is no `offsetof` | minor | missing-feature | worked-around |
+| 26 | ISSUE-012 | A header's string macros aren't imported | minor | known-limitation | worked-around |
+| 27 | ISSUE-011 | No `sizeof` of an expression, so no array length | minor | missing-feature | worked-around |
+| 28 | ISSUE-015 | Only the entry file can export a strong symbol | minor | design | worked-around |
+| 29 | ISSUE-016 | No byte literal: `\e` is a 32-bit Char and won't convert to `i8` | minor | design | worked-around |
+| 30 | ISSUE-017 | A `CStr` can't be indexed | minor | design | worked-around |
+| 31 | ISSUE-014 | `SIG_DFL` imports as the integer 0 | minor | interop | worked-around |
+| 32 | ISSUE-040 | A later declarator in a field list (`*previous, *next`) imported as a bare `ptr` | minor | bug | fixed in nucleus `a64ac73` |
+| 33 | ISSUE-042 | `=` on two `CStr`s compares contents, so a C pointer test ported as written reads through null | minor | design | worked-around |
+| 34 | ISSUE-041 | `bit-not` of an unsigned value is refused: `-1` doesn't fit it | papercut | bug | worked-around |
+| 35 | ISSUE-024 | A `_`-prefixed macro isn't imported, even ISO C's `_IOFBF` | papercut | design | worked-around |
+| 36 | ISSUE-020 | `set!` won't expand a macro in its place | papercut | missing-feature | worked-around |
+| 37 | ISSUE-025 | `sizeof` is a signed integer, so comparing a size with it is refused | papercut | design | worked-around |
+| 38 | ISSUE-035 | `unsafe/cast` from a function pointer to an integer is refused | papercut | bug | worked-around |
+| 39 | ISSUE-036 | A `defvar`'s array initializer isn't macroexpanded before its shape is checked | papercut | bug | worked-around |
+| 40 | ISSUE-037 | A `defstruct` can't complete a struct its header declares without a body | papercut | missing-feature | worked-around |
+| 41 | ISSUE-038 | A parameter named like a special form is accepted, then misparsed at its use | papercut | design | worked-around |
+| 42 | ISSUE-039 | A `build.edn` makes one program, and a second sharing its sources warns at every build | papercut | tooling | worked-around |
+| 43 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
 
 ## ISSUE-001: A C variadic couldn't be defined in Nucleus
 
@@ -683,6 +684,26 @@ operand gets a pointer test, so a null held in a variable crashed the suite in
 a global table. Content equality is a fair default for strings, but the same
 spelling means identity on every other pointer, and nothing marks the difference at
 a comparison of two variables. A null operand could at least compare unequal.
+
+## ISSUE-043: A place under a macro call gave the address of a copy
+
+- **Severity:** major
+- **Kind:** bug
+- **Status:** fixed in nucleus `275b612`
+- **Probe:** `probes/issue-043.nuc` — expected `same`; actual `different`
+- **Port sites:** `mainthread` in `state.nuc` and `do.nuc`: `lua_yieldk`, `luaD_throw`,
+  `lua_close`
+- **Workaround:** bind `(G L)` to a name first; fixed instead, since nothing flags the
+  copy and every macro that wraps a field path is exposed.
+
+Context: `lstate.h` defines `mainthread(G)` as `&(G)->mainth.l`, ported as
+`(ref ((~g 'mainth) 'l))`. Called as `(mainthread (G L))`, with `G` itself a macro,
+the address was a stack slot: the typing pass leaves a macro call untyped, so the
+receiver `((G L) 'mainth)` was emitted as a struct value and stored in a temporary.
+With a named `g`, as in `lua_newstate`, it was right, so the port ran until
+`errors.lua` asked `coroutine.yield()` outside a coroutine and got "attempt to yield
+across a C-call boundary": `lua_yieldk` never saw the main thread. A `set!` one level
+deeper was refused as a temporary receiver, which at least was loud.
 
 ## ISSUE-039: A `build.edn` makes one program, and a second sharing its sources warns at every build
 

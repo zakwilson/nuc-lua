@@ -1,0 +1,17 @@
+; ISSUE-043: a place under a macro call, `&G(L)->mainth.l`, gave a copy's address.
+; expect: prints `same`; actual: `different`
+; run: $NUCLEUSC $P -o $W/p && $W/p
+; fixed-when-output: same
+(import-use "stdio.h")
+(defstruct Th n:i32)
+(defstruct Lx pad:i64 l:Th)
+(defstruct Gs y:i32 mainth:Lx)
+(defstruct St g:(ptr Gs))
+(defmacro G (s) `(~s 'g))
+(defmacro mainthread (g) `(ref ((~g 'mainth) 'l)))
+(defn main ():i32
+  (let (s:(ptr St) (alloca St))
+    (set! (s 'g) (alloca Gs))
+    (printf "%s\n" (if (= (as ptr (mainthread (G s))) (as ptr (mainthread (s 'g))))
+                     (as CStr "same") (as CStr "different")))
+    (return 0)))

@@ -1,0 +1,696 @@
+; The stack and the calls: errors as long jumps, growing the stack, calling
+; and returning, coroutines, and protected parsing.
+;
+; ldo.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.do)
+(set-ir-prefix "")
+(import-use "lstate.h")
+(import-use "lapi.h")
+(import-use "ldebug.h")
+(import-use "ldo.h")
+(import-use "lfunc.h")
+(import-use "lgc.h")
+(import-use "lmem.h")
+(import-use "lobject.h")
+(import-use "lparser.h")
+(import-use "lstring.h")
+(import-use "ltable.h")
+(import-use "ltm.h")
+(import-use "lundump.h")
+(import-use "lvm.h")
+(import-use "lzio.h")
+(import-use "setjmp.h")
+(import-use "stdlib.h")
+(import-use "string.h")
+(import-use luacapi)  ; LUA_SIGNATURE
+(import-use lua.util)
+(import-use lua.core)
+
+(defconst LUAI_MAXCCALLS 200)
+(defconst BASIC_STACK_SIZE 40)  ; 2*LUA_MINSTACK
+(defconst STACKERRSPACE 200)    ; room to handle a stack error
+(defconst MAXSTACK 1000000)     ; LUAI_MAXSTACK, below MAXSTACK_BYSIZET
+(defconst ERRORSTACKSIZE 1000200)  ; MAXSTACK + STACKERRSPACE
+(defconst NYCI 0x10001)         ; nyci: one more call, and not yieldable
+(defconst CIST_RECST 12)
+(defconst CIST_NRESULTS 0xff)
+
+(defmacro errorstatus (s) `(> ~s LUA_YIELD))
+(defmacro getCcalls (L) `(bit-and (~L 'nCcalls) 0xffff))
+(defmacro yieldable (L) `(= (bit-and (~L 'nCcalls) 0xffff0000) 0))
+(defmacro incnny (L) `(set! (~L 'nCcalls) (+ (~L 'nCcalls) 0x10000)))
+(defmacro decnny (L) `(set! (~L 'nCcalls) (- (~L 'nCcalls) 0x10000)))
+(defmacro stacksize (th) `(cast_int (stack-diff ((~th 'stack_last) 'p) ((~th 'stack) 'p))))
+(defmacro mainthread (g) `(ref ((~g 'mainth) 'l)))
+(defmacro api_incr_top (L) `(set! ((~L 'top) 'p) (p+ ((~L 'top) 'p) 1)))
+(defmacro get_nresults (cs) `(- (cast_int (bit-and ~cs CIST_NRESULTS)) 1))
+(defmacro getcistrecst (ci) `(cast_uchar (bit-and (bit-shr (~ci 'callstatus) CIST_RECST) 7)))
+(defmacro setcistrecst (ci st)
+  `(set! (~ci 'callstatus) (bit-or (clearbits (~ci 'callstatus) (bit-shl 7 CIST_RECST))
+                                   (bit-shl (as ui32 ~st) CIST_RECST))))
+(defmacro getoah (ci) `(if (!= (bit-and (~ci 'callstatus) CIST_OAH) 0) 1 0))
+(defmacro pcRel (pc p) `(- (cast_int (/ (byte-diff ~pc (~p 'code)) (sizeof Instruction))) 1))
+(defmacro adjustresults (L nres)
+  `(when (and (<= ~nres LUA_MULTRET) (< (as ptr (((~L 'ci) 'top) 'p)) (as ptr ((~L 'top) 'p))))
+     (set! (((~L 'ci) 'top) 'p) ((~L 'top) 'p))))
+(defmacro setclLvalue2s (L o cl)
+  `(let (a:(ptr TValue) (s2v ~o))
+     (set! ((a 'value_) 'gc) (obj2gco ~cl))
+     (set! (a 'tt_) (ctb LUA_VLCL))))
+(defmacro setgcovalue (L obj x)
+  `(let (a:(ptr TValue) ~obj
+         g:(ptr GCObject) ~x)
+     (set! ((a 'value_) 'gc) g)
+     (set! (a 'tt_) (ctb (g 'tt)))))
+; The next CallInfo, allocated if the list ends here.
+(defmacro next_ci (L)
+  `(if (!= (as ptr ((~L 'ci) 'next)) null) ((~L 'ci) 'next) (luaE_extendCI ~L 1)))
+
+; ---- errors ----
+
+; A recover point: the chain of jump buffers. lstate.h only declares the C
+; struct, which a defstruct can't complete (ISSUE-037); L->errorJmp is cast.
+(defstruct LongJmp
+  previous:(ptr LongJmp)
+  b:jmp_buf
+  status:TStatus)
+(defmacro errorJmp (L) `(unsafe/cast (ptr LongJmp) (~L 'errorJmp)))
+
+(defn luaD_seterrorobj (L:(ptr lua_State) errcode:TStatus oldtop:StkId):void
+  (if (= errcode LUA_ERRMEM)  ; the preregistered message
+    (setsvalue2s L oldtop ((G L) 'memerrmsg))
+    (setobjs2s L oldtop (p+ ((L 'top) 'p) -1)))  ; a real error, its object on the top
+  (set! ((L 'top) 'p) (p+ oldtop 1)))
+
+(defn luaD_throw (L:(ptr lua_State) errcode:TStatus):void :noreturn
+  (if (!= (as ptr (L 'errorJmp)) null)  ; a handler?
+    (let (lj:(ptr LongJmp) (errorJmp L))
+      (set! (lj 'status) errcode)
+      (_longjmp (lj 'b) 1)
+      (abort))  ; _longjmp isn't on the importer's noreturn list
+    (let (g:(ptr global_State) (G L)
+          mainth:(ptr lua_State) (mainthread g)
+          status:TStatus (luaE_resetthread L errcode))  ; close every upvalue
+      (set! (L 'status) status)
+      (when (!= (as ptr (mainth 'errorJmp)) null)  ; the main thread has one?
+        (setobjs2s L ((mainth 'top) 'p) (p+ ((L 'top) 'p) -1))  ; the error object
+        (set! ((mainth 'top) 'p) (p+ ((mainth 'top) 'p) 1))
+        (luaD_throw mainth status))  ; throw it again there
+      (when (!= (unsafe/cast ptr (g 'panic)) null)  ; a last chance to jump out
+        ((g 'panic) L))
+      (abort))))
+
+(defn luaD_throwbaselevel (L:(ptr lua_State) errcode:TStatus):void :noreturn
+  (when (!= (as ptr (L 'errorJmp)) null)
+    (while (!= (as ptr ((errorJmp L) 'previous)) null)  ; unroll to the first level
+      (set! (L 'errorJmp) (unsafe/cast (ptr lua_longjmp) ((errorJmp L) 'previous)))))
+  (luaD_throw L errcode))
+
+; 'f' with errors caught: _setjmp returns twice, and nothing it changes in
+; this frame is read after the jump but through 'lj'.
+(defn luaD_rawrunprotected (L:(ptr lua_State) f:Pfunc ud:ptr):TStatus
+  (let (oldnCcalls:ui32 (L 'nCcalls)
+        lj:(ptr LongJmp) (alloca LongJmp))
+    (set! (lj 'status) LUA_OK)
+    (set! (lj 'previous) (errorJmp L))  ; chain the new handler
+    (set! (L 'errorJmp) (unsafe/cast (ptr lua_longjmp) lj))
+    (when (= (_setjmp (lj 'b)) 0)
+      (f L ud))
+    (set! (L 'errorJmp) (unsafe/cast (ptr lua_longjmp) (lj 'previous)))
+    (set! (L 'nCcalls) oldnCcalls)
+    (return (lj 'status))))
+
+; ---- the stack ----
+
+; A stack error while the message handler runs.
+(defn luaD_errerr (L:(ptr lua_State)):void :noreturn
+  (setsvalue2s L ((L 'top) 'p) (luaS_newliteral L "error in error handling"))
+  (api_incr_top L)  ; EXTRA_STACK leaves room
+  (luaD_throw L LUA_ERRERR))
+
+; Room to run a simple function such as a finalizer: BASIC_STACK_SIZE slots,
+; two CallInfos and two C-stack levels.
+(defn luaD_checkminstack (L:(ptr lua_State)):i32
+  (when (>= (getCcalls L) (- LUAI_MAXCCALLS 2))
+    (return 0))
+  (when (and (= (as ptr ((L 'ci) 'next)) null) (= (as ptr (luaE_extendCI L 0)) null))
+    (return 0))
+  (when (and (= (as ptr (((L 'ci) 'next) 'next)) null) (= (as ptr (luaE_extendCI L 0)) null))
+    (return 0))
+  (if (>= (stack-diff ((L 'stack_last) 'p) ((L 'top) 'p)) BASIC_STACK_SIZE)
+    (return 1)
+    (return (luaD_growstack L BASIC_STACK_SIZE 0))))
+
+; Every pointer into the stack, as an offset, while it moves: ISO C forbids
+; using one after the old block is freed (LUAI_STRICT_ADDRESS).
+(defn- relstack (L:(ptr lua_State)):void
+  (set! ((L 'top) 'offset) (savestack L ((L 'top) 'p)))
+  (set! ((L 'tbclist) 'offset) (savestack L ((L 'tbclist) 'p)))
+  (let (up:(ptr UpVal) (L 'openupval))
+    (while (!= (as ptr up) null)
+      (set! ((up 'v) 'offset) (savestack L (uplevel up)))
+      (set! up (((up 'u) 'open) 'next))))
+  (let (ci:(ptr CallInfo) (L 'ci))
+    (while (!= (as ptr ci) null)
+      (set! ((ci 'top) 'offset) (savestack L ((ci 'top) 'p)))
+      (set! ((ci 'func) 'offset) (savestack L ((ci 'func) 'p)))
+      (set! ci (ci 'previous)))))
+
+; And back to pointers.
+(defn- correctstack (L:(ptr lua_State)):void
+  (set! ((L 'top) 'p) (restorestack L ((L 'top) 'offset)))
+  (set! ((L 'tbclist) 'p) (restorestack L ((L 'tbclist) 'offset)))
+  (let (up:(ptr UpVal) (L 'openupval))
+    (while (!= (as ptr up) null)
+      (set! ((up 'v) 'p) (s2v (restorestack L ((up 'v) 'offset))))
+      (set! up (((up 'u) 'open) 'next))))
+  (let (ci:(ptr CallInfo) (L 'ci))
+    (while (!= (as ptr ci) null)
+      (set! ((ci 'top) 'p) (restorestack L ((ci 'top) 'offset)))
+      (set! ((ci 'func) 'p) (restorestack L ((ci 'func) 'offset)))
+      (when (isLua ci)
+        (set! (((ci 'u) 'l) 'trap) 1))  ; luaV_execute must update its 'trap'
+      (set! ci (ci 'previous)))))
+
+; A new size for the stack. A failed allocation raises an error or returns
+; false, as 'raiseerror' says.
+(defn luaD_reallocstack (L:(ptr lua_State) newsize:i32 raiseerror:i32):i32
+  (let (oldsize:i32 (stacksize L)
+        oldstack:StkId ((L 'stack) 'p)
+        oldgcstop:lu_byte ((G L) 'gcstopem))
+    (relstack L)
+    (set! ((G L) 'gcstopem) 1)  ; no emergency collection while pointers are offsets
+    (let (newstack:StkId (luaM_reallocvector L oldstack (+ oldsize EXTRA_STACK) (+ newsize EXTRA_STACK) StackValue))
+      (set! ((G L) 'gcstopem) oldgcstop)
+      (when (= (as ptr newstack) null)  ; it failed?
+        (correctstack L)
+        (when (!= raiseerror 0) (luaM_error L))
+        (return 0))
+      (set! ((L 'stack) 'p) newstack)
+      (correctstack L)
+      (set! ((L 'stack_last) 'p) (p+ ((L 'stack) 'p) newsize))
+      (for (i:i32 (+ oldsize EXTRA_STACK)) (< i (+ newsize EXTRA_STACK)) (inc! i)
+        (setnilvalue2s (p+ newstack i)))  ; erase the new part
+      (return 1))))
+
+; Grows the stack by at least 'n'; a failure raises an error or returns 0.
+(defn luaD_growstack (L:(ptr lua_State) n:i32 raiseerror:i32):i32
+  (let (size:i32 (stacksize L))
+    (when (> size MAXSTACK)
+      ;; already using the space kept for errors, handling a stack error:
+      ;; it can't grow past that
+      (when (!= raiseerror 0) (luaD_errerr L))
+      (return 0))
+    (when (< n MAXSTACK)  ; no arithmetic overflow
+      (let (newsize:i32 (+ size (bit-shr size 1))  ; size * 1.5
+            needed:i32 (+ (cast_int (stack-diff ((L 'top) 'p) ((L 'stack) 'p))) n))
+        (when (> newsize MAXSTACK) (set! newsize MAXSTACK))
+        (when (< newsize needed) (set! newsize needed))  ; what was asked for
+        (when (<= newsize MAXSTACK)
+          (return (luaD_reallocstack L newsize raiseerror)))))
+    ;; a stack overflow: room to handle its message
+    (luaD_reallocstack L ERRORSTACKSIZE raiseerror)
+    (when (!= raiseerror 0)
+      (luaG_runerror L "stack overflow"))
+    (return 0)))
+
+; The stack in use: the highest top of every frame, and the current one.
+(defn- stackinuse (L:(ptr lua_State)):i32
+  (let (lim:StkId ((L 'top) 'p)
+        ci:(ptr CallInfo) (L 'ci))
+    (while (!= (as ptr ci) null)
+      (when (< (as ptr lim) (as ptr ((ci 'top) 'p)))
+        (set! lim ((ci 'top) 'p)))
+      (set! ci (ci 'previous)))
+    (let (res:i32 (+ (cast_int (stack-diff lim ((L 'stack) 'p))) 1))
+      (return (if (< res LUA_MINSTACK) LUA_MINSTACK res)))))
+
+; More than three times the use: down to twice it. A stack that handled an
+; overflow and no longer does comes back to a regular size this way too.
+(defn luaD_shrinkstack (L:(ptr lua_State)):void
+  (let (inuse:i32 (stackinuse L)
+        max:i32 (if (> inuse (/ MAXSTACK 3)) MAXSTACK (* inuse 3)))
+    (when (and (<= inuse MAXSTACK) (> (stacksize L) max))
+      (luaD_reallocstack L (if (> inuse (/ MAXSTACK 2)) MAXSTACK (* inuse 2)) 0))  ; may fail
+    (luaE_shrinkCI L)))
+
+; ---- hooks ----
+
+; Calls the hook for 'event', if there still is one: signals may change
+; 'hook' and 'hookmask'.
+(defn luaD_hook (L:(ptr lua_State) event:i32 line:i32 ftransfer:i32 ntransfer:i32):void
+  (let (hook:lua_Hook (L 'hook))
+    (when (and (!= (unsafe/cast ptr hook) null) (!= (L 'allowhook) 0))
+      (let (ci:(ptr CallInfo) (L 'ci)
+            top:i64 (savestack L ((L 'top) 'p))  ; the original top
+            ci_top:i64 (savestack L ((ci 'top) 'p))
+            ar:(ptr lua_Debug) (alloca lua_Debug))
+        (set! (ar 'event) event)
+        (set! (ar 'currentline) line)
+        (set! (ar 'i_ci) ci)
+        (set! ((L 'transferinfo) 'ftransfer) ftransfer)
+        (set! ((L 'transferinfo) 'ntransfer) ntransfer)
+        (when (and (isLua ci) (< (as ptr ((L 'top) 'p)) (as ptr ((ci 'top) 'p))))
+          (set! ((L 'top) 'p) ((ci 'top) 'p)))  ; protect the whole frame
+        (luaD_checkstack L LUA_MINSTACK)
+        (when (< (as ptr ((ci 'top) 'p)) (as ptr (p+ ((L 'top) 'p) LUA_MINSTACK)))
+          (set! ((ci 'top) 'p) (p+ ((L 'top) 'p) LUA_MINSTACK)))
+        (set! (L 'allowhook) 0)  ; no hooks inside a hook
+        (set! (ci 'callstatus) (bit-or (ci 'callstatus) CIST_HOOKED))
+        (hook L ar)
+        (set! (L 'allowhook) 1)
+        (set! ((ci 'top) 'p) (restorestack L ci_top))
+        (set! ((L 'top) 'p) (restorestack L top))
+        (set! (ci 'callstatus) (clearbits (ci 'callstatus) CIST_HOOKED))))))
+
+; The call hook for a Lua function, if call hooks are on.
+(defn luaD_hookcall (L:(ptr lua_State) ci:(ptr CallInfo)):void
+  (set! (L 'oldpc) 0)  ; for the new function
+  (when (!= (bit-and (L 'hookmask) LUA_MASKCALL) 0)
+    (let (event:i32 (if (!= (bit-and (ci 'callstatus) CIST_TAIL) 0) LUA_HOOKTAILCALL LUA_HOOKCALL)
+          p:(ptr Proto) ((ci_func ci) 'p))
+      (set! (((ci 'u) 'l) 'savedpc) (p+ (((ci 'u) 'l) 'savedpc) 1))  ; hooks expect 'pc' past it
+      (luaD_hook L event -1 1 (as i32 (p 'numparams)))
+      (set! (((ci 'u) 'l) 'savedpc) (p+ (((ci 'u) 'l) 'savedpc) -1)))))
+
+; The return hook, and 'oldpc' for the line hook even when return hooks are off.
+(defn- rethook (L:(ptr lua_State) ci:(ptr CallInfo) nres:i32):void
+  (when (!= (bit-and (L 'hookmask) LUA_MASKRET) 0)
+    (let (firstres:StkId (p+ ((L 'top) 'p) (- nres))
+          delta:i32 0)  ; for a vararg function
+      (when (isLua ci)
+        (let (p:(ptr Proto) ((ci_func ci) 'p))
+          (when (!= (bit-and (p 'flag) PF_VAHID) 0)
+            (set! delta (+ (((ci 'u) 'l) 'nextraargs) (as i32 (p 'numparams)) 1)))))
+      (set! ((ci 'func) 'p) (p+ ((ci 'func) 'p) delta))  ; back to the virtual 'func'
+      (luaD_hook L LUA_HOOKRET -1 (cast_int (stack-diff firstres ((ci 'func) 'p))) nres)
+      (set! ((ci 'func) 'p) (p+ ((ci 'func) 'p) (- delta)))))
+  (let (prev:(ptr CallInfo) (ci 'previous))
+    (when (isLua prev)
+      (set! (L 'oldpc) (pcRel (((prev 'u) 'l) 'savedpc) ((ci_func prev) 'p))))))
+
+; ---- calls ----
+
+; Puts the '__call' metamethod of 'func' below it, to be called instead, or
+; raises an error. The CIST_CCMT bits count the metamethods, and their extra
+; arguments; too many is an error.
+(defn- tryfuncTM (L:(ptr lua_State) func:StkId status:ui32):ui32
+  (let (tm:(ptr TValue) (luaT_gettmbyobj L (s2v func) TM_CALL))
+    (when (ttisnil tm)
+      (luaG_callerror L (s2v func)))
+    (let (p:StkId ((L 'top) 'p))
+      (while (> (as ptr p) (as ptr func))  ; open a slot
+        (setobjs2s L p (p+ p -1))
+        (set! p (p+ p -1))))
+    (api_incr_top L)  ; the caller made room
+    (setobj2s L func tm)
+    (when (= (bit-and status MAX_CCMT) MAX_CCMT)  ; the counter is full?
+      (luaG_runerror L "'__call' chain too long"))
+    (return (+ status (bit-shl (as ui32 1) CIST_CCMT)))))
+
+(defn- genmoveresults (L:(ptr lua_State) res:StkId nres0:i32 wanted:i32):void
+  (let (firstresult:StkId (p+ ((L 'top) 'p) (- nres0))
+        nres:i32 (if (> nres0 wanted) wanted nres0)  ; drop the extra ones
+        i:i32 0)
+    (while (< i nres)
+      (setobjs2s L (p+ res i) (p+ firstresult i))
+      (inc! i))
+    (while (< i wanted)  ; nils for the missing ones
+      (setnilvalue2s (p+ res i))
+      (inc! i))
+    (set! ((L 'top) 'p) (p+ res wanted))))
+
+; Moves 'fwanted' - 1 of the 'nres' results to 'res', the usual counts first.
+; CIST_TBC in 'fwanted' forces the general case.
+(defn- moveresults (L:(ptr lua_State) res0:StkId nres:i32 fwanted:ui32):void
+  (case (as i32 fwanted)
+    1 (set! ((L 'top) 'p) res0)  ; no values wanted
+    2 (do (if (= nres 0)  ; one
+            (setnilvalue2s res0)
+            (setobjs2s L res0 (p+ ((L 'top) 'p) (- nres))))
+          (set! ((L 'top) 'p) (p+ res0 1)))
+    0 (genmoveresults L res0 nres nres)  ; LUA_MULTRET + 1: all of them
+    (let (wanted:i32 (get_nresults fwanted)
+          res:StkId res0)
+      (when (!= (bit-and fwanted CIST_TBC) 0)  ; to-be-closed variables?
+        (set! (((L 'ci) 'u2) 'nres) nres)
+        (set! ((L 'ci) 'callstatus) (bit-or ((L 'ci) 'callstatus) CIST_CLSRET))  ; in case of yields
+        (set! res (luaF_close L res CLOSEKTOP 1))
+        (set! ((L 'ci) 'callstatus) (clearbits ((L 'ci) 'callstatus) CIST_CLSRET))
+        (when (!= (L 'hookmask) 0)  ; the hook comes after the '__close's
+          (let (savedres:i64 (savestack L res))
+            (rethook L (L 'ci) nres)
+            (set! res (restorestack L savedres))))  ; the hook may move the stack
+        (when (= wanted LUA_MULTRET)
+          (set! wanted nres)))
+      (genmoveresults L res nres wanted))))
+
+; Ends a call: the return hook, the results moved into place, and the
+; caller's CallInfo. With variables to close, the hook comes after them.
+(defn luaD_poscall (L:(ptr lua_State) ci:(ptr CallInfo) nres:i32):void
+  (let (fwanted:ui32 (bit-and (ci 'callstatus) (as ui32 (bit-or CIST_TBC CIST_NRESULTS))))
+    (when (and (!= (L 'hookmask) 0) (= (bit-and fwanted CIST_TBC) 0))
+      (rethook L ci nres))
+    (moveresults L ((ci 'func) 'p) nres fwanted)
+    (set! (L 'ci) (ci 'previous))))
+
+; A new frame. Only the result count, CIST_C and the extra-argument count are
+; set in 'status' yet, all in 16 bits.
+(defn- prepCallInfo (L:(ptr lua_State) func:StkId status:ui32 top:StkId):(ptr CallInfo)
+  (let (ci:(ptr CallInfo) (next_ci L))
+    (set! (L 'ci) ci)
+    (set! ((ci 'func) 'p) func)
+    (set! (ci 'callstatus) status)
+    (set! ((ci 'top) 'p) top)
+    (return ci)))
+
+; Calls a C function.
+(defn- precallC (L:(ptr lua_State) func0:StkId status:ui32 f:lua_CFunction):i32
+  (let (func:StkId func0)
+    (checkstackp L LUA_MINSTACK func)
+    (let (ci:(ptr CallInfo) (prepCallInfo L func (bit-or status CIST_C) (p+ ((L 'top) 'p) LUA_MINSTACK)))
+      (when (!= (bit-and (L 'hookmask) LUA_MASKCALL) 0)
+        (luaD_hook L LUA_HOOKCALL -1 1 (- (cast_int (stack-diff ((L 'top) 'p) func)) 1)))
+      (let (n:i32 (f L))
+        (luaD_poscall L ci n)
+        (return n)))))
+
+; A tail call's frame, over the current one. 'narg1' counts the arguments and
+; the function. The C function's result count, or -1 for a Lua function.
+(defn luaD_pretailcall (L:(ptr lua_State) ci:(ptr CallInfo) func0:StkId narg10:i32 delta:i32):i32
+  (let (status:ui32 (as ui32 (+ LUA_MULTRET 1))
+        func:StkId func0
+        narg1:i32 narg10)
+    (while true
+      (case (as i32 (ttypetag (s2v func)))
+        LUA_VCCL (return (precallC L func status ((clCvalue (s2v func)) 'f)))
+        LUA_VLCF (return (precallC L func status (fvalue (s2v func))))
+        LUA_VLCL (let (p:(ptr Proto) ((clLvalue (s2v func)) 'p)
+                       fsize:i32 (as i32 (p 'maxstacksize))  ; the frame's size
+                       nfixparams:i32 (as i32 (p 'numparams)))
+                   (checkstackp L (- fsize delta) func)
+                   (set! ((ci 'func) 'p) (p+ ((ci 'func) 'p) (- delta)))  ; the real 'func', if vararg
+                   (for (i:i32 0) (< i narg1) (inc! i)  ; move the function and arguments down
+                     (setobjs2s L (p+ ((ci 'func) 'p) i) (p+ func i)))
+                   (set! func ((ci 'func) 'p))
+                   (while (<= narg1 nfixparams)
+                     (setnilvalue2s (p+ func narg1))  ; the missing arguments
+                     (inc! narg1))
+                   (set! ((ci 'top) 'p) (p+ func (+ 1 fsize)))
+                   (set! (((ci 'u) 'l) 'savedpc) (p 'code))
+                   (set! (ci 'callstatus) (bit-or (ci 'callstatus) CIST_TAIL))
+                   (set! ((L 'top) 'p) (p+ func narg1))
+                   (return -1))
+        (do (checkstackp L 1 func)  ; not a function: room for the metamethod
+            (set! status (tryfuncTM L func status))
+            (inc! narg1))))
+    (return -1)))
+
+; Prepares a call to the function at 'func', its arguments after it, and runs
+; it if it is a C function. The CallInfo to run for a Lua function; null for a
+; C function, its results on the stack from 'func' on.
+(defn luaD_precall (L:(ptr lua_State) func0:StkId nresults:i32):(ptr CallInfo)
+  (let (status:ui32 (cast_uint (+ nresults 1))
+        func:StkId func0)
+    (while true
+      (case (as i32 (ttypetag (s2v func)))
+        LUA_VCCL (do (precallC L func status ((clCvalue (s2v func)) 'f))
+                     (return null))
+        LUA_VLCF (do (precallC L func status (fvalue (s2v func)))
+                     (return null))
+        LUA_VLCL (let (p:(ptr Proto) ((clLvalue (s2v func)) 'p)
+                       narg:i32 (- (cast_int (stack-diff ((L 'top) 'p) func)) 1)  ; the real arguments
+                       nfixparams:i32 (as i32 (p 'numparams))
+                       fsize:i32 (as i32 (p 'maxstacksize)))
+                   (checkstackp L fsize func)
+                   (let (ci:(ptr CallInfo) (prepCallInfo L func status (p+ func (+ 1 fsize))))
+                     (set! (((ci 'u) 'l) 'savedpc) (p 'code))
+                     (while (< narg nfixparams)
+                       (setnilvalue2s ((L 'top) 'p))  ; the missing arguments
+                       (api_incr_top L)
+                       (inc! narg))
+                     (return ci)))
+        (do (checkstackp L 1 func)  ; not a function: room for the metamethod
+            (set! status (tryfuncTM L func status)))))
+    (return null)))
+
+; A call through C. 'inc' is 1, one more C level, or NYCI, which also makes
+; it not yieldable. It may use EXTRA_STACK, which luaD_precall checks first.
+(defn- ccall (L:(ptr lua_State) func0:StkId nResults:i32 inc:ui32):void
+  (let (func:StkId func0)
+    (set! (L 'nCcalls) (+ (L 'nCcalls) inc))
+    (when (>= (getCcalls L) LUAI_MAXCCALLS)
+      (checkstackp L 0 func)  ; give back any EXTRA_STACK in use
+      (luaE_checkcstack L))
+    (let (ci:(ptr CallInfo) (luaD_precall L func nResults))
+      (when (!= (as ptr ci) null)  ; a Lua function?
+        (set! (ci 'callstatus) (bit-or (ci 'callstatus) CIST_FRESH))  ; a fresh luaV_execute
+        (luaV_execute L ci)))
+    (set! (L 'nCcalls) (- (L 'nCcalls) inc))))
+
+(defn luaD_call (L:(ptr lua_State) func:StkId nResults:i32):void
+  (ccall L func nResults 1))
+
+; luaD_call with no yields in the call.
+(defn luaD_callnoyield (L:(ptr lua_State) func:StkId nResults:i32):void
+  (ccall L func nResults NYCI))
+
+; ---- coroutines ----
+
+; Finishes a lua_pcallk a yield interrupted (finishCcall adjusts the results).
+; If a '__close' yields or errs here, control comes back and this runs again,
+; closing what is still pending; CIST_RECST keeps the error status across.
+(defn- finishpcallk (L:(ptr lua_State) ci:(ptr CallInfo)):TStatus
+  (let (status:TStatus (getcistrecst ci))  ; the original status
+    (if (= status LUA_OK)
+      (set! status LUA_YIELD)  ; a yield interrupted it
+      (let (func:StkId (restorestack L ((ci 'u2) 'funcidx)))  ; an error
+        (set! (L 'allowhook) (getoah ci))
+        (set! func (luaF_close L func status 1))  ; may yield or raise an error
+        (luaD_seterrorobj L status func)
+        (luaD_shrinkstack L)  ; back to size after an overflow
+        (setcistrecst ci LUA_OK)))
+    (set! (ci 'callstatus) (clearbits (ci 'callstatus) CIST_YPCALL))
+    (set! (L 'errfunc) (((ci 'u) 'c) 'old_errfunc))
+    (return status)))  ; errors or yields: unlike lua_pcallk, the status stays
+
+; Finishes a C function a yield interrupted, while it closed its tbc variables
+; in moveresults (redo luaD_poscall) or ran lua_callk/lua_pcallk (finish that,
+; then its continuation). The result count is unknown, so it always adjusts.
+(defn- finishCcall (L:(ptr lua_State) ci:(ptr CallInfo)):void
+  (let (n:i32 0)
+    (if (!= (bit-and (ci 'callstatus) CIST_CLSRET) 0)  ; closing a tbc variable?
+      (set! n ((ci 'u2) 'nres))
+      (let (status:TStatus LUA_YIELD
+            kf:lua_KFunction (((ci 'u) 'c) 'k))  ; the continuation
+        (when (!= (bit-and (ci 'callstatus) CIST_YPCALL) 0)  ; inside lua_pcallk?
+          (set! status (finishpcallk L ci)))
+        (adjustresults L LUA_MULTRET)  ; finish lua_callk
+        (set! n (kf L (as i32 status) (((ci 'u) 'c) 'ctx)))))
+    (luaD_poscall L ci n)))  ; finish luaD_call
+
+; Runs the rest of an interrupted coroutine until its stack is empty, or
+; another interruption jumps out.
+(defn- unroll (L:(ptr lua_State) ud:ptr):void
+  (let (base:(ptr CallInfo) (ref (L 'base_ci)))
+    (while (!= (L 'ci) base)
+      (let (ci:(ptr CallInfo) (L 'ci))
+        (if (not (isLua ci))
+          (finishCcall L ci)
+          (do (luaV_finishOp L)  ; the interrupted instruction
+              (luaV_execute L ci)))))))  ; down to the next C boundary
+
+; A suspended protected call to recover at, or null.
+(defn- findpcall (L:(ptr lua_State)):(ptr CallInfo)
+  (let (ci:(ptr CallInfo) (L 'ci))
+    (while (!= (as ptr ci) null)
+      (when (!= (bit-and (ci 'callstatus) CIST_YPCALL) 0)
+        (return ci))
+      (set! ci (ci 'previous)))
+    (return null)))
+
+; An error in the call to lua_resume, not in the coroutine: no handler sees it
+; and the coroutine lives on.
+(defn- resume_error (L:(ptr lua_State) msg:CStr narg:i32):i32
+  (set! ((L 'top) 'p) (p+ ((L 'top) 'p) (- narg)))  ; drop the arguments
+  (setsvalue2s L ((L 'top) 'p) (luaS_new L msg))
+  (api_incr_top L)
+  (return LUA_ERRRUN))
+
+; lua_resume's work, protected: starting, resuming inside a hook, or resuming
+; a plain yield, with or without a continuation.
+(defn- resume (L:(ptr lua_State) ud:ptr):void
+  (let (n:i32 (deref (unsafe/cast (ptr i32) ud))  ; the arguments
+        firstArg:StkId (p+ ((L 'top) 'p) (- n))
+        ci:(ptr CallInfo) (L 'ci))
+    (if (= (L 'status) LUA_OK)  ; starting?
+      (ccall L (p+ firstArg -1) LUA_MULTRET 0)  ; just call the body
+      (do (set! (L 'status) LUA_OK)  ; running again after a yield
+          (if (isLua ci)  ; it yielded inside a hook?
+            (do (set! (((ci 'u) 'l) 'savedpc) (p+ (((ci 'u) 'l) 'savedpc) -1))  ; luaG_traceexec's increment: not run yet
+                (set! ((L 'top) 'p) firstArg)  ; drop the arguments
+                (luaV_execute L ci))
+            (do (when (!= (unsafe/cast ptr (((ci 'u) 'c) 'k)) null)  ; a continuation?
+                  (set! n ((((ci 'u) 'c) 'k) L LUA_YIELD (((ci 'u) 'c) 'ctx))))
+                (luaD_poscall L ci n)))  ; finish luaD_call
+          (unroll L null)))))
+
+; Unrolls the coroutine, protected, while errors are recoverable: inside a
+; protected call, which findpcall finds. Stops at a normal end, a yield, or
+; an error with no recover point.
+(defn- precover (L:(ptr lua_State) status0:TStatus):TStatus
+  (let (status:TStatus status0)
+    (while (errorstatus status)
+      (let (ci:(ptr CallInfo) (findpcall L))
+        (when (= (as ptr ci) null) (break))
+        (set! (L 'ci) ci)  ; down to the recovery functions
+        (setcistrecst ci status)  ; for finishing the pcall
+        (set! status (luaD_rawrunprotected L unroll null))))
+    (return status)))
+
+(defn lua_resume (L:(ptr lua_State) from:(ptr lua_State) nargs0:i32 nresults:(ptr i32)):i32
+  (let (nargs:i32 nargs0)
+    (if (= (L 'status) LUA_OK)  ; maybe starting
+      (cond (!= (L 'ci) (ref (L 'base_ci)))
+            (return (resume_error L "cannot resume non-suspended coroutine" nargs))
+            (= (stack-diff ((L 'top) 'p) (p+ (((L 'ci) 'func) 'p) 1)) nargs)  ; no function?
+            (return (resume_error L "cannot resume dead coroutine" nargs)))
+      (when (!= (L 'status) LUA_YIELD)  ; it ended with errors?
+        (return (resume_error L "cannot resume dead coroutine" nargs))))
+    (set! (L 'nCcalls) (if (!= (as ptr from) null) (getCcalls from) 0))
+    (when (>= (getCcalls L) LUAI_MAXCCALLS)
+      (return (resume_error L "C stack overflow" nargs)))
+    (set! (L 'nCcalls) (+ (L 'nCcalls) 1))
+    (let (status:TStatus (precover L (luaD_rawrunprotected L resume (as ptr &nargs))))  ; on past recoverable errors
+      (when (errorstatus status)  ; an unrecoverable error
+        (set! (L 'status) status)  ; the thread is dead
+        (luaD_seterrorobj L status ((L 'top) 'p))
+        (set! (((L 'ci) 'top) 'p) ((L 'top) 'p)))
+      (set! (deref nresults) (if (= status LUA_YIELD)
+                               (((L 'ci) 'u2) 'nyield)
+                               (cast_int (stack-diff ((L 'top) 'p) (p+ (((L 'ci) 'func) 'p) 1)))))
+      (return (as i32 status)))))
+
+(defn lua_isyieldable (L:(ptr lua_State)):i32
+  (return (if (yieldable L) 1 0)))
+
+(defn lua_yieldk (L:(ptr lua_State) nresults:i32 ctx:lua_KContext k:lua_KFunction):i32
+  (let (ci:(ptr CallInfo) (L 'ci))
+    (when (not (yieldable L))
+      (if (!= L (mainthread (G L)))
+        (luaG_runerror L "attempt to yield across a C-call boundary")
+        (luaG_runerror L "attempt to yield from outside a coroutine")))
+    (set! (L 'status) LUA_YIELD)
+    (set! ((ci 'u2) 'nyield) nresults)
+    (when (not (isLua ci))  ; not inside a hook
+      (set! (((ci 'u) 'c) 'k) k)
+      (when (!= (unsafe/cast ptr k) null)  ; a continuation?
+        (set! (((ci 'u) 'c) 'ctx) ctx))
+      (luaD_throw L LUA_YIELD))
+    (return 0)))  ; inside a hook: back to luaD_hook
+
+; ---- protected calls ----
+
+(defstruct CloseP level:StkId status:TStatus)
+
+(defn- closepaux (L:(ptr lua_State) ud:ptr):void
+  (let (pcl:(ptr CloseP) (unsafe/cast (ptr CloseP) ud))
+    (luaF_close L (pcl 'level) (pcl 'status) 0)))
+
+; luaF_close, protected, again until no error: the original status, or the
+; error's.
+(defn luaD_closeprotected (L:(ptr lua_State) level:i64 status0:TStatus):TStatus
+  (let (old_ci:(ptr CallInfo) (L 'ci)
+        old_allowhooks:lu_byte (L 'allowhook)
+        status:TStatus status0
+        pcl:(ptr CloseP) (alloca CloseP))
+    (while true
+      (set! (pcl 'level) (restorestack L level))
+      (set! (pcl 'status) status)
+      (set! status (luaD_rawrunprotected L closepaux (as ptr pcl)))
+      (when (= status LUA_OK)  ; no more errors?
+        (return (pcl 'status)))
+      (set! (L 'ci) old_ci)  ; an error: restore and repeat
+      (set! (L 'allowhook) old_allowhooks))
+    (return status)))
+
+; Calls 'func' protected, restoring the thread's state ('allowhook' and the
+; stack level above all) after an error.
+(defn luaD_pcall (L:(ptr lua_State) func:Pfunc u:ptr old_top:i64 ef:i64):TStatus
+  (let (old_ci:(ptr CallInfo) (L 'ci)
+        old_allowhooks:lu_byte (L 'allowhook)
+        old_errfunc:i64 (L 'errfunc))
+    (set! (L 'errfunc) ef)
+    (let (status:TStatus (luaD_rawrunprotected L func u))
+      (when (!= status LUA_OK)  ; an error?
+        (set! (L 'ci) old_ci)
+        (set! (L 'allowhook) old_allowhooks)
+        (set! status (luaD_closeprotected L old_top status))
+        (luaD_seterrorobj L status (restorestack L old_top))
+        (luaD_shrinkstack L))  ; back to size after an overflow
+      (set! (L 'errfunc) old_errfunc)
+      (return status))))
+
+; ---- the protected parser ----
+
+(defstruct SParser
+  z:(ptr ZIO)
+  buff:Mbuffer  ; the scanner's buffer
+  dyd:Dyndata   ; the parser's dynamic structures
+  mode:CStr
+  name:CStr)
+
+(defn- checkmode (L:(ptr lua_State) mode:CStr x:CStr):void
+  (when (= (as ptr (strchr mode (as i32 (aref (bytes x) 0)))) null)
+    (luaO_pushfstring L "attempt to load a %s chunk (mode is '%s')" x mode)
+    (luaD_throw L LUA_ERRSYNTAX)))
+
+; The first slot it takes holds a table that anchors what the loader makes.
+(defn- f_parser (L:(ptr lua_State) ud:ptr):void
+  (let (p:(ptr SParser) (unsafe/cast (ptr SParser) ud)
+        mode:CStr (if (!= (as ptr (p 'mode)) null) (p 'mode) (cstr "bt"))
+        otop:i64 (savestack L ((L 'top) 'p))
+        cl:(ptr LClosure) null)
+    (luaD_checkstack L 2)
+    (let (anchor:(ptr Table) (luaH_new L))
+      (sethvalue2s L ((L 'top) 'p) anchor)  ; anchor the anchor
+      (api_incr_top L)
+      (let (c:i32 (zgetc (p 'z)))  ; the first character
+        (if (= c (as i32 (aref (bytes LUA_SIGNATURE) 0)))
+          (let (fixed:i32 0)
+            (if (!= (as ptr (strchr mode 66)) null)  ; 'B': a fixed buffer
+              (set! fixed 1)
+              (checkmode L mode "binary"))
+            (set! cl (luaU_undump L (p 'z) anchor (p 'name) fixed)))
+          (do (checkmode L mode "text")
+              (set! cl (luaY_parser L (p 'z) anchor (ref (p 'buff)) (ref (p 'dyd)) (p 'name) c))))))
+    (set! ((L 'top) 'p) (restorestack L otop))
+    (setclLvalue2s L ((L 'top) 'p) cl)
+    (api_incr_top L)
+    (luaF_initupvals L cl)))
+
+; Anchors 'obj' in the table 'anchor', its key and value. It sits on the stack
+; first, as luaH_set may collect; a new key gets luaH_set's barrier.
+(defn luaD_anchorobj (L:(ptr lua_State) anchor:(ptr Table) obj:(ptr GCObject)):void
+  (setgcovalue L (s2v ((L 'top) 'p)) obj)
+  (api_incr_top L)
+  (luaH_set L anchor (s2v (p+ ((L 'top) 'p) -1)) (s2v (p+ ((L 'top) 'p) -1)))
+  (set! ((L 'top) 'p) (p+ ((L 'top) 'p) -1)))
+
+(defn luaD_protectedparser (L:(ptr lua_State) z:(ptr ZIO) name:CStr mode:CStr):TStatus
+  (let (p:(ptr SParser) (alloca SParser))
+    (incnny L)  ; no yields while parsing
+    (set! (p 'z) z)
+    (set! (p 'name) name)
+    (set! (p 'mode) mode)
+    (set! (((p 'dyd) 'actvar) 'arr) null) (set! (((p 'dyd) 'actvar) 'size) 0)
+    (set! (((p 'dyd) 'gt) 'arr) null) (set! (((p 'dyd) 'gt) 'size) 0)
+    (set! (((p 'dyd) 'label) 'arr) null) (set! (((p 'dyd) 'label) 'size) 0)
+    (luaZ_initbuffer L (ref (p 'buff)))
+    (let (status:TStatus (luaD_pcall L f_parser (as ptr p) (savestack L ((L 'top) 'p)) (L 'errfunc)))
+      (luaZ_freebuffer L (ref (p 'buff)))
+      (luaM_freearray L (((p 'dyd) 'actvar) 'arr) (((p 'dyd) 'actvar) 'size) Vardesc)
+      (luaM_freearray L (((p 'dyd) 'gt) 'arr) (((p 'dyd) 'gt) 'size) Labeldesc)
+      (luaM_freearray L (((p 'dyd) 'label) 'arr) (((p 'dyd) 'label) 'size) Labeldesc)
+      (decnny L)
+      (return status))))

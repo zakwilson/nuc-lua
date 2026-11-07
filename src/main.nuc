@@ -25,6 +25,7 @@
 (import lua.table)
 (import lua.state)  ; execution state
 (import lua.debug)
+(import lua.do)
 (import lua.opcodes)  ; the compiler
 (import lua.lex)
 (import lua.code)
