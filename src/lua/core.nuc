@@ -390,3 +390,29 @@
 ; An open upvalue points into the stack; a closed one at its own 'value'.
 (defmacro upisopen (up) `(!= ((~up 'v) 'p) (ref ((~up 'u) 'value))))
 (defmacro uplevel (up) `(unsafe/cast (ptr StackValue) ((~up 'v) 'p)))
+
+; ---- lzio.h ----
+; The next byte, or EOZ. 'n' is unsigned, so it is tested before it drops.
+(defmacro zgetc (z)
+  (let (a (gensym))
+    `(let ((~a (ptr ZIO)) ~z)
+       (if (> (~a 'n) 0)
+         (do (set! (~a 'n) (- (~a 'n) 1))
+             (let (c:i32 (as i32 (cast_uchar (deref (~a 'p)))))
+               (set! (~a 'p) (p+ (~a 'p) 1))
+               c))
+         (do (set! (~a 'n) (- (~a 'n) 1))
+             (luaZ_fill ~a))))))
+(defmacro luaZ_buffer (b) `(~b 'buffer))
+(defmacro luaZ_sizebuffer (b) `(~b 'buffsize))
+(defmacro luaZ_bufflen (b) `(~b 'n))
+(defmacro luaZ_buffremove (b i) `(set! (~b 'n) (- (~b 'n) (cast_sizet ~i))))
+(defmacro luaZ_resetbuffer (b) `(set! (~b 'n) 0))
+(defmacro luaZ_initbuffer (L b) `(do (set! (~b 'buffer) null) (set! (~b 'buffsize) 0)))
+(defmacro luaZ_resizebuffer (L b size)
+  (let (m (gensym) sz (gensym))
+    `(let ((~m (ptr Mbuffer)) ~b
+           (~sz usize) ~size)
+       (set! (~m 'buffer) (unsafe/cast (ptr i8) (luaM_saferealloc_ ~L (as ptr (~m 'buffer)) (~m 'buffsize) ~sz)))
+       (set! (~m 'buffsize) ~sz))))
+(defmacro luaZ_freebuffer (L b) `(luaZ_resizebuffer ~L ~b 0))

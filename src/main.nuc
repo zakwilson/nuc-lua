@@ -23,6 +23,8 @@
 (import lua.func)
 (import lua.tm)
 (import lua.table)
+(import lua.opcodes)  ; the compiler
+(import lua.lex)
 (import lua.init)
 (import-use lua.util)
 (import-use "stdio.h")

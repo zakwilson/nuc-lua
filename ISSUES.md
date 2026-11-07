@@ -38,7 +38,8 @@ Ranked by porter pain removed per unit of language work.
 | 32 | ISSUE-020 | `set!` won't expand a macro in its place | papercut | missing-feature | worked-around |
 | 33 | ISSUE-025 | `sizeof` is a signed integer, so comparing a size with it is refused | papercut | design | worked-around |
 | 34 | ISSUE-035 | `unsafe/cast` from a function pointer to an integer is refused | papercut | bug | worked-around |
-| 35 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
+| 35 | ISSUE-036 | A `defvar`'s array initializer isn't macroexpanded before its shape is checked | papercut | bug | worked-around |
+| 36 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
 
 ## ISSUE-001: A C variadic couldn't be defined in Nucleus
 
@@ -570,6 +571,22 @@ f)` fails with "cast: unsupported conversion", though `unsafe/cast` takes a func
 pointer to `ptr` and `ptr` to `usize`, so the two-step spelling works. `as` from a function
 pointer to `ptr` is refused as a reinterpretation, which is fair; the direct `unsafe/cast`,
 whose contract is reinterpreting bits, has no reason to be.
+
+## ISSUE-036: A `defvar`'s array initializer isn't macroexpanded before its shape is checked
+
+- **Severity:** papercut
+- **Kind:** bug
+- **Status:** worked-around
+- **Probe:** `probes/issue-036.nuc`
+- **Port sites:** `luaP_opmodes` in `opcodes.nuc`
+- **Workaround:** the macro makes the whole `defvar`, which works at top level.
+
+Context: `luaP_opmodes` is generated from the opcode rows by a macro expanding to an
+`(array ui8 …)` literal, the shape the slot wants. `(defvar luaP_opmodes:(array ui8 85)
+(with-opcodes opmodes-array))` is refused: "an (array ui8 85) slot must be initialized
+with an (array T ...) literal". The check reads the initializer's syntax before any macro
+in it expands, though the expansion is exactly the literal it asks for. A computed table,
+which the docs recommend `macmap` and `~e` for, is the case it stops.
 
 ## What worked well
 

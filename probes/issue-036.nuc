@@ -1,0 +1,8 @@
+; ISSUE-036: a defvar's array initializer isn't macroexpanded before its shape is checked.
+; expect: prints `3`; actual: `defvar: an (array i32 3) slot must be initialized with an (array T ...) literal`
+; run: $NUCLEUSC $P -o $W/p && $W/p
+; fixed-when-output: 3
+(import-use "stdio.h")
+(defmacro three () `(array i32 1 2 3))
+(defvar g:(array i32 3) (three))
+(defn main ():i32 (printf "%d\n" (aref g 2)) (return 0))

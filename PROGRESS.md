@@ -29,7 +29,8 @@ object model, the compiler, execution state, the collector and the VM (§10).
 | 1 Binding and first library | done: `capi/` (both layers), layout gate, `libs/mayi`, `tests/capi/capi.c`, stock column |
 | 2 Host and libraries | done: `lua.c`, `lauxlib.c`, `linit` and every standard library in Nucleus |
 | 3 Object model | done: `lctype`, `lzio`, `lmem`, `lobject`, `lstring`, `lfunc`, `ltm`, `ltable` |
-| 4–11 | not started |
+| 4 Compiler | in progress: `lopcodes`, `llex` ported; `lcode`, `lparser`, `ldump`, `lundump`, `luac.c` left |
+| 5–11 | not started |
 
 ### Nucleus
 
@@ -85,12 +86,16 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
 - `scripts/build-libs.sh` builds `libs/*` into `build/so/n/`; `setup.sh` builds the C
   modules into `build/so/c/`.
 - `scripts/check-probes.sh`.
+- `scripts/check-bytecode.sh`: the 68 dumps of the suite's files, stripped and not, must be
+  byte-identical to stock's; names the first differing function; cross-loads both ways.
+- `scripts/check-tables.sh`: `luaP_opmodes` and `luai_ctype_` byte-identical to stock's.
 - `scripts/check-suite.sh` runs the official suite (`LUA=` picks the binary).
 
 ## Next
 
-M4, the compiler: `lopcodes`, `llex`, `lcode`, `lparser`, `ldump`, `lundump`, then
-`luac.c`, with the suite and a new `scripts/check-bytecode.sh` (§7.4) after each.
+M4, the compiler: `lcode`, `lparser`, `ldump`, `lundump`, then `luac.c`, with the suite
+and `check-bytecode.sh` after each. `opcodes.nuc` generates `luaP_opmodes` from one
+opcode row table (`with-opcodes`); `luac`'s opcode names come from the same rows.
 
 The core modules import the internal headers (`-Ireference/build/src` in `:cflags`) for
 their layouts. `src/lua/core.nuc` holds the internal headers' macros (`lobject.h`,

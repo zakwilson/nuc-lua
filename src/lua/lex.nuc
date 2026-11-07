@@ -1,0 +1,410 @@
+; The lexical analyzer.
+;
+; llex.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.lex)
+(set-ir-prefix "")
+(import-use "lstate.h")
+(import-use "llex.h")
+(import-use "lparser.h")
+(import-use "lzio.h")
+(import-use "lstring.h")
+(import-use "ltable.h")
+(import-use "lgc.h")
+(import-use "ldo.h")
+(import-use "ldebug.h")
+(import-use "lmem.h")
+(import-use "string.h")
+(import-use lua.util)
+(import-use lua.core)
+(import-use lua.ctype)
+
+(defconst LUA_MINBUFFER 32)  ; the buffer's smallest size
+(defconst LF 10)
+(defconst CR 13)
+(defconst TAB 9)
+(defconst VT 11)
+(defconst FF 12)
+(defconst NUM_RESERVED 23)   ; TK_WHILE - FIRST_RESERVED + 1 (ISSUE-029)
+(defconst INT_MAX 2147483647)
+(defconst LUA_ENV "_ENV")    ; llex.h's string macro (ISSUE-012)
+
+; ORDER RESERVED: llex.h's enum RESERVED, which lparser.c still reads.
+(defvar- luaX_tokens:(array CStr 38)
+  (array CStr "and" "break" "do" "else" "elseif" "end" "false" "for" "function"
+         "global" "goto" "if" "in" "local" "nil" "not" "or" "repeat" "return" "then"
+         "true" "until" "while"
+         "//" ".." "..." "==" ">=" "<=" "~=" "<<" ">>" "::" "<eof>"
+         "<number>" "<integer>" "<name>" "<string>"))
+
+(defmacro next (ls) `(set! (~ls 'current) (zgetc (~ls 'z))))
+(defmacro currIsNewline (ls) `(or (= (~ls 'current) LF) (= (~ls 'current) CR)))
+(defmacro save_and_next (ls) `(do (save ~ls (~ls 'current)) (next ~ls)))
+(defmacro isreserved (ts) `(and (strisshr ~ts) (> (~ts 'extra) 0)))
+
+(defn- save (ls:(ptr LexState) c:i32):void
+  (let (b:(ptr Mbuffer) (ls 'buff))
+    (when (> (+ (luaZ_bufflen b) 1) (luaZ_sizebuffer b))
+      (let (newsize:usize (luaZ_sizebuffer b))
+        (when (>= newsize (* (/ (MAX_SIZE) 3) 2))  ; larger than MAX_SIZE/1.5?
+          (lexerror ls "lexical element too long" 0))
+        (set! newsize (+ newsize (bit-shr newsize 1)))  ; 1.5 times the old one
+        (luaZ_resizebuffer (ls 'L) b newsize)))
+    (set! (deref (p+ (luaZ_buffer b) (luaZ_bufflen b))) (cast_char c))
+    (set! (b 'n) (+ (b 'n) 1))))
+
+(defn luaX_init (L:(ptr lua_State)):void
+  (let (e:(ptr TString) (luaS_newliteral L LUA_ENV))
+    (luaC_fix L (obj2gco e))  ; never collected
+    (for (i:i32 0) (< i NUM_RESERVED) (inc! i)
+      (let (ts:(ptr TString) (luaS_new L (aref luaX_tokens i)))
+        (luaC_fix L (obj2gco ts))  ; reserved words are never collected
+        (set! (ts 'extra) (cast_uchar (+ i 1)))))))
+
+(defn luaX_token2str (ls:(ptr LexState) token:i32):CStr
+  (if (< token FIRST_RESERVED)  ; a single-byte symbol
+    (if (lisprint token)
+      (return (luaO_pushfstring (ls 'L) "'%c'" token))
+      (return (luaO_pushfstring (ls 'L) "'<\\%d>'" token)))  ; a control character
+    (let (s:CStr (aref luaX_tokens (- token FIRST_RESERVED)))
+      (if (< token TK_EOS)  ; symbols and reserved words are quoted
+        (return (luaO_pushfstring (ls 'L) "'%s'" s))
+        (return s)))))  ; names, strings and numerals
+
+(defn- txtToken (ls:(ptr LexState) token:i32):CStr
+  (if (or (= token TK_NAME) (= token TK_STRING) (= token TK_FLT) (= token TK_INT))
+    (do (save ls 0)
+        (return (luaO_pushfstring (ls 'L) "'%s'" (luaZ_buffer (ls 'buff)))))
+    (return (luaX_token2str ls token))))
+
+(defn- lexerror (ls:(ptr LexState) msg:CStr token:i32):void
+  (set! msg (luaG_addinfo (ls 'L) msg (ls 'source) (ls 'linenumber)))
+  (when (!= token 0)
+    (luaO_pushfstring (ls 'L) "%s near %s" msg (txtToken ls token)))
+  (luaD_throw (ls 'L) LUA_ERRSYNTAX))
+
+(defn luaX_syntaxerror (ls:(ptr LexState) msg:CStr):void
+  (lexerror ls msg ((ls 't) 'token)))
+
+; Anchors a string in the scanner's table until compilation ends, by when
+; something else anchors it. This also interns long strings.
+(defn- anchorstr (ls:(ptr LexState) ts:(ptr TString)):(ptr TString)
+  (let (L:(ptr lua_State) (ls 'L)
+        oldts:(ptr TValue) (alloca TValue)
+        tag:i32 (as i32 (luaH_getstr (ls 'h) ts oldts)))
+    (when (not (tagisempty tag))  ; already there
+      (return (tsvalue oldts)))
+    (let (stv:(ptr TValue) (s2v ((L 'top) 'p)))  ; the string, anchored on the stack
+      (set! ((L 'top) 'p) (p+ ((L 'top) 'p) 1))
+      (setsvalue L stv ts)
+      (luaH_set L (ls 'h) stv stv)  ; t[string] = string; not a metatable, so no cache
+      (luaC_checkGC L)
+      (set! ((L 'top) 'p) (p+ ((L 'top) 'p) -1))
+      (return ts))))
+
+(defn luaX_newstring (ls:(ptr LexState) str:CStr l:usize):(ptr TString)
+  (return (anchorstr ls (luaS_newlstr (ls 'L) str l))))
+
+; Skips a newline: \n, \r, \n\r or \r\n.
+(defn- inclinenumber (ls:(ptr LexState)):void
+  (let (old:i32 (ls 'current))
+    (next ls)
+    (when (and (currIsNewline ls) (!= (ls 'current) old))
+      (next ls))
+    (set! (ls 'linenumber) (+ (ls 'linenumber) 1))
+    (when (>= (ls 'linenumber) INT_MAX)
+      (lexerror ls "chunk has too many lines" 0))))
+
+(defn luaX_setinput (L:(ptr lua_State) ls:(ptr LexState) z:(ptr ZIO) source:(ptr TString)
+                     firstchar:i32):void
+  (set! ((ls 't) 'token) 0)
+  (set! (ls 'L) L)
+  (set! (ls 'current) firstchar)
+  (set! ((ls 'lookahead) 'token) TK_EOS)  ; no lookahead token
+  (set! (ls 'z) z)
+  (set! (ls 'fs) null)
+  (set! (ls 'linenumber) 1)
+  (set! (ls 'lastline) 1)
+  (set! (ls 'source) source)
+  ; "_ENV", "break" and "global" are fixed, so never collected
+  (set! (ls 'envn) (luaS_newliteral L LUA_ENV))
+  (set! (ls 'brkn) (luaS_newliteral L "break"))
+  (set! (ls 'glbn) (luaS_newliteral L "global"))  ; LUA_COMPAT_GLOBAL: not reserved
+  (set! ((ls 'glbn) 'extra) 0)
+  (luaZ_resizebuffer (ls 'L) (ls 'buff) LUA_MINBUFFER))
+
+; ---- the analyzer ----
+
+(defn- check_next1 (ls:(ptr LexState) c:i32):bool
+  (when (= (ls 'current) c)
+    (next ls)
+    (return true))
+  (return false))
+
+; Saves the current byte if it is 'c1' or 'c2'.
+(defn- check_next2 (ls:(ptr LexState) c1:i32 c2:i32):bool
+  (when (or (= (ls 'current) c1) (= (ls 'current) c2))
+    (save_and_next ls)
+    (return true))
+  (return false))
+
+; Liberal: luaO_str2num rejects what is ill-formed. Roughly
+; %d(%x|%.|([Ee][+-]?))* or 0[Xx](%x|%.|([Pp][+-]?))*, a sign only after an
+; exponent mark, so that '3-4' and '0xe+1' aren't one numeral. The caller may
+; have read a dot already.
+(defn- read_numeral (ls:(ptr LexState) seminfo:(ptr SemInfo)):i32
+  (let (obj:(ptr TValue) (alloca TValue)
+        e1:i32 (ch \E)
+        e2:i32 (ch \e)
+        first:i32 (ls 'current))
+    (save_and_next ls)
+    (when (and (= first (ch \0)) (check_next2 ls (ch \x) (ch \X)))  ; hexadecimal
+      (set! e1 (ch \P))
+      (set! e2 (ch \p)))
+    (while true
+      (cond (check_next2 ls e1 e2) (check_next2 ls (ch \-) (ch \+))  ; an optional sign
+            (or (lisxdigit (ls 'current)) (= (ls 'current) (ch \.))) (save_and_next ls)
+            true (break)))
+    (when (lislalpha (ls 'current))  ; touching a letter: force an error
+      (save_and_next ls))
+    (save ls 0)
+    (when (= (luaO_str2num (cstr (luaZ_buffer (ls 'buff))) obj) 0)
+      (lexerror ls "malformed number" TK_FLT))
+    (if (ttisinteger obj)
+      (do (set! (seminfo 'i) (ivalue obj))
+          (return TK_INT))
+      (do (set! (seminfo 'r) (fltvalue obj))
+          (return TK_FLT)))))
+
+; Reads '[=*[' or ']=*]', leaving the last bracket: the number of '='s plus 2
+; when well formed, 1 for a lone bracket, 0 for an unfinished '[==...'.
+(defn- skip_sep (ls:(ptr LexState)):usize
+  (let (count:usize 0
+        s:i32 (ls 'current))
+    (save_and_next ls)
+    (while (= (ls 'current) (ch \=))
+      (save_and_next ls)
+      (inc! count))
+    (return (cond (= (ls 'current) s) (+ count 2)
+                  (= count 0) 1
+                  true 0))))
+
+(defn- read_long_string (ls:(ptr LexState) seminfo:(ptr SemInfo) sep:usize):void
+  (let (line:i32 (ls 'linenumber))  ; for the error message
+    (save_and_next ls)  ; the second '['
+    (when (currIsNewline ls)  ; a first newline is skipped
+      (inclinenumber ls))
+    (while true
+      (let (c:i32 (ls 'current))
+        (cond (= c EOZ)
+                (let (what:CStr (if (!= seminfo null) "string" "comment"))
+                  (lexerror ls (luaO_pushfstring (ls 'L) "unfinished long %s (starting at line %d)"
+                                                 what line)
+                            TK_EOS))
+              (= c (ch \]))
+                (when (= (skip_sep ls) sep)
+                  (save_and_next ls)  ; the second ']'
+                  (break))
+              (or (= c LF) (= c CR))
+                (do (save ls LF)
+                    (inclinenumber ls)
+                    (when (= seminfo null)  ; a comment: don't waste space
+                      (luaZ_resetbuffer (ls 'buff))))
+              true
+                (if (!= seminfo null) (save_and_next ls) (next ls)))))
+    (when (!= seminfo null)
+      (set! (seminfo 'ts) (luaX_newstring ls (cstr (p+ (luaZ_buffer (ls 'buff)) sep))
+                                          (- (luaZ_bufflen (ls 'buff)) (* 2 sep)))))))
+
+(defn- esccheck (ls:(ptr LexState) c:bool msg:CStr):void
+  (when (not c)
+    (when (!= (ls 'current) EOZ)
+      (save_and_next ls))  ; the current byte, for the message
+    (lexerror ls msg TK_STRING)))
+
+(defn- gethexa (ls:(ptr LexState)):i32
+  (save_and_next ls)
+  (esccheck ls (lisxdigit (ls 'current)) "hexadecimal digit expected")
+  (return (as i32 (luaO_hexavalue (ls 'current)))))
+
+(defn- readhexaesc (ls:(ptr LexState)):i32
+  (let (r:i32 (gethexa ls))
+    (set! r (+ (bit-shl r 4) (gethexa ls)))
+    (luaZ_buffremove (ls 'buff) 2)  ; drop the saved bytes
+    (return r)))
+
+; Everything read is saved, for an error message; 'i' counts what to drop
+; on success.
+(defn- readutf8esc (ls:(ptr LexState)):l_uint32
+  (let (r:l_uint32 0
+        i:i32 4)  ; #"\u{X"
+    (save_and_next ls)  ; the 'u'
+    (esccheck ls (= (ls 'current) (ch \{)) "missing '{'")
+    (set! r (cast_uint (gethexa ls)))  ; at least one digit
+    (while true
+      (save_and_next ls)
+      (when (not (lisxdigit (ls 'current)))
+        (break))
+      (inc! i)
+      (esccheck ls (<= r (bit-shr (as l_uint32 0x7FFFFFFF) 4)) "UTF-8 value too large")
+      (set! r (+ (bit-shl r 4) (as l_uint32 (luaO_hexavalue (ls 'current))))))
+    (esccheck ls (= (ls 'current) (ch \})) "missing '}'")
+    (next ls)  ; the '}'
+    (luaZ_buffremove (ls 'buff) i)
+    (return r)))
+
+(defn- utf8esc (ls:(ptr LexState)):void
+  (let (buff:(ptr i8) (alloca i8 UTF8BUFFSZ)
+        n:i32 (luaO_utf8esc buff (readutf8esc ls)))
+    (while (> n 0)
+      (save ls (as i32 (deref (p+ buff (- UTF8BUFFSZ n)))))
+      (dec! n))))
+
+(defn- readdecesc (ls:(ptr LexState)):i32
+  (let (i:i32 0
+        r:i32 0)
+    (while (and (< i 3) (lisdigit (ls 'current)))  ; up to 3 digits
+      (set! r (- (+ (* 10 r) (ls 'current)) (ch \0)))
+      (save_and_next ls)
+      (inc! i))
+    (esccheck ls (<= r 255) "decimal escape too large")
+    (luaZ_buffremove (ls 'buff) i)
+    (return r)))
+
+(defconst READ-SAVE 0)  ; skip the escape's last byte, then save 'c'
+(defconst ONLY-SAVE 1)  ; save 'c'
+(defconst NO-SAVE 2)
+
+(defn- read_string (ls:(ptr LexState) del:i32 seminfo:(ptr SemInfo)):void
+  (save_and_next ls)  ; the delimiter, for error messages
+  (while (!= (ls 'current) del)
+    (let (cur:i32 (ls 'current))
+      (cond (= cur EOZ) (lexerror ls "unfinished string" TK_EOS)
+            (or (= cur LF) (= cur CR)) (lexerror ls "unfinished string" TK_STRING)
+            (= cur (ch \\))
+              (let (c:i32 0
+                    how:i32 READ-SAVE
+                    e:i32 0)
+                (save_and_next ls)  ; the '\\', for error messages
+                (set! e (ls 'current))
+                (cond (= e (ch \a)) (set! c 7)
+                      (= e (ch \b)) (set! c 8)
+                      (= e (ch \f)) (set! c FF)
+                      (= e (ch \n)) (set! c LF)
+                      (= e (ch \r)) (set! c CR)
+                      (= e (ch \t)) (set! c TAB)
+                      (= e (ch \v)) (set! c VT)
+                      (= e (ch \x)) (set! c (readhexaesc ls))
+                      (= e (ch \u)) (do (utf8esc ls) (set! how NO-SAVE))
+                      (or (= e LF) (= e CR)) (do (inclinenumber ls) (set! c LF) (set! how ONLY-SAVE))
+                      (or (= e (ch \\)) (= e (ch \")) (= e 39)) (set! c e)  ; 39 is '
+                      (= e EOZ) (set! how NO-SAVE)  ; the next round raises the error
+                      (= e (ch \z))  ; skip the following run of spaces
+                        (do (luaZ_buffremove (ls 'buff) 1)  ; the '\\'
+                            (next ls)  ; the 'z'
+                            (while (lisspace (ls 'current))
+                              (if (currIsNewline ls) (inclinenumber ls) (next ls)))
+                            (set! how NO-SAVE))
+                      true
+                        (do (esccheck ls (lisdigit (ls 'current)) "invalid escape sequence")
+                            (set! c (readdecesc ls))  ; '\ddd'
+                            (set! how ONLY-SAVE)))
+                (when (= how READ-SAVE)
+                  (next ls))
+                (when (!= how NO-SAVE)
+                  (luaZ_buffremove (ls 'buff) 1)  ; the '\\'
+                  (save ls c)))
+            true (save_and_next ls))))
+  (save_and_next ls)  ; the delimiter
+  (set! (seminfo 'ts) (luaX_newstring ls (cstr (p+ (luaZ_buffer (ls 'buff)) 1))
+                                      (- (luaZ_bufflen (ls 'buff)) 2))))
+
+(defn- llex (ls:(ptr LexState) seminfo:(ptr SemInfo)):i32
+  (luaZ_resetbuffer (ls 'buff))
+  (while true
+    (let (c:i32 (ls 'current))
+      (cond (or (= c LF) (= c CR)) (inclinenumber ls)
+            (or (= c (ch \space)) (= c FF) (= c TAB) (= c VT)) (next ls)
+            (= c (ch \-))  ; '-' or a comment
+              (do (next ls)
+                  (when (!= (ls 'current) (ch \-))
+                    (return (ch \-)))
+                  (next ls)
+                  (let (long:bool false)
+                    (when (= (ls 'current) (ch \[))
+                      (let (sep:usize (skip_sep ls))
+                        (luaZ_resetbuffer (ls 'buff))  ; skip_sep may dirty it
+                        (when (>= sep 2)
+                          (read_long_string ls null sep)
+                          (luaZ_resetbuffer (ls 'buff))
+                          (set! long true))))
+                    (when (not long)  ; a short comment: to the end of the line
+                      (while (and (not (currIsNewline ls)) (!= (ls 'current) EOZ))
+                        (next ls)))))
+            (= c (ch \[))  ; a long string or a '['
+              (let (sep:usize (skip_sep ls))
+                (when (>= sep 2)
+                  (read_long_string ls seminfo sep)
+                  (return TK_STRING))
+                (when (= sep 0)  ; '[=...' without the second bracket
+                  (lexerror ls "invalid long string delimiter" TK_STRING))
+                (return (ch \[)))
+            (= c (ch \=))
+              (do (next ls)
+                  (return (if (check_next1 ls (ch \=)) TK_EQ (ch \=))))
+            (= c (ch \<))
+              (do (next ls)
+                  (return (cond (check_next1 ls (ch \=)) TK_LE
+                                (check_next1 ls (ch \<)) TK_SHL
+                                true (ch \<))))
+            (= c (ch \>))
+              (do (next ls)
+                  (return (cond (check_next1 ls (ch \=)) TK_GE
+                                (check_next1 ls (ch \>)) TK_SHR
+                                true (ch \>))))
+            (= c (ch \/))
+              (do (next ls)
+                  (return (if (check_next1 ls (ch \/)) TK_IDIV (ch \/))))
+            (= c (ch \~))
+              (do (next ls)
+                  (return (if (check_next1 ls (ch \=)) TK_NE (ch \~))))
+            (= c (ch \:))
+              (do (next ls)
+                  (return (if (check_next1 ls (ch \:)) TK_DBCOLON (ch \:))))
+            (or (= c (ch \")) (= c 39))  ; a short string; 39 is '
+              (do (read_string ls c seminfo)
+                  (return TK_STRING))
+            (= c (ch \.))  ; '.', '..', '...' or a numeral
+              (do (save_and_next ls)
+                  (when (check_next1 ls (ch \.))
+                    (return (if (check_next1 ls (ch \.)) TK_DOTS TK_CONCAT)))
+                  (if (not (lisdigit (ls 'current)))
+                    (return (ch \.))
+                    (return (read_numeral ls seminfo))))
+            (and (>= c (ch \0)) (<= c (ch \9))) (return (read_numeral ls seminfo))
+            (= c EOZ) (return TK_EOS)
+            (lislalpha c)  ; a name or a reserved word
+              (do (while true
+                    (save_and_next ls)
+                    (when (not (lislalnum (ls 'current)))
+                      (break)))
+                  (let (ts:(ptr TString) (luaS_newlstr (ls 'L) (cstr (luaZ_buffer (ls 'buff)))
+                                                       (luaZ_bufflen (ls 'buff))))
+                    (if (isreserved ts)
+                      (return (+ (- (as i32 (ts 'extra)) 1) FIRST_RESERVED))
+                      (do (set! (seminfo 'ts) (anchorstr ls ts))
+                          (return TK_NAME)))))
+            true  ; a single-byte token: '+', '*', '%', '{', '}', ...
+              (do (next ls)
+                  (return c)))))
+  (return TK_EOS))
+
+(defn luaX_next (ls:(ptr LexState)):void
+  (set! (ls 'lastline) (ls 'linenumber))
+  (if (!= ((ls 'lookahead) 'token) TK_EOS)  ; a lookahead token: use it
+    (do (set! (ls 't) (ls 'lookahead))
+        (set! ((ls 'lookahead) 'token) TK_EOS))
+    (set! ((ls 't) 'token) (llex ls (ref ((ls 't) 'seminfo))))))
+
+(defn luaX_lookahead (ls:(ptr LexState)):i32
+  (set! ((ls 'lookahead) 'token) (llex ls (ref ((ls 'lookahead) 'seminfo))))
+  (return ((ls 'lookahead) 'token)))
