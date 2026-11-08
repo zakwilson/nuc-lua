@@ -232,7 +232,7 @@
   (let (name:CStr (if (!= (as ptr def) null)
                     (luaL_optstring L arg def)
                     (luaL_checkstring L arg))
-        lst:(ptr CStr) (unsafe/cast (ptr CStr) lst0)  ; the header's array imports as ptr
+        lst:(ptr CStr) (unsafe/cast (ptr CStr) lst0)  ; the header's array imports as ptr; any other type would be an overload (ISSUE-022)
         i:i32 0)
     (while (!= (as ptr (aref lst i)) null)
       (when (= (strcmp (aref lst i) name) 0)

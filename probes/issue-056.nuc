@@ -1,0 +1,10 @@
+; ISSUE-056: glibc's `isalpha` is a macro over a table lookup, but the header import
+; keeps only the function of that name, so each call goes through the PLT.
+; expect: no call to `@isalpha` in the IR (`0`), as C compiles it; actual: `1`
+; run: $NUCLEUSC --emit-llvm $P | grep -c 'call i32 @isalpha'
+; fixed-when-output: 0
+(import-use "stdio.h")
+(import-use "ctype.h")
+(defn main ():i32
+  (printf "%d\n" (isalpha 65))
+  (return 0))

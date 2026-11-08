@@ -1,5 +1,5 @@
 ;; The port's `luac`: one build.edn makes one program, so the second has its own
-;; project, sharing the port's sources.
+;; project, sharing the port's sources; each path out of it warns (ISSUE-039).
 {:name "luac"
  :opt 2
  :entry "../src/luac.nuc"

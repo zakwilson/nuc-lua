@@ -1,0 +1,12 @@
+; ISSUE-055: `<` on two pointers is a signed comparison (`icmp slt ptr`), so an
+; address at or above 2^63 (2^31 on a 32-bit target) sorts below one under it.
+; expect: prints `1` (C compares pointers unsigned); actual: `0`
+; run: $NUCLEUSC $P -o $W/p && $W/p
+; fixed-when-output: 1
+(import-use "stdio.h")
+(defn lt (a:(ptr i8) b:(ptr i8)):bool (return (< a b)))
+(defn main ():i32
+  (let (x:(ptr i8) (unsafe/cast (ptr i8) 0x7fffffffffffffff)
+        y:(ptr i8) (unsafe/cast (ptr i8) 0x8000000000000000))
+    (printf "%d\n" (as i32 (lt x y))))
+  (return 0))

@@ -44,6 +44,7 @@
          "//" ".." "..." "==" ">=" "<=" "~=" "<<" ">>" "::" "<eof>"
          "<number>" "<integer>" "<name>" "<string>"))
 
+; C's 'next'; a macro of that name would capture every local 'next' (ISSUE-051).
 (defmacro next-char (ls) `(set! (~ls 'current) (zgetc (~ls 'z))))
 (defmacro currIsNewline (ls) `(or (= (~ls 'current) LF) (= (~ls 'current) CR)))
 (defmacro save_and_next (ls) `(do (save ~ls (~ls 'current)) (next-char ~ls)))

@@ -60,7 +60,7 @@
 (defvar- l-getenv:(fn CStr)(CStr) null)
 (defvar- l-readline:(fn CStr)(CStr) null)
 (defvar- l-addhist:(fn void)(CStr) null)
-; SIG_DFL is ((__sighandler_t) 0), which the header import folds to the int 0.
+; SIG_DFL is ((__sighandler_t) 0), which the header import folds to the int 0 (ISSUE-014).
 (defconst sig-dfl null)
 
 (defn- setsignal (sig:i32 handler:(fn void)(i32)):void

@@ -1,3 +1,4 @@
 ; The T build's entry: lua.c's interpreter (src/main.nuc) with the T library.
+; relative to tests/T, where the build runs, not to this file (ISSUE-054)
 (import-use "../../src/main.nuc")
 (import-use lua.tests)

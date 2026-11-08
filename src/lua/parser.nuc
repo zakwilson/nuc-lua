@@ -396,9 +396,9 @@
     (code-semerror ls "<goto %s> at line %d jumps into the scope of '%s'"
                    (getstr (gt 'name)) (gt 'line) varname)))
 
-; Resolves goto 'g' to 'label' and drops it from the pending list. It needs a
-; CLOSE when it leaves a block with upvalues, or ('bup') a variable's scope
-; in a block that has them.
+; Resolves goto 'g' to 'lb' (C's 'label', a special form here: ISSUE-038) and
+; drops it from the pending list. It needs a CLOSE when it leaves a block with
+; upvalues, or ('bup') a variable's scope in a block that has them.
 (defn- closegoto (ls:(ptr LexState) g:i32 lb:(ptr Labeldesc) bup:i32):void
   (let (fs:(ptr FuncState) (ls 'fs)
         gl:(ptr Labellist) (ref ((ls 'dyd) 'gt))
@@ -650,7 +650,7 @@
   (expr ls (ref (cc 'v)))
   (set! (cc 'tostore) (+ (cc 'tostore) 1)))
 
-; listfield | recfield. C calls it 'field', a special form here.
+; listfield | recfield. C calls it 'field', a special form here (ISSUE-038).
 (defn- fieldexp (ls:(ptr LexState) cc:(ptr ConsControl)):void
   (case (token ls)
     TK_NAME (if (!= (lex-lookahead ls) (ch \=))  ; an expression?
@@ -977,7 +977,7 @@
             (adjust-assign ls nvars nexps e))))
     (storevartop (ls 'fs) lv)))
 
-; A condition: its false list. C calls it 'cond'.
+; A condition: its false list. C calls it 'cond', a special form here (ISSUE-038).
 (defn- condexp (ls:(ptr LexState)):i32
   (let (v:(ptr expdesc) (alloca expdesc))
     (expr ls v)

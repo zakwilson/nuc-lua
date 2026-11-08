@@ -427,7 +427,7 @@
 (defmacro zio-freebuffer (L b) `(zio-resizebuffer ~L ~b 0))
 
 ; ---- shared by the core modules, which import one another in cycles ----
-; A cycle carries no macro, so every macro a second module uses lives here.
+; A cycle carries no macro, so every macro a second module uses lives here (ISSUE-052).
 
 (defmacro adjustresults (L nres)
   `(when (and (<= ~nres LUA_MULTRET) (< (as ptr (((~L 'ci) 'top) 'p)) (as ptr ((~L 'top) 'p))))

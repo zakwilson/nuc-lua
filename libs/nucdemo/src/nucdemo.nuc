@@ -7,7 +7,7 @@
 ; yield. Owning work runs in helpers that never call Lua and return a Result;
 ; the Lua function raises only after they have returned. A resource that must
 ; live while Lua runs is anchored in a userdata whose __gc releases it.
-(ns nucdemo)
+(ns nucdemo)  ; a macro may then name the file's private helpers (ISSUE-050)
 (set-ir-prefix "")  ; luaopen_nucdemo keeps its C name; the rest is private
 (import-use luacapi)
 (import-use "string.h")

@@ -740,6 +740,7 @@
     (lua_pushinteger L (unsafe/cast lua_Integer (unsafe/cast usize (as ptr a))))
     (return 5)))
 
+; ltests' resetCI; state.nuc's private reset-ci has the same link name (ISSUE-053).
 (defn- free-cis (L:(ptr lua_State)):i32
   (let (ci:(ptr CallInfo) (L 'ci))
     (while (!= (as ptr (ci 'next)) null)

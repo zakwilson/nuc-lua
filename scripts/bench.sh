@@ -4,8 +4,8 @@
 # NOAPPEND=1 prints only; a file argument runs that subset.
 set -uo pipefail
 source "$(dirname "$0")/env.sh"
-STOCK=$ROOT/reference/build/src/lua
-PORT=$ROOT/build/lua
+STOCK=${STOCK:-$ROOT/reference/build/src/lua}  # either may be overridden, to compare other builds
+PORT=${PORT:-$ROOT/build/lua}
 RUNS=${RUNS:-3}
 files=("$@")
 [ ${#files[@]} -gt 0 ] || files=("$ROOT"/bench/*.lua)

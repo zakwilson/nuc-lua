@@ -2,5 +2,6 @@
  :name "nucdemo"
  :version "1.0"
  :shared true
+ ;; the version script keeps the standard library's instances private (ISSUE-049)
  :link-args ["-Wl,--version-script=exports.map"]
  :deps {luacapi {:path "../../capi"}}}

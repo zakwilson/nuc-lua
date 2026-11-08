@@ -1,5 +1,42 @@
 # Findings
 
+Lua 5.5.1, all of it, in Nucleus: the core, the libraries, `lua`, `luac` and the
+`T` test library. It passes the official suite in every configuration, dumps
+byte-identical bytecode, loads C libraries built for stock `lua`, and runs at 0.90 to
+1.13 times stock's speed. 57 findings; 12 were compiler bugs or limits, fixed on the
+way (`lua-bugfixes`).
+
+## Executive summary: the five changes that would help most
+
+1. **Make a `longjmp` over a cleanup visible** (ISSUE-047). Every Lua C function can
+   be left by a `longjmp`, which skips its `defer`s, `with` releases and `Drop`s
+   without a word. A library author learns the rule from a leak. A
+   `:may-longjmp` attribute on `lua_error` and the API, and a diagnostic for a
+   cleanup that is live across such a call, would turn the rule into a check; the
+   types already know where cleanups are.
+2. **Give a shared library an export list** (ISSUE-005, 049, 007). A public `defn`
+   in a `.so` is preempted by any same-named symbol in the process, and every
+   standard-library instance it uses is exported, data included. Hidden by default,
+   with `:exports` in `build.edn`, fixes both and the `lib` prefix too. Every
+   library a Nucleus user writes for a C host meets this.
+3. **Import a header's function-like and expression macros** (ISSUE-018, 029, 012,
+   024, 046, 014, 056). The largest family of workarounds: `errno`, the wait macros,
+   `LUA_VNUMINT`, string macros, `_IOFBF`, `SIG_DFL`, written out by hand and tied to
+   glibc's private encodings. It also costs speed silently: `isalpha` becomes a PLT
+   call where C inlines a table lookup, a third of the port's slowest benchmark.
+4. **Let a header's declaration bind** (ISSUE-022, 037, 034). A `defn` whose type
+   misses its header's prototype silently becomes a mangled overload, and the C
+   caller links to nothing; a `defstruct` can't complete a struct the header
+   declares, so the port can't own `lua_State`; a header type named like a prelude
+   type is silently the prelude's. Each is cheap to diagnose where it happens.
+5. **Arithmetic as C has it** (ISSUE-008, 027, 055, 028, 041, 025, 016). Integer to
+   float takes `unsafe/cast`; `(- x)` on a float is `0 - x`, wrong for `-0.0`; `<` on
+   pointers is signed; `bit-not` refuses unsigned operands; `sizeof` is signed; there
+   is no byte literal. Each is small, and an interpreter meets all of them on every
+   page; two give wrong answers rather than errors.
+
+## Ranking
+
 Ranked by porter pain removed per unit of language work.
 
 | Rank | Issue | Claim | Severity | Kind | Status |
@@ -21,43 +58,123 @@ Ranked by porter pain removed per unit of language work.
 | 15 | ISSUE-003 | A `defvar` array of a header's struct was refused as opaque | major | bug | fixed in nucleus `beb0472` |
 | 16 | ISSUE-008 | Integer to float takes `unsafe/cast` | major | design | worked-around |
 | 17 | ISSUE-027 | Unary minus on a float is `0 - x`, so `(- 0.0)` is `0.0`, not `-0.0` | major | bug | worked-around |
-| 18 | ISSUE-045 | A computed goto's jump table can be neither a local array nor a static one | minor | missing-feature | worked-around |
-| 19 | ISSUE-037 | A `defstruct` can't complete a struct its header declares without a body, so the port can't own `lua_State` | minor | missing-feature | worked-around |
-| 20 | ISSUE-052 | A macro doesn't cross an import cycle, so mutually recursive modules keep their shared macros in a leaf | minor | known-limitation | worked-around |
-| 21 | ISSUE-051 | A local named like a macro in scope is the macro at the head of a form, so `(next 'v)` expands | minor | design | worked-around |
-| 22 | ISSUE-019 | A header's `char *` is `(ptr i8)`, and an `if` won't join it with a string literal | minor | design | worked-around |
-| 23 | ISSUE-021 | Pointers can't be subtracted | minor | missing-feature | worked-around |
-| 24 | ISSUE-028 | `bit-not` of an unsigned operand is refused | minor | bug | worked-around |
-| 25 | ISSUE-029 | A constant macro built with a function-like macro isn't imported: `LUA_VNUMINT` | minor | known-limitation | worked-around |
-| 26 | ISSUE-030 | A `defconst` over a header constant is refused once a `defstruct` uses it as an array length | minor | bug | worked-around |
-| 27 | ISSUE-031 | A row of a header's 2-D array field doesn't decay, so it can't be indexed | minor | bug | worked-around |
-| 28 | ISSUE-034 | In a namespaced file, a header type named like a prelude type is silently the prelude's | minor | design | worked-around |
-| 29 | ISSUE-018 | A header's expression macros aren't imported: `errno`, `WIFEXITED` | minor | known-limitation | worked-around |
-| 30 | ISSUE-007 | A shared library is always named `lib<name>.so` | minor | tooling | worked-around |
-| 31 | ISSUE-048 | A shared library's link ignored `:link-args` | minor | bug | fixed in nucleus (see PROGRESS.md) |
-| 32 | ISSUE-010 | There is no `offsetof` | minor | missing-feature | worked-around |
-| 33 | ISSUE-012 | A header's string macros aren't imported | minor | known-limitation | worked-around |
-| 34 | ISSUE-011 | No `sizeof` of an expression, so no array length | minor | missing-feature | worked-around |
-| 35 | ISSUE-015 | Only the entry file can export a strong symbol | minor | design | worked-around |
-| 36 | ISSUE-016 | No byte literal: `\e` is a 32-bit Char and won't convert to `i8` | minor | design | worked-around |
-| 37 | ISSUE-017 | A `CStr` can't be indexed | minor | design | worked-around |
-| 38 | ISSUE-014 | `SIG_DFL` imports as the integer 0 | minor | interop | worked-around |
-| 39 | ISSUE-040 | A later declarator in a field list (`*previous, *next`) imported as a bare `ptr` | minor | bug | fixed in nucleus `a64ac73` |
-| 40 | ISSUE-042 | `=` on two `CStr`s compares contents, so a C pointer test ported as written reads through null | minor | design | worked-around |
-| 41 | ISSUE-041 | `bit-not` of an unsigned value is refused: `-1` doesn't fit it | papercut | bug | worked-around |
-| 42 | ISSUE-044 | A global `i8` array takes no string initializer, so `lua_ident` is spelled out in bytes | papercut | missing-feature | worked-around |
-| 43 | ISSUE-046 | A header's array variable, `extern const char lua_ident[]`, isn't imported | papercut | known-limitation | worked-around |
-| 44 | ISSUE-054 | A string-path import, `"z.nuc"`, isn't looked up beside the importing file, as the docs say | papercut | bug | worked-around |
-| 45 | ISSUE-053 | Under `(set-ir-prefix "")` two namespaces can't each have a private helper of one name, and the error names one namespace for both | papercut | design | worked-around |
-| 46 | ISSUE-050 | In a file with no `(ns …)`, a macro can't name the file's own private helpers | papercut | design | worked-around |
-| 47 | ISSUE-024 | A `_`-prefixed macro isn't imported, even ISO C's `_IOFBF` | papercut | design | worked-around |
-| 48 | ISSUE-020 | `set!` won't expand a macro in its place | papercut | missing-feature | worked-around |
-| 49 | ISSUE-025 | `sizeof` is a signed integer, so comparing a size with it is refused | papercut | design | worked-around |
-| 50 | ISSUE-035 | `unsafe/cast` from a function pointer to an integer is refused | papercut | bug | worked-around |
-| 51 | ISSUE-036 | A `defvar`'s array initializer isn't macroexpanded before its shape is checked | papercut | bug | worked-around |
-| 52 | ISSUE-038 | A parameter named like a special form is accepted, then misparsed at its use | papercut | design | worked-around |
-| 53 | ISSUE-039 | A `build.edn` makes one program, and a second sharing its sources warns at every build | papercut | tooling | worked-around |
-| 54 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
+| 18 | ISSUE-055 | `<` on two pointers is a signed comparison | minor | bug | open |
+| 19 | ISSUE-045 | A computed goto's jump table can be neither a local array nor a static one | minor | missing-feature | worked-around |
+| 20 | ISSUE-037 | A `defstruct` can't complete a struct its header declares without a body, so the port can't own `lua_State` | minor | missing-feature | worked-around |
+| 21 | ISSUE-052 | A macro doesn't cross an import cycle, so mutually recursive modules keep their shared macros in a leaf | minor | known-limitation | worked-around |
+| 22 | ISSUE-051 | A local named like a macro in scope is the macro at the head of a form, so `(next 'v)` expands | minor | design | worked-around |
+| 23 | ISSUE-019 | A header's `char *` is `(ptr i8)`, and an `if` won't join it with a string literal | minor | design | worked-around |
+| 24 | ISSUE-021 | Pointers can't be subtracted | minor | missing-feature | worked-around |
+| 25 | ISSUE-028 | `bit-not` of an unsigned operand is refused | minor | bug | worked-around |
+| 26 | ISSUE-029 | A constant macro built with a function-like macro isn't imported: `LUA_VNUMINT` | minor | known-limitation | worked-around |
+| 27 | ISSUE-030 | A `defconst` over a header constant is refused once a `defstruct` uses it as an array length | minor | bug | worked-around |
+| 28 | ISSUE-031 | A row of a header's 2-D array field doesn't decay, so it can't be indexed | minor | bug | worked-around |
+| 29 | ISSUE-034 | In a namespaced file, a header type named like a prelude type is silently the prelude's | minor | design | worked-around |
+| 30 | ISSUE-018 | A header's expression macros aren't imported: `errno`, `WIFEXITED` | minor | known-limitation | worked-around |
+| 31 | ISSUE-056 | glibc's `isalpha` is a macro, but the import calls the function: a PLT call per character | minor | interop | open |
+| 32 | ISSUE-007 | A shared library is always named `lib<name>.so` | minor | tooling | worked-around |
+| 33 | ISSUE-048 | A shared library's link ignored `:link-args` | minor | bug | fixed in nucleus (see PROGRESS.md) |
+| 34 | ISSUE-010 | There is no `offsetof` | minor | missing-feature | worked-around |
+| 35 | ISSUE-012 | A header's string macros aren't imported | minor | known-limitation | worked-around |
+| 36 | ISSUE-011 | No `sizeof` of an expression, so no array length | minor | missing-feature | worked-around |
+| 37 | ISSUE-015 | Only the entry file can export a strong symbol | minor | design | worked-around |
+| 38 | ISSUE-016 | No byte literal: `\e` is a 32-bit Char and won't convert to `i8` | minor | design | worked-around |
+| 39 | ISSUE-017 | A `CStr` can't be indexed | minor | design | worked-around |
+| 40 | ISSUE-014 | `SIG_DFL` imports as the integer 0 | minor | interop | worked-around |
+| 41 | ISSUE-040 | A later declarator in a field list (`*previous, *next`) imported as a bare `ptr` | minor | bug | fixed in nucleus `a64ac73` |
+| 42 | ISSUE-042 | `=` on two `CStr`s compares contents, so a C pointer test ported as written reads through null | minor | design | worked-around |
+| 43 | ISSUE-041 | `bit-not` of an unsigned value is refused: `-1` doesn't fit it | papercut | bug | worked-around |
+| 44 | ISSUE-044 | A global `i8` array takes no string initializer, so `lua_ident` is spelled out in bytes | papercut | missing-feature | worked-around |
+| 45 | ISSUE-046 | A header's array variable, `extern const char lua_ident[]`, isn't imported | papercut | known-limitation | worked-around |
+| 46 | ISSUE-054 | A string-path import, `"z.nuc"`, isn't looked up beside the importing file, as the docs say | papercut | bug | worked-around |
+| 47 | ISSUE-053 | Under `(set-ir-prefix "")` two namespaces can't each have a private helper of one name, and the error names one namespace for both | papercut | design | worked-around |
+| 48 | ISSUE-050 | In a file with no `(ns …)`, a macro can't name the file's own private helpers | papercut | design | worked-around |
+| 49 | ISSUE-024 | A `_`-prefixed macro isn't imported, even ISO C's `_IOFBF` | papercut | design | worked-around |
+| 50 | ISSUE-020 | `set!` won't expand a macro in its place | papercut | missing-feature | worked-around |
+| 51 | ISSUE-025 | `sizeof` is a signed integer, so comparing a size with it is refused | papercut | design | worked-around |
+| 52 | ISSUE-035 | `unsafe/cast` from a function pointer to an integer is refused | papercut | bug | worked-around |
+| 53 | ISSUE-036 | A `defvar`'s array initializer isn't macroexpanded before its shape is checked | papercut | bug | worked-around |
+| 54 | ISSUE-038 | A parameter named like a special form is accepted, then misparsed at its use | papercut | design | worked-around |
+| 55 | ISSUE-039 | A `build.edn` makes one program, and a second sharing its sources warns at every build | papercut | tooling | worked-around |
+| 56 | ISSUE-057 | No branch hint (`likely`, `cold`): the VM's rare paths stay inline, 4.8 KB of `vm-execute` | papercut | missing-feature | open |
+| 57 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
+
+## Line counts
+
+Code lines exclude blank and comment-only lines; characters are the non-blank
+characters outside comments, the fairer measure, since a Lisp line holds more than a
+C one. `scripts/line-counts.sh` prints the table.
+
+| Subsystem | C lines | Nucleus lines | Ratio | C chars | Nucleus chars | Ratio |
+|---|---|---|---|---|---|---|
+| Object model (lctype, lzio, lmem, lobject, lstring, lfunc, ltm, ltable) | 2319 | 1707 | 0.74 | 49749 | 53176 | 1.07 |
+| Compiler (lopcodes, llex, lcode, lparser, ldump, lundump) | 4007 | 2989 | 0.75 | 82741 | 93059 | 1.12 |
+| Execution state (lstate, ldebug, ldo, lapi) | 2961 | 2022 | 0.68 | 63056 | 66409 | 1.05 |
+| Collector (lgc) | 1122 | 906 | 0.81 | 23127 | 28468 | 1.23 |
+| VM (lvm) | 1508 | 1149 | 0.76 | 27896 | 30240 | 1.08 |
+| Auxiliary library and init (lauxlib, linit) | 861 | 636 | 0.74 | 18646 | 19113 | 1.03 |
+| Standard libraries (10) | 4721 | 3258 | 0.69 | 100270 | 94758 | 0.95 |
+| Hosts (lua.c, luac.c) | 1223 | 736 | 0.60 | 23392 | 22326 | 0.95 |
+| Internal headers' macros and limits (l*.h but the public four) | 2013 | 465 | 0.23 | 53872 | 17845 | 0.33 |
+| **Lua** | **20735** | **13868** | **0.67** | **442749** | **425394** | **0.96** |
+| Test library (ltests.c, ltests.h) | 1932 | 1257 | 0.65 | 41071 | 42671 | 1.04 |
+| Public headers' macros (lua.h, lauxlib.h, lualib.h) as the binding | 434 | 180 | 0.41 | 16991 | 6918 | 0.41 |
+
+The port is a third shorter in lines and about the same in characters: 10% longer in
+the core, 4% shorter in the libraries and hosts. The core pays for casts that C makes
+implicitly (`as`, `unsafe/cast`, the `cast_*` family) and for `(set! ((x 'f) 'g) v)`
+where C writes `x->f.g = v`; the libraries gain from `defn-lua`, `lua-newlib` and
+`case`. The headers row is not like for like: the port still takes its struct layouts
+from the stock headers (ISSUE-037), so its 465 lines are the headers' macros and
+limits only.
+
+## Code generation
+
+Stock `lua` is built by gcc, file by file. The port is one LLVM module, so the fair
+comparison is stock built by the same backend (clang 19, `-O2`) with LTO:
+
+| | gcc `-O2` | clang `-O2` | clang `-O2 -flto` | the same, no `l_likely` | port |
+|---|---:|---:|---:|---:|---:|
+| `luaV_execute` / `vm-execute` | 15,719 | 15,084 | 21,649 | 26,020 | 26,492 |
+| `luaD_precall` / `do-precall` | 598 | 760 | 1,198 | 1,041 | 1,058 |
+| `luaH_get` / `table-get` | 285 | 605 | 621 | 621 | 762 |
+| program text | 278,310 | 279,041 | 340,265 | 341,793 | 370,779 |
+
+- **Whole-program inlining** explains most of what M9 saw. Compiled as one module,
+  the port inlines across files as stock does only under LTO: `do-precall` carries
+  `growstack` and `extendCI` inline, and is smaller than stock's under LTO. It is a design win: Nucleus gets LTO's inlining by default.
+- **No branch hint** (ISSUE-057). Stock marks its rare paths `l_unlikely`; without
+  the hint, stock's `luaV_execute` grows from 21.6 KB to 26.0 KB, the port's size. The
+  trap check that ends every opcode shows it: stock calls `luaG_traceexec` from 22
+  places, unhinted stock from 56, the port from 80. Speed is unchanged within noise
+  (the unhinted build ran 0.77 to 1.10 times the hinted one, no pattern), so this is
+  size, not time.
+- **Library calls that C inlines** (ISSUE-056). `patterns` is the one benchmark the
+  port loses to every stock build (1.12 against gcc, 1.21 against clang LTO); its
+  `gmatch` loop alone is 1.25. `match-class` calls `tolower`, `isalpha` and `islower`
+  through the PLT per character; C's are glibc's inline table lookups. Stock built with
+  `-D__NO_CTYPE`, which makes C call the same functions, runs `patterns` at 290 ms
+  against 271, and `gmatch` at 171 against 148: half of `gmatch`'s gap, a third of the
+  benchmark's. The rest I didn't trace.
+- **Signed pointer comparisons** (ISSUE-055). Side by side, `singlematch`'s test
+  `s < ms->src_end`:
+
+  ```
+  clang (C)                         Nucleus
+  cmp    rdi,rsi                    cmp    QWORD PTR [rdi+0x8],rsi
+  jbe    <singlematch+0xdb>         jle    <singlematch+0x39>
+  ```
+
+  The same code otherwise, but `jle` is signed. No x86-64 Linux user address reaches
+  2^63, so the port runs correctly; on a 32-bit target it would not.
+- **The remaining 9% of text** over stock under LTO is spread thin: the port has 616
+  functions to stock's 479 (it inlines less in the parser: stock's `subexpr` is 7.4 KB
+  with its callees inside, the port's 1.2 KB with them out of line), and only two public functions, 785 bytes, are
+  never called. Floating point is the port's best case: `floats` runs at 0.96 of gcc's
+  stock and 0.71 of clang's.
+
+`scripts/bench.sh` takes `STOCK=` and `PORT=` to compare other builds; the clang
+builds above are `clang -O2 [-flto] -DLUA_USE_LINUX` over `reference/build/src`.
 
 ## ISSUE-001: A C variadic couldn't be defined in Nucleus
 
@@ -686,6 +803,7 @@ throughout `ltable.c`, so it was fixed instead.
 - **Severity:** blocker
 - **Kind:** bug
 - **Status:** fixed in nucleus `1ae171b`
+- **Probe:** `nucleus` test `s21-many-macros` (in `1ae171b`): 300 macros
 - **Port sites:** `lobject.nuc`, once `core.nuc` passed about 160 macros (`util.nuc`'s and
   the imported headers' count as well)
 
@@ -984,6 +1102,57 @@ Context: docs/toplevel.md, "Where an import is found", puts "the directory of th
 that holds the import" first, for a library name or a `.nuc` string path. A library
 name is found there; a string path is resolved against the current directory only.
 The same source then means different files depending on where the compiler starts.
+
+## ISSUE-055: `<` on two pointers is a signed comparison
+
+- **Severity:** minor
+- **Kind:** bug
+- **Status:** open
+- **Probe:** `probes/issue-055.nuc` — expected `1`; actual `0`: `0x7fff…ffff < 0x8000…0000`
+  is false
+- **Port sites:** every pointer comparison: the matcher's `s < src_end`, the stack's
+  `top < stack_last`, the lexer's and the dumper's buffer ends
+- **Workaround:** none needed here: x86-64 Linux user addresses are below 2^47.
+
+Context: the emitter writes `icmp slt ptr` for `<` on pointers; C compares them
+unsigned. Found reading `singlematch`'s assembly beside clang's (`jle` for `jbe`). On
+a 32-bit target, where the stack and the heap straddle 2^31, or on AVR, which Nucleus
+targets, the port's bound checks would invert. Pointers should take `ult`/`ule`.
+
+## ISSUE-056: glibc's `isalpha` is a macro over a table lookup, and the import calls the function
+
+- **Severity:** minor
+- **Kind:** interop
+- **Status:** open
+- **Probe:** `probes/issue-056.nuc` — expected no `call i32 @isalpha` in the IR; actual one
+- **Port sites:** `match-class` in `strlib.nuc` (`tolower`, `isalpha`, `islower`, … per
+  character matched); `lctype` has its own table, so the lexer is unaffected
+- **Workaround:** none taken; the fix in the port would read glibc's private
+  `__ctype_b_loc` table, which ISSUE-018 already does too much of.
+
+Context: `ctype.h` declares `isalpha` and, under `__OPTIMIZE__`, defines a macro and an
+inline `tolower` over `__ctype_b_loc()`. The import keeps the declaration and drops the
+macro, so each call is a PLT call into libc. Nothing warns: the code is right and
+slower. `patterns` runs at 1.21 times stock built by clang with LTO; stock built with
+`-D__NO_CTYPE`, so that it makes the same calls, recovers a third of that (half of
+`gmatch`'s). A function-like macro that shadows a function is the case ISSUE-018's
+fix would have to choose: the macro, as C does.
+
+## ISSUE-057: No branch hint, so rare paths stay inline
+
+- **Severity:** papercut
+- **Kind:** missing-feature
+- **Status:** open
+- **Port sites:** `vm.nuc`'s `vmbreak` (the hook trap after every opcode) and every
+  `l_likely`/`l_unlikely` of the C (51 in the core, 114 in all), written as plain tests
+- **Workaround:** none.
+
+Context: C's `l_unlikely` is `__builtin_expect`; Nucleus has neither an expectation
+nor a `cold` attribute (`fn-attr` takes string attributes only, and `cold` is an enum
+one). The cost measured is code size: stock built without the hints grows
+`luaV_execute` from 21.6 KB to 26.0 KB, the port's size, with no speed change outside
+noise. A `(likely c)` form lowering to `llvm.expect`, or a `:cold` attribute, would
+keep the VM's error and hook paths out of its hot loop.
 
 ## What worked well
 

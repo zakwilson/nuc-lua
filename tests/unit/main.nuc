@@ -1,7 +1,7 @@
 ; Unit tests (PROMPT §7.6), run by `nucleus test`: the arithmetic edge cases,
 ; number parsing and formatting, the generated tables against stock's bytes, the
 ; token names, and the binding's macros. The suite tests these only through Lua.
-(ns lua.unit)
+(ns lua.unit)  ; a macro may then name the file's private helpers (ISSUE-050)
 (set-ir-prefix "")  ; main keeps its name
 (import-use luacapi)
 (import lua.aux)

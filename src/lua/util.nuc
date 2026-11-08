@@ -9,13 +9,13 @@
 (import-use luaconfig)
 
 ; A byte as an integer literal: (ch \e) is 101. A `\e` is a 32-bit Char, which
-; won't compare with an i8 byte, and converting it is refused as lossy.
+; won't compare with an i8 byte, and converting it is refused as lossy (ISSUE-016).
 (defmacro ch (c)
   (when (!= (c 'kind) NODE-CHAR)  ; a string's 'i' would read as 0
     (macro-error c "ch: expects a Char literal, such as \\k"))
   (node-int (c 'i)))
 
-; The bytes of a C string, for indexing; a CStr can't be indexed.
+; The bytes of a C string, for indexing; a CStr can't be indexed (ISSUE-017).
 (defmacro bytes (s) `(as (ptr i8) (as ptr ~s)))
 
 ; The reverse, for a `char *` the importer read as (ptr i8), such as a field or

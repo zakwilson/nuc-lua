@@ -41,7 +41,7 @@ object model, the compiler, execution state, the collector and the VM (§10).
 | 8 Nucleus libraries | done: `libs/nucdemo`, `tests/capi/nuc`, `docs/writing-libraries.md`; the full matrix, two libraries at once, the unload path; user test request below |
 | 9 Idiom pass | done: internals and private functions in kebab-case, shared macros in one place, `mathlib` in `defn-lua`; the layouts stay in the stock headers (ISSUE-037) |
 | 10 T harness | done: all of `ltests.c` in `tests/T`, a configuration per build (`config/`); the suite passes with `T`, `api.lua` and `memerr.lua` included, in both stressed modes |
-| 11 Final report | not started |
+| 11 Final report | done: `ISSUES.md` opens with the executive summary, the final ranking, the line-count table and the code generation section |
 
 ### Nucleus
 
@@ -134,6 +134,11 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
   scripts/check-gcstress.sh`). `memerr.lua`'s 44 minimum-allocation and memory
   figures equal those of stock built the same way (`build/ref-T/lua-T`). The release
   build's gates are unchanged.
+- M11: every bug in `ISSUES.md` has a probe (or, if fixed, the Nucleus test of its
+  fix) and every workaround is tagged in the code with its issue. Reading assembly
+  beside clang's for the code generation section found ISSUE-055 (signed pointer
+  comparisons), ISSUE-056 (`isalpha` through the PLT) and ISSUE-057 (no branch
+  hint); `check-probes.sh` reports 9 fixed, 24 reproduce.
 - The spike: a Nucleus `luaopen_` module whose function raises with `luaL_error`
   (a real C variadic call) is caught by `pcall` in stock `lua`.
 
@@ -170,13 +175,16 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
   ran past ten minutes in `db.lua`'s hook tests, and `stepsize` 0 took nine and
   failed its count-hook test (`db.lua:605`). `MODES=`
   picks one, logs in `build/`; `SUITE=` (for `check-suite.sh` too) runs on a copy.
+- `scripts/line-counts.sh` prints `ISSUES.md`'s line-count table.
 - `scripts/check-T.sh` builds `tests/T` and runs the suite with it (log in
   `build/suite-T.log`); with `LUA=tests/T/build/lua`, `check-gcstress.sh` runs the
   stressed modes in that configuration.
 
 ## Next
 
-M11, the final report (PROMPT §10).
+All milestones are done. What remains is the user's: the test requests below, and
+the five changes in `ISSUES.md`'s summary, which are Nucleus's to make. Feedback on
+the port goes into the milestone it concerns.
 
 ## The idiom pass (M9)
 
@@ -350,3 +358,16 @@ at `-O2`; a ratio above 1 is the port slower.
 | patterns | 298 | 336 | 1.13 |
 | strings | 195 | 183 | 0.94 |
 | tables | 376 | 348 | 0.93 |
+
+### Benchmark, 2026-11-08, Nucleus b8e711e
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 431 | 474 | 1.10 |
+| closures | 423 | 406 | 0.96 |
+| floats | 285 | 267 | 0.94 |
+| gc | 619 | 616 | 1.00 |
+| metamethods | 386 | 386 | 1.00 |
+| patterns | 303 | 336 | 1.11 |
+| strings | 195 | 184 | 0.94 |
+| tables | 370 | 339 | 0.92 |
