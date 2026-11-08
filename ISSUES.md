@@ -47,15 +47,17 @@ Ranked by porter pain removed per unit of language work.
 | 41 | ISSUE-041 | `bit-not` of an unsigned value is refused: `-1` doesn't fit it | papercut | bug | worked-around |
 | 42 | ISSUE-044 | A global `i8` array takes no string initializer, so `lua_ident` is spelled out in bytes | papercut | missing-feature | worked-around |
 | 43 | ISSUE-046 | A header's array variable, `extern const char lua_ident[]`, isn't imported | papercut | known-limitation | worked-around |
-| 44 | ISSUE-050 | In a file with no `(ns …)`, a macro can't name the file's own private helpers | papercut | design | worked-around |
-| 45 | ISSUE-024 | A `_`-prefixed macro isn't imported, even ISO C's `_IOFBF` | papercut | design | worked-around |
-| 46 | ISSUE-020 | `set!` won't expand a macro in its place | papercut | missing-feature | worked-around |
-| 47 | ISSUE-025 | `sizeof` is a signed integer, so comparing a size with it is refused | papercut | design | worked-around |
-| 48 | ISSUE-035 | `unsafe/cast` from a function pointer to an integer is refused | papercut | bug | worked-around |
-| 49 | ISSUE-036 | A `defvar`'s array initializer isn't macroexpanded before its shape is checked | papercut | bug | worked-around |
-| 50 | ISSUE-038 | A parameter named like a special form is accepted, then misparsed at its use | papercut | design | worked-around |
-| 51 | ISSUE-039 | A `build.edn` makes one program, and a second sharing its sources warns at every build | papercut | tooling | worked-around |
-| 52 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
+| 44 | ISSUE-054 | A string-path import, `"z.nuc"`, isn't looked up beside the importing file, as the docs say | papercut | bug | worked-around |
+| 45 | ISSUE-053 | Under `(set-ir-prefix "")` two namespaces can't each have a private helper of one name, and the error names one namespace for both | papercut | design | worked-around |
+| 46 | ISSUE-050 | In a file with no `(ns …)`, a macro can't name the file's own private helpers | papercut | design | worked-around |
+| 47 | ISSUE-024 | A `_`-prefixed macro isn't imported, even ISO C's `_IOFBF` | papercut | design | worked-around |
+| 48 | ISSUE-020 | `set!` won't expand a macro in its place | papercut | missing-feature | worked-around |
+| 49 | ISSUE-025 | `sizeof` is a signed integer, so comparing a size with it is refused | papercut | design | worked-around |
+| 50 | ISSUE-035 | `unsafe/cast` from a function pointer to an integer is refused | papercut | bug | worked-around |
+| 51 | ISSUE-036 | A `defvar`'s array initializer isn't macroexpanded before its shape is checked | papercut | bug | worked-around |
+| 52 | ISSUE-038 | A parameter named like a special form is accepted, then misparsed at its use | papercut | design | worked-around |
+| 53 | ISSUE-039 | A `build.edn` makes one program, and a second sharing its sources warns at every build | papercut | tooling | worked-around |
+| 54 | ISSUE-009 | A library's diagnostics print three times | papercut | tooling | open |
 
 ## ISSUE-001: A C variadic couldn't be defined in Nucleus
 
@@ -946,7 +948,42 @@ a leaf, away from the structure it belongs to, `code.nuc`'s `expdesc` accessors
 included. It did also expose 17 macros the migration had copied into two to four
 modules each, some subtly different (`pcRel`, `get_nresults`, `tonumber`'s result
 type); they are one copy each now. A macro registered graph-wide, as signatures
-are, would keep each where it is defined.
+are, would keep each where it is defined. The same message also stands for a plain
+missing import: a function whose module the file never imported was reported as
+"defined in a file this unit imports circularly, and not registered yet".
+
+## ISSUE-053: Under `(set-ir-prefix "")`, two namespaces can't each have a private helper of one name
+
+- **Severity:** papercut
+- **Kind:** design
+- **Status:** worked-around
+- **Probe:** `probes/issue-053.nuc` — expected `1 2`; actual `duplicate definition of
+  'helper' … both definitions are in namespace 'b'`
+- **Port sites:** `tests/T/src/lua/tests.nuc`, whose `resetCI` met `state.nuc`'s
+  private `reset-ci`
+- **Workaround:** rename one (`free-cis`).
+
+Context: the port keeps C's link names with `(set-ir-prefix "")`, so a `defn-` in two
+namespaces is one IR symbol. Refusing that is fair, as two `static` functions of one
+name are fine in C only because each has internal linkage. Here a private function
+could have internal linkage too and keep its bare name; failing that, the message
+should name both namespaces, not say both are in the second.
+
+## ISSUE-054: A string-path import isn't looked up beside the importing file
+
+- **Severity:** papercut
+- **Kind:** bug
+- **Status:** worked-around
+- **Probe:** `probes/issue-054.nuc` — expected `8`; actual `import: cannot find
+  'z.nuc'` when compiled from another directory
+- **Port sites:** `tests/T/src/tmain.nuc`, whose `"../../src/main.nuc"` is relative to
+  `tests/T`, where `nucleus build` runs, not to `tests/T/src`
+- **Workaround:** write the path relative to the build directory.
+
+Context: docs/toplevel.md, "Where an import is found", puts "the directory of the file
+that holds the import" first, for a library name or a `.nuc` string path. A library
+name is found there; a string path is resolved against the current directory only.
+The same source then means different files depending on where the compiler starts.
 
 ## What worked well
 

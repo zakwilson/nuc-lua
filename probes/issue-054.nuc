@@ -1,0 +1,10 @@
+; ISSUE-054: a string-path import ("z.nuc") isn't looked up in the importing file's
+; directory, as docs/toplevel.md's first search step says; a library name is.
+; expect: prints `8` when compiled from another directory; actual: `import: cannot find 'z.nuc'`
+; run: mkdir -p $W/p54/d $W/p54/e && cp $P $W/p54/d/w.nuc && printf '(ns z)\n(defn z-f ():i32 (return 8))\n' > $W/p54/d/z.nuc && cd $W/p54/e && $NUCLEUSC ../d/w.nuc -o p 2>&1 | head -1 && ./p
+; fixed-when-output: 8
+(import-use "stdio.h")
+(import-use "z.nuc")
+(defn main ():i32
+  (printf "%d\n" (z-f))
+  (return 0))

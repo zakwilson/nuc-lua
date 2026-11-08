@@ -1,0 +1,13 @@
+;; The port built in Lua's test configuration (ltests.h): assertions on, a checked
+;; allocator, and the T library (src/lua/tests.nuc), for the suite's T-only parts.
+;; scripts/check-T.sh builds and runs it.
+{:name "lua"
+ :opt 2
+ :entry "src/tmain.nuc"
+ :source-root "../../src"
+ :cflags ["-I../../include" "-I../../reference/build/src" "-I../../build/suite/ltests"
+          "-DLUA_USE_LINUX" "-DLUA_USER_H=\"ltests.h\""]
+ :link-args ["-Wl,--dynamic-list=../../src/lua.dynlist"]
+ :libs ["m" "dl"]
+ :deps {luacapi {:path "../../capi"}
+        luaconfig {:path "../../config/tests"}}}

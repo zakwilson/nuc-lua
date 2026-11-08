@@ -1,0 +1,13 @@
+; What a stock build leaves to the C preprocessor and the headers can't carry: the
+; settings that `.c` files define, and the hooks ltests.h replaces. The settings the
+; headers define (LUAI_MAXCCALLS, MAXIWTHABS, LUAL_BUFFERSIZE, …) come from them.
+(ns luaconfig)
+
+(defconst LUA-ASSERTS false)          ; LUAI_ASSERT
+(defconst LUAI_MAXSTACK 1000000)      ; ldo.c
+(defconst MINSTRTABSIZE 128)          ; lstring.c: a power of 2; the core alone makes about 50
+(defconst LUA-COMPAT-MATHLIB false)   ; math.cosh, sinh, tanh, pow and log10
+
+(defmacro luai_tracegc (L first) `(do))
+(defmacro lua-new-state () `(luaL_newstate))     ; lua.c's
+(defmacro luai_openlibs (L) `(luaL_openlibs ~L))

@@ -40,7 +40,8 @@ object model, the compiler, execution state, the collector and the VM (§10).
 | 7 The VM | done: `lvm`, threaded dispatch; no stock object linked; benchmarked; user test request below |
 | 8 Nucleus libraries | done: `libs/nucdemo`, `tests/capi/nuc`, `docs/writing-libraries.md`; the full matrix, two libraries at once, the unload path; user test request below |
 | 9 Idiom pass | done: internals and private functions in kebab-case, shared macros in one place, `mathlib` in `defn-lua`; the layouts stay in the stock headers (ISSUE-037) |
-| 10–11 | not started |
+| 10 T harness | done: all of `ltests.c` in `tests/T`, a configuration per build (`config/`); the suite passes with `T`, `api.lua` and `memerr.lua` included, in both stressed modes |
+| 11 Final report | not started |
 
 ### Nucleus
 
@@ -127,6 +128,12 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
 - M9: after the renames every gate passes as before (suite, both stressed runs, the
   matrix, bytecode, tables, `nm` for both programs, 13 unit tests); the benchmark
   is unchanged, 0.93 to 1.13 times stock.
+- M10: `scripts/check-T.sh` passes the whole suite (`final OK`, 28 files, `api.lua`
+  and `memerr.lua` among them) on the port built with `ltests.h`, the checked
+  allocator, `T` and assertions on; so do both stressed runs (`LUA=tests/T/build/lua
+  scripts/check-gcstress.sh`). `memerr.lua`'s 44 minimum-allocation and memory
+  figures equal those of stock built the same way (`build/ref-T/lua-T`). The release
+  build's gates are unchanged.
 - The spike: a Nucleus `luaopen_` module whose function raises with `luaL_error`
   (a real C variadic call) is caught by `pcall` in stock `lua`.
 
@@ -163,10 +170,13 @@ the modules share from `llimits.h`, plus the workaround macros (`ch`, `bytes`, `
   ran past ten minutes in `db.lua`'s hook tests, and `stepsize` 0 took nine and
   failed its count-hook test (`db.lua:605`). `MODES=`
   picks one, logs in `build/`; `SUITE=` (for `check-suite.sh` too) runs on a copy.
+- `scripts/check-T.sh` builds `tests/T` and runs the suite with it (log in
+  `build/suite-T.log`); with `LUA=tests/T/build/lua`, `check-gcstress.sh` runs the
+  stressed modes in that configuration.
 
 ## Next
 
-M10, the `T` harness (PROMPT §10), then M11, the final report.
+M11, the final report (PROMPT §10).
 
 ## The idiom pass (M9)
 
@@ -213,6 +223,35 @@ A namespaced module that names `Node` imports `lobject.h` a second time with pre
 and writes `c/Node` (ISSUE-034). Every ported module is checked with `nm` for mangled
 names (ISSUE-022), since a definition whose type misses the header's prototype links as an
 overload and the C caller then binds to nothing.
+
+## The T harness (M10)
+
+- **Configuration.** `ltests.h` changes constants and turns on assertions, and a
+  Nucleus file can't yet choose code by target, so the choice is a library: the
+  `luaconfig` dependency is `config/release` for `lua` and `luac`, `config/tests` for
+  `tests/T`. Each holds the few constants the port defines itself (`LUA-ASSERTS`,
+  `LUAI_MAXSTACK`, `MINSTRTABSIZE`, `LUA-COMPAT-MATHLIB`) and three macros: the state's
+  constructor (the checked allocator under test), `luai_openlibs` (adds `T`) and
+  `luai_tracegc`. Constants `luaconf.h` defines (`LUAI_MAXCCALLS`, `LUAL_BUFFERSIZE`,
+  `LUA_EXTRASPACE`, `STRCACHE_N`, `LUA_COMPAT_GLOBAL`, …) come from the header, which
+  `-DLUA_USER_H=\"ltests.h\"` in `tests/T/build.edn` changes; the port's own copies
+  of them are gone. `lua_assert` is a macro that compiles to nothing when
+  `LUA-ASSERTS` is false; when true it aborts with the line.
+- **`tests/T`.** Builds the same sources (`:source-root "../../src"`) with
+  `tests/T/src/lua/tests.nuc`, all of `ltests.c` in Nucleus (1,409 lines against
+  2,247): the checked allocator with its marks and fill, `T.checkmemory` walking every
+  object, `T.testC`'s interpreter, `T.listcode`/`listk`, hooks, the panic test through
+  `_setjmp`. ISSUE-053 renamed one helper; ISSUE-054 shapes the entry's import path.
+- **Assertions.** `lgc.c`'s are restored (about 45) and pass in every run, since the
+  collector is where a layout or barrier mistake would hide. About 280 in the other
+  modules, and `lapi.c`'s `api_check`s, are not; the migration had dropped them and the
+  suite's own checks cover those paths.
+- **Left out.** `lua_lock`/`lua_unlock` and `ltests.h`'s user-state lock checks (the
+  port has no lock calls); `LUA_RAND32`, the 32-bit generator; `l_sprintf`'s
+  `memset`; `LUAI_STRICT_ADDRESS`; `LUA_USE_JUMPTABLE 0` (the port always threads).
+- **Oracle.** `build/ref-T/lua-T` is stock built with `ltests.c` and `-Wl,-E`, so that
+  `T`-mode results can be compared; `memerr.lua`'s minimum allocation for `dofile`
+  varies by one between runs on both.
 
 ## Open questions
 

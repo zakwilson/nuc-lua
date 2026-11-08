@@ -4,7 +4,9 @@
 ; llimits.h: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
 (ns lua.util)
 (import-use "stdio.h")
+(import-use "stdlib.h")
 (import-ct nucleus.node)
+(import-use luaconfig)
 
 ; A byte as an integer literal: (ch \e) is 101. A `\e` is a 32-bit Char, which
 ; won't compare with an i8 byte, and converting it is refused as lossy.
@@ -24,8 +26,14 @@
 (defmacro lua_writeline () `(do (fwrite "\n" 1 1 stdout) (fflush stdout)))
 (defmacro lua_writestringerror (s p) `(do (fprintf stderr ~s ~p) (fflush stderr)))
 
-; lua_assert is compiled out, as in a stock build without LUAI_ASSERT.
-(defmacro lua_assert (c) `(do))
+; LUAI_ASSERT's switch (luaconfig). The condition is compiled either way, so it
+; stays well typed; off, the constant test removes it.
+(defmacro lua_assert (c)
+  `(when (and LUA-ASSERTS (not ~c)) (lua-assert-fail ~(node-int (c 'line)))))
+
+(defn lua-assert-fail (line:i32):void :noreturn
+  (fprintf stderr "lua_assert failed, line %d\n" line)
+  (abort))
 
 ; llimits.h's casts. C converts silently and Nucleus's `as` refuses anything
 ; that can lose bits, so these are the port's one spelling of a C cast (ISSUE-008).

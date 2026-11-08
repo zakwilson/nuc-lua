@@ -1,0 +1,1409 @@
+; The T library: Lua's internal tests (ltests.c), for the suite's T-only parts. It
+; reads the core's structures directly, so it is built only in the configuration
+; of ltests.h (tests/T/build.edn), where its C declarations come from.
+;
+; ltests.c: Copyright (C) 1994-2026 Lua.org, PUC-Rio.
+(ns lua.tests)
+(set-ir-prefix "")
+(import-use luacapi)
+(import-use lua.util)
+(import-use lua.core)
+(import-use lua.opcodes)
+(import-use lua.ctype)
+(import-use lua.object)
+(import-use lua.string)
+(import-use lua.mem)
+(import-use lua.func)
+(import-use lua.tm)
+(import-use lua.table)
+(import-use lua.state)
+(import-use lua.debug)
+(import-use lua.do)
+(import-use lua.gc)
+(import-use "lstate.h")
+(import-use "lobject.h")
+(import "lobject.h" c)  ; c/Node: a bare Node is the prelude's (ISSUE-034)
+(import-use "lopcodes.h")
+(import-use "lgc.h")
+(import-use "ltests.h")
+(import-use "stdio.h")
+(import-use "stdlib.h")
+(import-use "string.h")
+(import-use "setjmp.h")
+(import-use "fcntl.h")
+(import-ct nucleus.node)
+(import-ct nucleus.intern)
+
+(defvar l_Trick:ptr null)
+
+(defmacro obj-at (L k) `(s2v (p+ (((~L 'ci) 'func) 'p) ~k)))
+
+; ltests.c checks memory with C's assert, on whatever the build's NDEBUG: so is this.
+(defmacro check (c)
+  `(when (not ~c) (check-failed ~(node-int (c 'line)))))
+
+(defn- check-failed (line:i32):void :noreturn
+  (fprintf stderr "lua.tests: check failed, line %d\n" line)
+  (abort))
+
+(defn- setnameval (L:(ptr lua_State) name:CStr val:i32):void
+  (lua_pushinteger L (as lua_Integer val))
+  (lua_setfield L -2 name))
+
+(defn- pushobject (L:(ptr lua_State) o:(ptr TValue)):void
+  (setobj2s L ((L 'top) 'p) o)
+  (api_incr_top L))
+
+(defn- badexit (fmt:CStr s1:CStr s2:CStr):void :noreturn
+  (fprintf stderr fmt s1)
+  (when (!= (as ptr s2) null)
+    (fprintf stderr "extra info: %s\n" s2))
+  (set! (l_memcontrol 'numblocks) 0)  ; no assertion failures when exiting
+  (set! (l_memcontrol 'total) 0)
+  (exit EXIT_FAILURE))
+
+(defn- tpanic (L:(ptr lua_State)):i32
+  (let (msg:CStr (if (= (lua_type L -1) LUA_TSTRING)
+                   (cstr (lua_tostring L -1))
+                   (cstr "error object is not a string")))
+    (badexit "PANIC: unprotected error in call to Lua API (%s)\n" msg (as CStr null))))
+
+; The warning function: parts of a message gather in 'warn-buff'. Mode 0
+; (normal) shows messages starting with '#' and aborts on others, as real
+; warnings the tests shouldn't raise; 1 (allow) shows all; 2 (store) puts the
+; message in the global _WARN.
+(defvar- warn-buff:(array i8 200))
+(defvar- warn-on:i32 0)
+(defvar- warn-mode:i32 0)
+(defvar- warn-lasttocont:i32 0)
+
+(defn- warnf (ud:ptr msg:CStr tocont:i32):void
+  (let (L:(ptr lua_State) (unsafe/cast (ptr lua_State) ud)
+        buff:(ptr i8) (as (ptr i8) warn-buff))
+    (when (and (= warn-lasttocont 0) (= tocont 0) (= (deref (bytes msg)) (ch \@)))  ; control?
+      (when (!= (deref buff) 0)
+        (badexit "Control warning during warning: %s\naborting...\n" msg (cstr buff)))
+      (cond (= (strcmp msg "@off") 0) (set! warn-on 0)
+            (= (strcmp msg "@on") 0) (set! warn-on 1)
+            (= (strcmp msg "@normal") 0) (set! warn-mode 0)
+            (= (strcmp msg "@allow") 0) (set! warn-mode 1)
+            (= (strcmp msg "@store") 0) (set! warn-mode 2)
+            true (badexit "Invalid control warning in test mode: %s\naborting...\n"
+                          msg (as CStr null)))
+      (return))
+    (set! warn-lasttocont tocont)
+    (when (>= (strlen msg) (- 200 (strlen (cstr buff))))
+      (badexit "warnf-buffer overflow (%s)\n" msg (cstr buff)))
+    (strcat buff msg)  ; add the part to the warning
+    (when (= tocont 0)  ; the message is complete
+      (luaL_checkstack L 1 "warn stack space")
+      (lua_getglobal L "_WARN")
+      (if (= (lua_toboolean L -1) 0)
+        (lua_pop L 1)  ; no earlier unexpected warning
+        (badexit "Unhandled warning in store mode: %s\naborting...\n"
+                 (lua_tostring L -1) (cstr buff)))
+      (when (and (= warn-mode 0) (!= (deref buff) (ch \#)) (!= warn-on 0))
+        (badexit "Unexpected warning in test mode: %s\naborting...\n" (cstr buff) (as CStr null)))
+      (case warn-mode
+        (:or 0 1) (when (!= warn-on 0)
+                    (fprintf stderr "Lua warning: %s\n" (cstr buff)))
+        2 (do (luaL_checkstack L 1 "warn stack space")
+              (lua_pushstring L (cstr buff))
+              (lua_setglobal L "_WARN"))
+        0)
+      (set! (deref buff) 0))))  ; ready for the next warning
+
+; ---- the checked allocator ----
+
+(defconst MARK 0x55)        ; 01010101, after each block
+(defconst MARKSIZE 16)
+(defmacro hdrsize () `(unsafe/cast usize (sizeof MemHeader)))  ; sizeof is signed (ISSUE-025)
+(defconst FILL 0xAB)        ; -MARK, filling new and freed memory
+
+; Before each block: its size and the type Lua said it was for. 16 bytes, as
+; ltests.c's union with LUAI_MAXALIGN, so the block stays aligned.
+(defstruct MemHeader size:usize type:i32)
+
+(defmacro block-bytes (h) `(p+ (unsafe/cast (ptr ui8) ~h) (hdrsize)))
+
+(defn- freeblock (mc:(ptr Memcontrol) block:(ptr MemHeader)):void
+  (when (!= (as ptr block) null)
+    (let (size:usize (block 'size)
+          b:(ptr ui8) (block-bytes block))
+      (for (i:usize 0) (< i (as usize MARKSIZE)) (set! i (+ i 1))  ; the marks after the block
+        (lua_assert (= (deref (p+ b (+ size i))) MARK)))
+      (set! (aref (mc 'objcount) (block 'type)) (- (aref (mc 'objcount) (block 'type)) 1))
+      (memset (as ptr block) FILL (+ (hdrsize) size (as usize MARKSIZE)))  ; erase it
+      (free (as ptr block))
+      (set! (mc 'numblocks) (- (mc 'numblocks) 1))
+      (set! (mc 'total) (- (mc 'total) size)))))
+
+(defn debug_realloc (ud:ptr b:ptr oldsize0:usize size:usize):ptr
+  (let (mc:(ptr Memcontrol) (unsafe/cast (ptr Memcontrol) ud)
+        block:(ptr MemHeader) (unsafe/cast (ptr MemHeader) b)
+        oldsize:usize oldsize0
+        type:i32 0)
+    (when (= (mc 'memlimit) 0)  ; the first call
+      (let (limit:CStr (getenv "MEMLIMIT"))
+        (set! (mc 'memlimit) (if (!= (as ptr limit) null) (strtoul limit null 10) ULONG_MAX))
+        (set! (mc 'countlimit) ULONG_MAX)))
+    (if (= (as ptr block) null)
+      (do (set! type (if (< oldsize LUA_NUMTYPES) (cast_int oldsize) 0))
+          (set! oldsize 0))
+      (do (set! block (p+ block -1))  ; the real header
+          (set! type (block 'type))
+          (lua_assert (= oldsize (block 'size)))))
+    (when (= size 0)
+      (freeblock mc block)
+      (return null))
+    (when (!= (mc 'failnext) 0)
+      (set! (mc 'failnext) 0)
+      (return null))  ; one faked allocation failure
+    (when (and (!= (mc 'countlimit) ULONG_MAX) (!= size oldsize))  ; a count limit?
+      (when (= (mc 'countlimit) 0)
+        (return null))  ; a faked failure
+      (set! (mc 'countlimit) (- (mc 'countlimit) 1)))
+    (when (and (> size oldsize) (> (- (+ (mc 'total) size) oldsize) (mc 'memlimit)))
+      (return null))  ; a faked failure
+    (let (commonsize:usize (if (< oldsize size) oldsize size)
+          realsize:usize (+ (hdrsize) size (as usize MARKSIZE)))
+      (when (< realsize size) (return null))  ; overflow
+      (let (newblock:(ptr MemHeader) (unsafe/cast (ptr MemHeader) (malloc realsize)))
+        (when (= (as ptr newblock) null)
+          (return null))  ; really out of memory
+        (let (nb:(ptr ui8) (block-bytes newblock))
+          (when (!= (as ptr block) null)
+            (memcpy (as ptr nb) (as ptr (block-bytes block)) commonsize)  ; the old contents
+            (freeblock mc block))  ; erase and check the old copy
+          (memset (as ptr (p+ nb commonsize)) FILL (- size commonsize))  ; something weird
+          (for (i:usize 0) (< i (as usize MARKSIZE)) (set! i (+ i 1))
+            (set! (deref (p+ nb (+ size i))) MARK))
+          (set! (newblock 'size) size)
+          (set! (newblock 'type) type)
+          (set! (mc 'total) (+ (mc 'total) size))
+          (when (> (mc 'total) (mc 'maxmem))
+            (set! (mc 'maxmem) (mc 'total)))
+          (set! (mc 'numblocks) (+ (mc 'numblocks) 1))
+          (set! (aref (mc 'objcount) type) (+ (aref (mc 'objcount) type) 1))
+          (return (as ptr nb)))))))
+
+(defvar l_memcontrol:Memcontrol)
+
+; ---- memory consistency ----
+
+; The collector's invariants: in incremental mode a black object can't point to a
+; white one; in generational mode a really old object can't point to a young one,
+; and old1 and touched2 objects can't point to new ones. Threads and open upvalues
+; are visited in every collection, so they may (and only they are old but gray).
+(defn- testobjref1 (g:(ptr global_State) f:(ptr GCObject) t:(ptr GCObject)):bool
+  (cond (isdead g t) (return false)
+        (issweepphase g) (return true)  ; no invariants
+        (!= (g 'gckind) KGC_GENMINOR) (return (not (and (isblack f) (iswhite t))))
+        true
+        (do (when (and (= (getage f) G_OLD) (isblack f) (not (isold t)))
+              (return false))
+            (when (and (or (= (getage f) G_OLD1) (= (getage f) G_TOUCHED2))
+                       (= (getage t) G_NEW))
+              (return false))
+            (return true))))
+
+(defvar- agenames:(array CStr 7) (array CStr "n" "s" "0" "1" "o" "T" "t"))
+
+(defn- printobj (g:(ptr global_State) o:(ptr GCObject)):void
+  (printf "||%s(%p)-%c%c(%02X)||" (ttypename (novariant (o 'tt))) (as ptr o)
+          (as i32 (cond (isdead g o) (ch \d) (isblack o) (ch \b) (iswhite o) (ch \w) true (ch \g)))
+          (as i32 (deref (bytes (aref agenames (getage o)))))
+          (as i32 (o 'marked)))
+  (when (or (= (o 'tt) LUA_VSHRSTR) (= (o 'tt) LUA_VLNGSTR))
+    (printf " '%s'" (getstr (gco2ts o)))))
+
+(defn lua_printobj (L:(ptr lua_State) o:(ptr GCObject)):void
+  (printobj (G L) o))
+
+(defn lua_printvalue (v:(ptr TValue)):void
+  (case (as i32 (ttypetag v))
+    (:or LUA_VNUMINT LUA_VNUMFLT)
+      (let (buff:(ptr i8) (alloca i8 LUA_N2SBUFFSZ)
+            len:ui32 (obj-tostringbuff v buff))
+        (set! (deref (p+ buff len)) 0)
+        (printf "%s" (cstr buff)))
+    LUA_VSHRSTR (printf "'%s'" (getstr (tsvalue v)))
+    LUA_VLNGSTR (printf "'%.30s...'" (getstr (tsvalue v)))
+    LUA_VFALSE (printf "%s" "false")
+    LUA_VTRUE (printf "%s" "true")
+    LUA_VLIGHTUSERDATA (printf "light udata: %p" (pvalue v))
+    LUA_VUSERDATA (printf "full udata: %p" (as ptr (uvalue v)))
+    LUA_VNIL (printf "nil")
+    LUA_VLCF (printf "light C function: %p" (unsafe/cast ptr (fvalue v)))
+    LUA_VCCL (printf "C closure: %p" (as ptr (clCvalue v)))
+    LUA_VLCL (printf "Lua function: %p" (as ptr (clLvalue v)))
+    LUA_VTHREAD (printf "thread: %p" (as ptr (gco2th (gcvalue v))))
+    LUA_VTABLE (printf "table: %p" (as ptr (hvalue v)))
+    (lua_assert false)))
+
+(defn- testobjref (g:(ptr global_State) f:(ptr GCObject) t:(ptr GCObject)):bool
+  (let (r1:bool (testobjref1 g f t))
+    (when (not r1)
+      (printf "%d(%02X) - " (as i32 (g 'gcstate)) (as i32 (g 'currentwhite)))
+      (printobj g f)
+      (printf "  ->  ")
+      (printobj g t)
+      (printf "\n"))
+    (return r1)))
+
+(defn- checkobjref (g:(ptr global_State) f:(ptr GCObject) t:(ptr GCObject)):void
+  (check (testobjref g f t)))
+
+; 't' may be null while an object is being built.
+(defmacro checkobjrefN (g f t)
+  (let (a (gensym))
+    `(let (~a ~t)
+       (when (!= (as ptr ~a) null) (checkobjref ~g ~f (obj2gco ~a))))))
+
+(defmacro righttt (o) `(= (ttypetag ~o) ((gcvalue ~o) 'tt)))
+
+(defn- checkvalref (g:(ptr global_State) f:(ptr GCObject) t:(ptr TValue)):void
+  (check (or (not (iscollectable t))
+             (and (righttt t) (testobjref g f (gcvalue t))))))
+
+(defn- checktable (g:(ptr global_State) h:(ptr Table)):void
+  (let (asize:ui32 (h 'asize)
+        limit:(ptr c/Node) (gnode h (sizenode h))
+        hgc:(ptr GCObject) (obj2gco h)
+        aux:(ptr TValue) (alloca TValue)
+        k:(ptr TValue) (alloca TValue))
+    (checkobjrefN g hgc (h 'metatable))
+    (for (i:ui32 0) (< i asize) (set! i (+ i 1))
+      (arr2obj h i aux)
+      (checkvalref g hgc aux))
+    (let (n:(ptr c/Node) (gnode h 0))
+      (while (< (as ptr n) (as ptr limit))
+        (when (not (isempty (gval n)))
+          (getnodekey (mainthread g) k n)
+          (check (not (keyisnil n)))
+          (checkvalref g hgc k)
+          (checkvalref g hgc (gval n)))
+        (set! n (p+ n 1))))))
+
+(defn- checkudata (g:(ptr global_State) u:(ptr Udata)):void
+  (let (hgc:(ptr GCObject) (obj2gco u))
+    (checkobjrefN g hgc (u 'metatable))
+    (for (i:i32 0) (< i (as i32 (u 'nuvalue))) (set! i (+ i 1))
+      (checkvalref g hgc (ref ((aref (u 'uv) i) 'uv))))))
+
+(defn- checkproto (g:(ptr global_State) f:(ptr Proto)):void
+  (let (fgc:(ptr GCObject) (obj2gco f))
+    (checkobjrefN g fgc (f 'source))
+    (for (i:i32 0) (< i (f 'sizek)) (set! i (+ i 1))
+      (when (iscollectable (p+ (f 'k) i))
+        (checkobjref g fgc (gcvalue (p+ (f 'k) i)))))
+    (for (i:i32 0) (< i (f 'sizeupvalues)) (set! i (+ i 1))
+      (checkobjrefN g fgc ((p+ (f 'upvalues) i) 'name)))
+    (for (i:i32 0) (< i (f 'sizep)) (set! i (+ i 1))
+      (checkobjrefN g fgc (deref (p+ (f 'p) i))))
+    (for (i:i32 0) (< i (f 'sizelocvars)) (set! i (+ i 1))
+      (checkobjrefN g fgc ((p+ (f 'locvars) i) 'varname)))))
+
+(defn- check-cclosure (g:(ptr global_State) cl:(ptr CClosure)):void
+  (let (clgc:(ptr GCObject) (obj2gco cl))
+    (for (i:i32 0) (< i (as i32 (cl 'nupvalues))) (set! i (+ i 1))
+      (checkvalref g clgc (ref (aref (cl 'upvalue) i))))))
+
+(defn- check-lclosure (g:(ptr global_State) cl:(ptr LClosure)):void
+  (let (clgc:(ptr GCObject) (obj2gco cl))
+    (checkobjrefN g clgc (cl 'p))
+    (for (i:i32 0) (< i (as i32 (cl 'nupvalues))) (set! i (+ i 1))
+      (let (uv:(ptr UpVal) (aref (cl 'upvals) i))
+        (when (!= (as ptr uv) null)
+          (checkobjrefN g clgc uv)
+          (when (not (upisopen uv))
+            (checkvalref g (obj2gco uv) ((uv 'v) 'p))))))))
+
+(defn- lua-checkpc (ci:(ptr CallInfo)):bool
+  (if (not (isLua ci))
+    (return true)
+    (let (p:(ptr Proto) ((clLvalue (s2v ((ci 'func) 'p))) 'p)
+          pc:(ptr Instruction) (((ci 'u) 'l) 'savedpc))
+      (return (and (<= (as ptr (p 'code)) (as ptr pc))
+                   (<= (as ptr pc) (as ptr (p+ (p 'code) (p 'sizecode)))))))))
+
+; lgc.h's checkliveness: a collectable value has the right tag and isn't dead.
+(defn- checkliveness (L:(ptr lua_State) o:(ptr TValue)):void
+  (check (or (not (iscollectable o))
+             (and (righttt o) (not (isdead (G L) (gcvalue o)))))))
+
+(defn- check-stack (g:(ptr global_State) L1:(ptr lua_State)):void
+  (check (not (isdead g (obj2gco L1))))
+  (when (= (as ptr ((L1 'stack) 'p)) null)  ; an incomplete thread
+    (check (and (= (as ptr (L1 'openupval)) null) (= (as ptr (L1 'ci)) null)))
+    (return))
+  (let (uv:(ptr UpVal) (L1 'openupval))
+    (while (!= (as ptr uv) null)
+      (check (upisopen uv))  ; must be open
+      (set! uv (((uv 'u) 'open) 'next))))
+  (check (<= (as ptr ((L1 'top) 'p)) (as ptr ((L1 'stack_last) 'p))))
+  (check (<= (as ptr ((L1 'tbclist) 'p)) (as ptr ((L1 'top) 'p))))
+  (let (ci:(ptr CallInfo) (L1 'ci))
+    (while (!= (as ptr ci) null)
+      (check (<= (as ptr ((ci 'top) 'p)) (as ptr ((L1 'stack_last) 'p))))
+      (check (lua-checkpc ci))
+      (set! ci (ci 'previous))))
+  (let (o:StkId ((L1 'stack) 'p))
+    (while (< (as ptr o) (as ptr ((L1 'stack_last) 'p)))
+      (checkliveness L1 (s2v o))  ; the whole stack holds valid values
+      (set! o (p+ o 1)))))
+
+(defn- checkrefs (g:(ptr global_State) o:(ptr GCObject)):void
+  (case (as i32 (o 'tt))
+    LUA_VUSERDATA (checkudata g (gco2u o))
+    LUA_VUPVAL (checkvalref g o (((gco2upv o) 'v) 'p))
+    LUA_VTABLE (checktable g (gco2t o))
+    LUA_VTHREAD (check-stack g (gco2th o))
+    LUA_VLCL (check-lclosure g (gco2lcl o))
+    LUA_VCCL (check-cclosure g (gco2ccl o))
+    LUA_VPROTO (checkproto g (gco2p o))
+    (:or LUA_VSHRSTR LUA_VLNGSTR) (check (not (isgray o)))  ; strings are never gray
+    (check false)))
+
+; Dead objects only in 'allgc' during a sweep (the caller's 'maybedead'); white
+; ones only in a pause. In generational mode, objects old enough for their list,
+; old ones not white and black unless touched1, old0, a thread or an open upvalue,
+; touched1 ones gray.
+(defn- checkobject (g:(ptr global_State) o:(ptr GCObject) maybedead:bool listage:i32):void
+  (if (isdead g o)
+    (check maybedead)
+    (do (check (or (!= (g 'gcstate) GCSpause) (iswhite o)))
+        (when (= (g 'gckind) KGC_GENMINOR)
+          (check (>= (as i32 (getage o)) listage))
+          (when (isold o)
+            (check (not (iswhite o)))
+            (check (or (isblack o)
+                       (= (getage o) G_TOUCHED1)
+                       (= (getage o) G_OLD0)
+                       (= (o 'tt) LUA_VTHREAD)
+                       (and (= (o 'tt) LUA_VUPVAL) (upisopen (gco2upv o))))))
+          (check (or (!= (getage o) G_TOUCHED1) (isgray o))))
+        (checkrefs g o))))
+
+(defconst TESTBIT 7)  ; lgc.h's, a bit the collector leaves to the tests
+(defmacro testbit (x b) `(!= (bit-and ~x (bit-shl 1 ~b)) 0))
+
+(defn- checkgraylist (g:(ptr global_State) o0:(ptr GCObject)):l_mem
+  (let (total:l_mem 0
+        o:(ptr GCObject) o0)
+    (while (!= (as ptr o) null)
+      (check (!= (isgray o) (= (getage o) G_TOUCHED2)))
+      (check (not (testbit (o 'marked) TESTBIT)))
+      (when (keepinvariant g)
+        (set! (o 'marked) (cast_uchar (bit-or (o 'marked) (bit-shl 1 TESTBIT)))))  ; in a gray list
+      (set! total (+ total 1))
+      (case (as i32 (o 'tt))
+        LUA_VTABLE (set! o ((gco2t o) 'gclist))
+        LUA_VLCL (set! o ((gco2lcl o) 'gclist))
+        LUA_VCCL (set! o ((gco2ccl o) 'gclist))
+        LUA_VTHREAD (set! o ((gco2th o) 'gclist))
+        LUA_VPROTO (set! o ((gco2p o) 'gclist))
+        LUA_VUSERDATA (do (check (> ((gco2u o) 'nuvalue) 0))
+                          (set! o ((gco2u o) 'gclist)))
+        (check false)))  ; nothing else goes in a gray list
+    (return total)))
+
+(defn- checkgrays (g:(ptr global_State)):l_mem
+  (when (not (keepinvariant g)) (return 0))
+  (return (+ (checkgraylist g (g 'gray)) (checkgraylist g (g 'grayagain))
+             (checkgraylist g (g 'weak)) (checkgraylist g (g 'allweak))
+             (checkgraylist g (g 'ephemeron)))))
+
+; Whether 'o' should be in a gray list; if so, counts it and checks the TESTBIT
+; that checkgraylist set.
+(defn- incifingray (g:(ptr global_State) o:(ptr GCObject) count:(ptr l_mem)):void
+  (when (not (keepinvariant g))
+    (return))  ; no gray lists in these phases
+  (when (= (o 'tt) LUA_VUPVAL)
+    (check (or (not (isgray o)) (upisopen (gco2upv o))))  ; only open ones can be gray
+    (return))  ; and none is in a gray list
+  (when (or (isgray o) (= (getage o) G_TOUCHED2))
+    (set! (deref count) (+ (deref count) 1))
+    (check (testbit (o 'marked) TESTBIT))
+    (set! (o 'marked) (cast_uchar (bit-and (o 'marked) (bit-xor 0xFF (bit-shl 1 TESTBIT)))))))
+
+(defn- checklist (g:(ptr global_State) maybedead:bool tof:bool newl:(ptr GCObject)
+                  survival:(ptr GCObject) old:(ptr GCObject) reallyold:(ptr GCObject)):l_mem
+  (let (total:l_mem 0
+        o:(ptr GCObject) newl)
+    (macrolet ((walk (until age dead)
+                 `(while (!= (as ptr o) (as ptr ~until))
+                    (checkobject g o ~dead ~age)
+                    (incifingray g o (ref total))
+                    (check (= tof (tofinalize o)))
+                    (set! o (o 'next)))))
+      (walk survival G_NEW maybedead)
+      (walk old G_SURVIVAL false)
+      (walk reallyold G_OLD1 false)
+      (walk null G_OLD false))
+    (return total)))
+
+(defn lua_checkmemory (L:(ptr lua_State)):i32
+  (let (g:(ptr global_State) (G L)
+        totalin:l_mem 0
+        totalshould:l_mem 0)
+    (when (keepinvariant g)
+      (check (not (iswhite (obj2gco (mainthread g)))))
+      (check (not (iswhite (gcvalue (ref (g 'l_registry)))))))
+    (check (not (isdead g (gcvalue (ref (g 'l_registry))))))
+    (check (or (= (as ptr (g 'sweepgc)) null) (issweepphase g)))
+    (set! totalin (checkgrays g))
+    (let (o:(ptr GCObject) (g 'fixedgc))  ; the 'fixedgc' list
+      (while (!= (as ptr o) null)
+        (check (and (= (o 'tt) LUA_VSHRSTR) (isgray o) (= (getage o) G_OLD)))
+        (set! o (o 'next))))
+    (let (maybedead:bool (and (< GCSatomic (g 'gcstate)) (<= (g 'gcstate) GCSswpallgc)))
+      (set! totalshould (checklist g maybedead false (g 'allgc) (g 'survival) (g 'old1)
+                                   (g 'reallyold))))
+    (set! totalshould (+ totalshould (checklist g false true (g 'finobj) (g 'finobjsur)
+                                                (g 'finobjold1) (g 'finobjrold))))
+    (let (o:(ptr GCObject) (g 'tobefnz))
+      (while (!= (as ptr o) null)
+        (checkobject g o false G_NEW)
+        (incifingray g o (ref totalshould))
+        (check (tofinalize o))
+        (check (or (= (o 'tt) LUA_VUSERDATA) (= (o 'tt) LUA_VTABLE)))
+        (set! o (o 'next))))
+    (when (keepinvariant g)
+      (check (= totalin totalshould)))
+    (return 0)))
+
+; ---- the disassembler ----
+
+; The opcode names, from the rows lopcodes uses, without their "OP_".
+(defmacro defopnames (rows)
+  (let (names (node-list-new (rows 'line))
+        n (ast-len rows)
+        i 0)
+    (while (< i n)
+      (let (s (alloc-node)
+            op ((ast-at (ast-at rows i) 0) 's))
+        (set! (s 'kind) NODE-STR)
+        (set! (s 's) (symbol-from-cstr (as CStr (as ptr (unsafe/ptr+ (as (ptr i8) (as ptr (symbol-as-cstr op))) 3)))))
+        (node-push names s))
+      (set! i (+ i 1)))
+    `(defvar- opnames:(array CStr 85) (array CStr ~@names))))  ; NUM_OPCODES
+
+(with-opcodes defopnames)
+
+(defn- buildop (p:(ptr Proto) pc:i32 buff0:(ptr i8)):CStr
+  (let (buff:(ptr i8) buff0
+        i:Instruction (deref (p+ (p 'code) pc))
+        o:i32 (GET_OPCODE i)
+        name:CStr (aref opnames o)
+        line:i32 (debug-getfuncline p pc)
+        lineinfo:i32 (if (!= (as ptr (p 'lineinfo)) null) (as i32 (deref (p+ (p 'lineinfo) pc))) 0)
+        k:CStr (if (!= (GETARG_k i) 0) (cstr " (k)") (cstr "")))
+    (if (= lineinfo ABSLINEINFO)
+      (set! buff (p+ buff (sprintf buff "(__")))
+      (set! buff (p+ buff (sprintf buff "(%2d" lineinfo))))
+    (set! buff (p+ buff (sprintf buff " - %4d) %4d - " line pc)))
+    (case (getOpMode o)
+      iABC (sprintf buff "%-12s%4d %4d %4d%s" name (GETARG_A i) (GETARG_B i) (GETARG_C i) k)
+      ivABC (sprintf buff "%-12s%4d %4d %4d%s" name (GETARG_A i) (GETARG_vB i) (GETARG_vC i) k)
+      iABx (sprintf buff "%-12s%4d %4d" name (GETARG_A i) (GETARG_Bx i))
+      iAsBx (sprintf buff "%-12s%4d %4d" name (GETARG_A i) (GETARG_sBx i))
+      iAx (sprintf buff "%-12s%4d" name (GETARG_Ax i))
+      isJ (sprintf buff "%-12s%4d" name (GETARG_sJ i))
+      0)
+    (return (cstr buff0))))
+
+(defn- getproto-arg (L:(ptr lua_State)):(ptr Proto)
+  (luaL_argcheck L (and (lua_isfunction L 1) (= (lua_iscfunction L 1) 0))
+                 1 "Lua function expected")
+  (return ((clLvalue (obj-at L 1)) 'p)))
+
+(defn- listcode (L:(ptr lua_State)):i32
+  (let (p:(ptr Proto) (getproto-arg L)
+        buff:(ptr i8) (alloca i8 100))
+    (lua_newtable L)
+    (setnameval L "maxstack" (as i32 (p 'maxstacksize)))
+    (setnameval L "numparams" (as i32 (p 'numparams)))
+    (for (pc:i32 0) (< pc (p 'sizecode)) (set! pc (+ pc 1))
+      (lua_pushinteger L (as lua_Integer (+ pc 1)))
+      (lua_pushstring L (buildop p pc buff))
+      (lua_settable L -3))
+    (return 1)))
+
+(defn- printcode (L:(ptr lua_State)):i32
+  (let (p:(ptr Proto) (getproto-arg L)
+        buff:(ptr i8) (alloca i8 100))
+    (printf "maxstack: %d\n" (as i32 (p 'maxstacksize)))
+    (printf "numparams: %d\n" (as i32 (p 'numparams)))
+    (for (pc:i32 0) (< pc (p 'sizecode)) (set! pc (+ pc 1))
+      (printf "%s\n" (buildop p pc buff)))
+    (return 0)))
+
+(defn- listk (L:(ptr lua_State)):i32
+  (let (p:(ptr Proto) (getproto-arg L))
+    (lua_createtable L (p 'sizek) 0)
+    (for (i:i32 0) (< i (p 'sizek)) (set! i (+ i 1))
+      (pushobject L (p+ (p 'k) i))
+      (lua_rawseti L -2 (as lua_Integer (+ i 1))))
+    (return 1)))
+
+(defn- listabslineinfo (L:(ptr lua_State)):i32
+  (let (p:(ptr Proto) (getproto-arg L))
+    (luaL_argcheck L (!= (as ptr (p 'abslineinfo)) null) 1 "function has no debug info")
+    (lua_createtable L (* 2 (p 'sizeabslineinfo)) 0)
+    (for (i:i32 0) (< i (p 'sizeabslineinfo)) (set! i (+ i 1))
+      (lua_pushinteger L (as lua_Integer ((p+ (p 'abslineinfo) i) 'pc)))
+      (lua_rawseti L -2 (as lua_Integer (+ (* 2 i) 1)))
+      (lua_pushinteger L (as lua_Integer ((p+ (p 'abslineinfo) i) 'line)))
+      (lua_rawseti L -2 (as lua_Integer (+ (* 2 i) 2))))
+    (return 1)))
+
+(defn- listlocals (L:(ptr lua_State)):i32
+  (let (pc:i32 (- (cast_int (luaL_checkinteger L 2)) 1)
+        i:i32 0
+        p:(ptr Proto) (getproto-arg L))
+    (while true
+      (set! i (+ i 1))
+      (let (name:CStr (func-getlocalname p i pc))
+        (when (= (as ptr name) null) (break))
+        (lua_pushstring L name)))
+    (return (- i 1))))
+
+(defn lua_printstack (L:(ptr lua_State)):void
+  (let (n:i32 (lua_gettop L))
+    (printf "stack: >>\n")
+    (for (i:i32 1) (<= i n) (set! i (+ i 1))
+      (printf "%3d: " i)
+      (lua_printvalue (obj-at L i))
+      (printf "\n"))
+    (printf "<<\n")))
+
+(defn lua_printallstack (L:(ptr lua_State)):i32
+  (let (i:i32 1
+        ci:(ptr CallInfo) (ref (L 'base_ci))
+        p:StkId ((L 'stack) 'p))
+    (printf "stack: >>\n")
+    (while (< (as ptr p) (as ptr ((L 'top) 'p)))
+      (when (and (!= (as ptr ci) null) (= (as ptr p) (as ptr ((ci 'func) 'p))))
+        (printf "  ---\n")
+        (set! ci (if (= (as ptr ci) (as ptr (L 'ci))) (as (ptr CallInfo) null) (ci 'next))))
+      (printf "%3d: " i)
+      (set! i (+ i 1))
+      (lua_printvalue (s2v p))
+      (printf "\n")
+      (set! p (p+ p 1)))
+    (printf "<<\n")
+    (return 0)))
+
+(defn- get-limits (L:(ptr lua_State)):i32
+  (lua_createtable L 0 5)
+  (setnameval L "IS32INT" LUAI_IS32INT)
+  (setnameval L "MAXARG_Ax" MAXARG_Ax)
+  (setnameval L "MAXARG_Bx" MAXARG_Bx)
+  (setnameval L "OFFSET_sBx" OFFSET_sBx)
+  (setnameval L "NUM_OPCODES" NUM_OPCODES)
+  (return 1))
+
+(defn- get-sizes (L:(ptr lua_State)):i32
+  (lua_newtable L)
+  (setnameval L "Lua state" (cast_int (sizeof lua_State)))
+  (setnameval L "global state" (cast_int (sizeof global_State)))
+  (setnameval L "TValue" (cast_int (sizeof TValue)))
+  (setnameval L "Node" (cast_int (sizeof c/Node)))
+  (setnameval L "stack Value" (cast_int (sizeof StackValue)))
+  (return 1))
+
+(defn- mem-query (L:(ptr lua_State)):i32
+  (cond
+    (lua_isnone L 1)
+      (do (lua_pushinteger L (unsafe/cast lua_Integer (l_memcontrol 'total)))
+          (lua_pushinteger L (unsafe/cast lua_Integer (l_memcontrol 'numblocks)))
+          (lua_pushinteger L (unsafe/cast lua_Integer (l_memcontrol 'maxmem)))
+          (return 3))
+    (!= (lua_isnumber L 1) 0)
+      (let (limit:ui64 (unsafe/cast ui64 (luaL_checkinteger L 1)))
+        (set! (l_memcontrol 'memlimit) (if (= limit 0) ULONG_MAX limit))
+        (return 0))
+    true
+      (let (t:CStr (luaL_checkstring L 1))
+        (for (i:i32 (- LUA_NUMTYPES 1)) (>= i 0) (set! i (- i 1))
+          (when (= (strcmp t (ttypename i)) 0)
+            (lua_pushinteger L (unsafe/cast lua_Integer (aref (l_memcontrol 'objcount) i)))
+            (return 1)))
+        (return (luaL_error L "unknown type '%s'" t)))))
+
+(defn- alloc-count (L:(ptr lua_State)):i32
+  (set! (l_memcontrol 'countlimit)
+        (if (lua_isnone L 1) ULONG_MAX (unsafe/cast ui64 (luaL_checkinteger L 1))))
+  (return 0))
+
+(defn- alloc-failnext (L:(ptr lua_State)):i32
+  (set! (l_memcontrol 'failnext) 1)
+  (return 0))
+
+(defn- settrick (L:(ptr lua_State)):i32
+  (set! l_Trick (if (ttisnil (obj-at L 1)) null (as ptr (gcvalue (obj-at L 1)))))
+  (return 0))
+
+(defn- gc-color (L:(ptr lua_State)):i32
+  (luaL_checkany L 1)
+  (let (o:(ptr TValue) (obj-at L 1))
+    (if (not (iscollectable o))
+      (lua_pushstring L "no collectable")
+      (let (obj:(ptr GCObject) (gcvalue o))
+        (lua_pushstring L (cond (isdead (G L) obj) (cstr "dead")
+                                (iswhite obj) (cstr "white")
+                                (isblack obj) (cstr "black")
+                                true (cstr "gray")))))
+    (return 1)))
+
+(defvar- gennames:(array CStr 7)
+  (array CStr "new" "survival" "old0" "old1" "old" "touched1" "touched2"))
+
+(defn- gc-age (L:(ptr lua_State)):i32
+  (luaL_checkany L 1)
+  (let (o:(ptr TValue) (obj-at L 1))
+    (if (not (iscollectable o))
+      (lua_pushstring L "no collectable")
+      (lua_pushstring L (aref gennames (getage (gcvalue o)))))
+    (return 1)))
+
+(defn- gc-printobj (L:(ptr lua_State)):i32
+  (luaL_checkany L 1)
+  (let (o:(ptr TValue) (obj-at L 1))
+    (if (not (iscollectable o))
+      (printf "no collectable\n")
+      (do (printobj (G L) (gcvalue o))
+          (printf "\n")))
+    (return 0)))
+
+(defvar- statenames:(array CStr 11)
+  (array CStr "propagate" "enteratomic" "atomic" "sweepallgc" "sweepfinobj"
+         "sweeptobefnz" "sweepend" "callfin" "pause" "" null))
+(defvar- gcstates:(array i32 10)
+  (array i32 GCSpropagate GCSenteratomic GCSatomic GCSswpallgc GCSswpfinobj
+         GCSswptobefnz GCSswpend GCScallfin GCSpause -1))
+
+(defn- gc-state (L:(ptr lua_State)):i32
+  (let (option:i32 (aref gcstates (luaL_checkoption L 1 "" (as (ptr CStr) statenames)))
+        g:(ptr global_State) (G L))
+    (when (= option -1)
+      (lua_pushstring L (aref statenames (g 'gcstate)))
+      (return 1))
+    (when (!= (g 'gckind) KGC_INC)
+      (luaL_error L "cannot change states in generational mode"))
+    (when (< option (as i32 (g 'gcstate)))  ; must cross 'pause'?
+      (gc-runtilstate L GCSpause 1))  ; run until pause
+    (gc-runtilstate L option 0)  ; don't skip the propagation state
+    (lua_assert (= (as i32 (g 'gcstate)) option))
+    (return 0)))
+
+(defvar- tracinggc:i32 0)
+
+(defn luai_tracegctest (L:(ptr lua_State) first:i32):void
+  (when (= tracinggc 0) (return))
+  (let (g:(ptr global_State) (G L))
+    (set! (g 'gcstp) GCSTPGC)
+    (lua_checkstack L 10)
+    (lua_getfield L LUA_REGISTRYINDEX "tracegc")
+    (lua_pushboolean L first)
+    (lua_call L 1 0)
+    (set! (g 'gcstp) 0)))
+
+(defn- tracegc (L:(ptr lua_State)):i32
+  (if (lua_isnil L 1)
+    (set! tracinggc 0)
+    (do (set! tracinggc 1)
+        (lua_setfield L LUA_REGISTRYINDEX "tracegc")))
+  (return 0))
+
+(defn- hash-query (L:(ptr lua_State)):i32
+  (if (lua_isnone L 2)
+    (do (luaL_argcheck L (= (lua_type L 1) LUA_TSTRING) 1 "string expected")
+        (let (ts:(ptr TString) (tsvalue (obj-at L 1)))
+          (when (= (ts 'tt) LUA_VLNGSTR)
+            (string-hashlongstr ts))  ; a long string's hash is made on demand
+          (lua_pushinteger L (as lua_Integer (cast_int (ts 'hash))))))
+    (let (o:(ptr TValue) (obj-at L 1))
+      (luaL_checktype L 2 LUA_TTABLE)
+      (let (t:(ptr Table) (hvalue (obj-at L 2)))
+        (lua_pushinteger L (as lua_Integer (/ (byte-diff (table-mainposition t o) (t 'node))
+                                              (sizeof c/Node)))))))
+  (return 1))
+
+(defn- stacklevel (L:(ptr lua_State)):i32
+  (let (a:(ptr i32) (alloca i32))
+    (lua_pushinteger L (as lua_Integer (stack-diff ((L 'top) 'p) ((L 'stack) 'p))))
+    (lua_pushinteger L (as lua_Integer (stacksize L)))
+    (lua_pushinteger L (as lua_Integer (L 'nCcalls)))
+    (lua_pushinteger L (as lua_Integer (L 'nci)))
+    (lua_pushinteger L (unsafe/cast lua_Integer (unsafe/cast usize (as ptr a))))
+    (return 5)))
+
+(defn- free-cis (L:(ptr lua_State)):i32
+  (let (ci:(ptr CallInfo) (L 'ci))
+    (while (!= (as ptr (ci 'next)) null)
+      (let (tofree:(ptr CallInfo) (ci 'next))
+        (set! (ci 'next) (tofree 'next))
+        (mem-free L tofree CallInfo)
+        (set! (L 'nci) (- (L 'nci) 1))))
+    (return 0)))
+
+(defn- reallocstack (L:(ptr lua_State)):i32
+  (let (n:i32 (cast_int (luaL_checkinteger L 1)))
+    (do-reallocstack L (+ (cast_int (stack-diff ((L 'top) 'p) ((L 'stack) 'p))) n) 1)
+    (return 0)))
+
+(defn- table-query (L:(ptr lua_State)):i32
+  (let (i:i32 (cast_int (luaL_optinteger L 2 -1)))
+    (luaL_checktype L 1 LUA_TTABLE)
+    (let (t:(ptr Table) (hvalue (obj-at L 1))
+          asize:ui32 (t 'asize))
+      (cond
+        (= i -1)
+          (do (lua_pushinteger L (as lua_Integer asize))
+              (lua_pushinteger L (as lua_Integer (allocsizenode t)))
+              (lua_pushinteger L (as lua_Integer (if (> asize 0) (deref (lenhint t)) 0)))
+              (return 3))
+        (< (cast_uint i) asize)
+          (do (lua_pushinteger L (as lua_Integer i))
+              (if (not (tagisempty (deref (getArrTag t i))))
+                (arr2obj t (cast_uint i) (s2v ((L 'top) 'p)))
+                (setnilvalue2s ((L 'top) 'p)))
+              (api_incr_top L)
+              (lua_pushnil L))
+        (< (cast_uint (- i (as i32 asize))) (as ui32 (sizenode t)))
+          (let (j:i32 (- i (as i32 asize))
+                k:(ptr TValue) (alloca TValue)
+                n:(ptr c/Node) (gnode t j))
+            (getnodekey L k n)
+            (if (or (not (isempty (gval n))) (ttisnil k) (ttisnumber k))
+              (pushobject L k)
+              (lua_pushstring L "<undef>"))
+            (if (not (isempty (gval n)))
+              (pushobject L (gval n))
+              (lua_pushnil L))
+            (lua_pushinteger L (as lua_Integer (gnext n)))))
+      (return 3))))
+
+(defn- gc-query (L:(ptr lua_State)):i32
+  (let (g:(ptr global_State) (G L))
+    (lua_pushstring L (cond (= (g 'gckind) KGC_INC) (cstr "inc")
+                            (= (g 'gckind) KGC_GENMAJOR) (cstr "genmajor")
+                            true (cstr "genminor")))
+    (lua_pushstring L (aref statenames (g 'gcstate)))
+    (lua_pushinteger L (cast_st2S (gettotalbytes g)))
+    (lua_pushinteger L (cast_st2S (g 'GCdebt)))
+    (lua_pushinteger L (cast_st2S (g 'GCmarked)))
+    (lua_pushinteger L (cast_st2S (g 'GCmajorminor)))
+    (return 6)))
+
+(defn- test-codeparam (L:(ptr lua_State)):i32
+  (let (p:lua_Integer (luaL_checkinteger L 1))
+    (lua_pushinteger L (as lua_Integer (obj-codeparam (cast_uint p))))
+    (return 1)))
+
+(defn- test-applyparam (L:(ptr lua_State)):i32
+  (let (p:lua_Integer (luaL_checkinteger L 1)
+        x:lua_Integer (luaL_checkinteger L 2))
+    (lua_pushinteger L (as lua_Integer (obj-applyparam (cast_uchar p) x)))
+    (return 1)))
+
+(defn- string-query (L:(ptr lua_State)):i32
+  (let (tb:(ptr stringtable) (ref ((G L) 'strt))
+        s:i32 (- (cast_int (luaL_optinteger L 1 0)) 1))
+    (cond
+      (= s -1)
+        (do (lua_pushinteger L (as lua_Integer (tb 'size)))
+            (lua_pushinteger L (as lua_Integer (tb 'nuse)))
+            (return 2))
+      (< s (tb 'size))
+        (let (n:i32 0
+              ts:(ptr TString) (deref (p+ (tb 'hash) s)))
+          (while (!= (as ptr ts) null)
+            (setsvalue2s L ((L 'top) 'p) ts)
+            (api_incr_top L)
+            (set! n (+ n 1))
+            (set! ts ((ts 'u) 'hnext)))
+          (return n))
+      true (return 0))))
+
+; A table as second argument, or else the registry.
+(defn- getreftable (L:(ptr lua_State)):i32
+  (return (if (lua_istable L 2) 2 LUA_REGISTRYINDEX)))
+
+(defn- tref (L:(ptr lua_State)):i32
+  (let (t:i32 (getreftable L)
+        level:i32 (lua_gettop L))
+    (luaL_checkany L 1)
+    (lua_pushvalue L 1)
+    (lua_pushinteger L (as lua_Integer (luaL_ref L t)))
+    (lua_assert (= (lua_gettop L) (+ level 1)))  ; +1 for the result
+    (return 1)))
+
+(defn- getref (L:(ptr lua_State)):i32
+  (let (t:i32 (getreftable L)
+        level:i32 (lua_gettop L))
+    (lua_rawgeti L t (luaL_checkinteger L 1))
+    (lua_assert (= (lua_gettop L) (+ level 1)))
+    (return 1)))
+
+(defn- unref (L:(ptr lua_State)):i32
+  (let (t:i32 (getreftable L)
+        level:i32 (lua_gettop L))
+    (luaL_unref L t (cast_int (luaL_checkinteger L 1)))
+    (lua_assert (= (lua_gettop L) level))
+    (return 0)))
+
+(defn- upvalue (L:(ptr lua_State)):i32
+  (let (n:i32 (cast_int (luaL_checkinteger L 2)))
+    (luaL_checktype L 1 LUA_TFUNCTION)
+    (if (lua_isnone L 3)
+      (let (name:CStr (lua_getupvalue L 1 n))
+        (when (= (as ptr name) null) (return 0))
+        (lua_pushstring L name)
+        (return 2))
+      (let (name:CStr (lua_setupvalue L 1 n))
+        (lua_pushstring L name)
+        (return 1)))))
+
+(defn- newuserdata (L:(ptr lua_State)):i32
+  (let (size:usize (cast_sizet (luaL_optinteger L 1 0))
+        nuv:i32 (cast_int (luaL_optinteger L 2 0))
+        p:ptr (lua_newuserdatauv L size nuv))
+    (memset p 0 size)
+    (return 1)))
+
+(defn- pushuserdata (L:(ptr lua_State)):i32
+  (let (u:lua_Integer (luaL_checkinteger L 1))
+    (lua_pushlightuserdata L (unsafe/cast ptr (cast_sizet u)))
+    (return 1)))
+
+(defn- udataval (L:(ptr lua_State)):i32
+  (lua_pushinteger L (cast_st2S (unsafe/cast usize (lua_touserdata L 1))))
+  (return 1))
+
+(defn- doonnewstack (L:(ptr lua_State)):i32
+  (let (L1:(ptr lua_State) (lua_newthread L)
+        l:(ptr usize) (alloca usize)
+        s:CStr (luaL_checklstring L 1 l)
+        status:i32 (luaL_loadbufferx L1 s (deref l) s "t"))
+    (when (= status LUA_OK)
+      (set! status (lua_pcall L1 0 0 0)))
+    (lua_pushinteger L (as lua_Integer status))
+    (return 1)))
+
+(defn- s2d (L:(ptr lua_State)):i32
+  (lua_pushnumber L (deref (unsafe/cast (ptr f64) (luaL_checkstring L 1))))
+  (return 1))
+
+(defn- d2s (L:(ptr lua_State)):i32
+  (let (d:(ptr f64) (alloca f64))
+    (set! (deref d) (luaL_checknumber L 1))
+    (lua_pushlstring L (unsafe/cast CStr d) (sizeof f64))
+    (return 1)))
+
+(defn- num2int (L:(ptr lua_State)):i32
+  (lua_pushinteger L (lua_tointeger L 1))
+  (return 1))
+
+(defn- makeseed (L:(ptr lua_State)):i32
+  (lua_pushinteger L (as lua_Integer (luaL_makeseed L)))
+  (return 1))
+
+(defn- newstate (L:(ptr lua_State)):i32
+  (let (ud:(ptr ptr) (alloca ptr)
+        f:lua_Alloc (lua_getallocf L ud)
+        L1:(ptr lua_State) (lua_newstate f (deref ud) 0))
+    (if (!= (as ptr L1) null)
+      (do (lua_atpanic L1 tpanic)
+          (lua_pushlightuserdata L (as ptr L1)))
+      (lua_pushnil L))
+    (return 1)))
+
+(defn- getstate (L:(ptr lua_State)):(ptr lua_State)
+  (let (L1:(ptr lua_State) (unsafe/cast (ptr lua_State) (lua_touserdata L 1)))
+    (luaL_argcheck L (!= (as ptr L1) null) 1 "state expected")
+    (return L1)))
+
+(defn- loadlib (L:(ptr lua_State)):i32
+  (let (L1:(ptr lua_State) (getstate L)
+        load:i32 (cast_int (luaL_checkinteger L 2))
+        preload:i32 (cast_int (luaL_checkinteger L 3)))
+    (luaL_openselectedlibs L1 load preload)
+    (luaL_requiref L1 "T" luaB_opentests 0)
+    (lua_assert (= (lua_type L1 -1) LUA_TTABLE))
+    ; requiref must not reload a module already loaded (null would crash)...
+    (luaL_requiref L1 "T" null 1)
+    ; ...but return the same one
+    (lua_assert (!= (lua_compare L1 -1 -2 LUA_OPEQ) 0))
+    (return 0)))
+
+(defn- closestate (L:(ptr lua_State)):i32
+  (lua_close (getstate L))
+  (return 0))
+
+(defn- doremote (L:(ptr lua_State)):i32
+  (let (L1:(ptr lua_State) (getstate L)
+        lcode:(ptr usize) (alloca usize)
+        code:CStr (luaL_checklstring L 2 lcode)
+        status:i32 0)
+    (lua_settop L1 0)
+    (set! status (luaL_loadbufferx L1 code (deref lcode) code "t"))
+    (when (= status LUA_OK)
+      (set! status (lua_pcall L1 0 LUA_MULTRET 0)))
+    (if (!= status LUA_OK)
+      (do (lua_pushnil L)
+          (lua_pushstring L (lua_tostring L1 -1))
+          (lua_pushinteger L (as lua_Integer status))
+          (return 3))
+      (let (i:i32 0)
+        (while true
+          (set! i (+ i 1))
+          (when (lua_isnone L1 i) (break))
+          (lua_pushstring L (lua_tostring L1 i)))
+        (lua_pop L1 (- i 1))
+        (return (- i 1))))))
+
+(defn- log2-aux (L:(ptr lua_State)):i32
+  (let (x:ui32 (unsafe/cast ui32 (luaL_checkinteger L 1)))
+    (lua_pushinteger L (as lua_Integer (obj-ceillog2 x)))
+    (return 1)))
+
+; checkpanic's jump back from a panic: the state's registry holds the Aux.
+(defstruct Aux jb:jmp_buf paniccode:CStr L:(ptr lua_State))
+
+(defn- panicback (L:(ptr lua_State)):i32
+  (lua_checkstack L 1)  ; room for the Aux
+  (lua_getfield L LUA_REGISTRYINDEX "_jmpbuf")
+  (let (b:(ptr Aux) (unsafe/cast (ptr Aux) (lua_touserdata L -1)))
+    (lua_pop L 1)
+    (run-c (b 'L) L (b 'paniccode))  ; the optional panic code
+    (_longjmp (b 'jb) 1)
+    (return 1)))
+
+; Runs 'code' unprotected in a new state whose panic function jumps back here.
+; Nothing in this frame changes after the _setjmp.
+(defn- checkpanic (L:(ptr lua_State)):i32
+  (let (b:(ptr Aux) (alloca Aux)
+        ud:(ptr ptr) (alloca ptr)
+        code:CStr (luaL_checkstring L 1)
+        f:lua_Alloc (lua_getallocf L ud))
+    (set! (b 'paniccode) (luaL_optstring L 2 ""))
+    (set! (b 'L) L)
+    (let (L1:(ptr lua_State) (lua_newstate f (deref ud) 0))
+      (when (= (as ptr L1) null)
+        (lua_pushstring L MEMERRMSG)
+        (return 1))
+      (lua_atpanic L1 panicback)
+      (lua_pushlightuserdata L1 (as ptr b))
+      (lua_setfield L1 LUA_REGISTRYINDEX "_jmpbuf")
+      (if (= (_setjmp (b 'jb)) 0)
+        (do (run-c L L1 code)  ; unprotected
+            (lua_pushstring L "no errors"))
+        (lua_pushstring L (lua_tostring L1 -1)))  ; the error message, moved over
+      (lua_close L1)
+      (return 1))))
+
+(defn- extern-kstr (L:(ptr lua_State)):i32
+  (let (len:(ptr usize) (alloca usize)
+        s:CStr (luaL_checklstring L 1 len))
+    (lua_pushexternalstring L s (deref len) (unsafe/cast lua_Alloc null) null)
+    (return 1)))
+
+; An external string in a buffer from Lua's own allocator, freed through it.
+(defn- externstr (L:(ptr lua_State)):i32
+  (let (len:(ptr usize) (alloca usize)
+        s:CStr (luaL_checklstring L 1 len)
+        ud:(ptr ptr) (alloca ptr)
+        allocf:lua_Alloc (lua_getallocf L ud)
+        buff:ptr (allocf (deref ud) null 0 (+ (deref len) 1)))
+    (when (= buff null)
+      (lua_pushstring L "not enough memory")
+      (lua_error L))
+    (memcpy buff (as ptr s) (+ (deref len) 1))  ; the ending 0 too
+    (lua_pushexternalstring L (unsafe/cast CStr buff) (deref len) allocf (deref ud))
+    (return 1)))
+
+; ---- testC: the C API driven from Lua, by a little assembly language ----
+
+(defconst DELIMITS " \t\n,;")
+
+(defn- skip (pc:(ptr (ptr i8))):void
+  (while true
+    (let (c:i8 (deref (deref pc)))
+      (cond (and (!= c 0) (!= (as ptr (strchr DELIMITS (as i32 c))) null))
+              (set! (deref pc) (p+ (deref pc) 1))
+            (= c (ch \#))  ; a comment, to the end of the line
+              (while (and (!= (deref (deref pc)) (ch \newline)) (!= (deref (deref pc)) 0))
+                (set! (deref pc) (p+ (deref pc) 1)))
+            true (return)))))
+
+(defn- getnum-aux (L:(ptr lua_State) L1:(ptr lua_State) pc:(ptr (ptr i8))):i32
+  (let (res:i32 0
+        sig:i32 1)
+    (skip pc)
+    (case (as i32 (deref (deref pc)))
+      (ch \.) (do (set! res (cast_int (lua_tointeger L1 -1)))
+                  (lua_pop L1 1)
+                  (set! (deref pc) (p+ (deref pc) 1))
+                  (return res))
+      (ch \*) (do (set! (deref pc) (p+ (deref pc) 1))
+                  (return (lua_gettop L1)))
+      (ch \!) (do (set! (deref pc) (p+ (deref pc) 1))
+                  (case (as i32 (deref (deref pc)))
+                    (ch \G) (set! res LUA_RIDX_GLOBALS)
+                    (ch \M) (set! res LUA_RIDX_MAINTHREAD)
+                    (lua_assert false))
+                  (set! (deref pc) (p+ (deref pc) 1))
+                  (return res))
+      (ch \-) (do (set! sig -1)
+                  (set! (deref pc) (p+ (deref pc) 1)))
+      0)
+    (when (not (lisdigit (cast_uchar (deref (deref pc)))))
+      (luaL_error L "number expected (%s)" (cstr (deref pc))))
+    (while (lisdigit (cast_uchar (deref (deref pc))))
+      (set! res (+ (* res 10) (- (as i32 (deref (deref pc))) (ch \0))))
+      (set! (deref pc) (p+ (deref pc) 1)))
+    (return (* sig res))))
+
+(defn- getstring-aux (L:(ptr lua_State) buff:(ptr i8) pc:(ptr (ptr i8))):CStr
+  (let (i:i32 0)
+    (skip pc)
+    (if (or (= (deref (deref pc)) (ch \")) (= (deref (deref pc)) (ch \')))  ; quoted
+      (let (quote:i8 (deref (deref pc)))
+        (set! (deref pc) (p+ (deref pc) 1))
+        (while (!= (deref (deref pc)) quote)
+          (when (= (deref (deref pc)) 0)
+            (luaL_error L "unfinished string in C script"))
+          (set! (deref (p+ buff i)) (deref (deref pc)))
+          (set! i (+ i 1))
+          (set! (deref pc) (p+ (deref pc) 1)))
+        (set! (deref pc) (p+ (deref pc) 1)))
+      (while (and (!= (deref (deref pc)) 0)
+                  (= (as ptr (strchr DELIMITS (as i32 (deref (deref pc))))) null))
+        (set! (deref (p+ buff i)) (deref (deref pc)))
+        (set! i (+ i 1))
+        (set! (deref pc) (p+ (deref pc) 1))))
+    (set! (deref (p+ buff i)) 0)
+    (return (cstr buff))))
+
+(defn- getindex-aux (L:(ptr lua_State) L1:(ptr lua_State) pc:(ptr (ptr i8))):i32
+  (skip pc)
+  (let (c:i8 (deref (deref pc)))
+    (set! (deref pc) (p+ (deref pc) 1))
+    (case (as i32 c)
+      (ch \R) (return LUA_REGISTRYINDEX)
+      (ch \U) (return (lua_upvalueindex (getnum-aux L L1 pc)))
+      (do (set! (deref pc) (p+ (deref pc) -1))  ; read it again
+          (let (n:i32 (getnum-aux L L1 pc))
+            (return (if (= n 0) 0 (lua_absindex L1 n))))))))
+
+(defconst MEMERRMSG "not enough memory")
+(defvar- statcodes:(array CStr 6)
+  (array CStr "OK" "YIELD" "ERRRUN" "ERRSYNTAX" MEMERRMSG "ERRERR"))
+
+; The status codes, anchored so that pushing one can't fail for memory.
+(defn- regcodes (L:(ptr lua_State)):void
+  (for (i:i32 0) (< i 6) (set! i (+ i 1))
+    (lua_pushboolean L 1)
+    (lua_setfield L LUA_REGISTRYINDEX (aref statcodes i))))
+
+; 'arith''s operators, in LUA_OP order: \ is IDIV, < SHL, > SHR, _ UNM, ! BNOT.
+(defconst ARITH-OPS "+-*%^/\\&|~<>_!")
+
+(defn- run-c (L:(ptr lua_State) L1:(ptr lua_State) pc0:CStr):i32
+  (let (buff:(ptr i8) (alloca i8 300)
+        pcv:(ptr (ptr i8)) (alloca (ptr i8))
+        status:i32 0)
+    (when (= (as ptr pc0) null)
+      (return (luaL_error L "attempt to runC null script")))
+    (set! (deref pcv) (bytes pc0))
+    (macrolet ((getnum () `(getnum-aux L L1 pcv))
+               (getstring () `(getstring-aux L buff pcv))
+               (getindex () `(getindex-aux L L1 pcv))
+               (is (s) `(= (strcmp inst ~s) 0)))
+      (while true
+        (let (inst:CStr (getstring))
+          (cond
+            (is "") (return 0)
+            (is "absindex") (lua_pushinteger L1 (as lua_Integer (getindex)))
+            (is "append") (let (t:i32 (getindex)
+                                i:i32 (cast_int (lua_rawlen L1 t)))
+                            (lua_rawseti L1 t (as lua_Integer (+ i 1))))
+            (is "arith") (do (skip pcv)
+                             (let (op:i32 (cast_int (byte-diff (strchr ARITH-OPS (as i32 (deref (deref pcv))))
+                                                               ARITH-OPS)))
+                               (set! (deref pcv) (p+ (deref pcv) 1))
+                               (lua_arith L1 op)))
+            (is "call") (let (narg:i32 (getnum) nres:i32 (getnum))
+                          (lua_call L1 narg nres))
+            (is "callk") (let (narg:i32 (getnum) nres:i32 (getnum) i:i32 (getindex))
+                           (lua_callk L1 narg nres (as lua_KContext i) cfunck))
+            (is "checkstack") (let (sz:i32 (getnum) msg:CStr (getstring))
+                                (luaL_checkstack L1 sz (if (= (deref (bytes msg)) 0)
+                                                         (as CStr null)  ; luaL_checkstack with no message
+                                                         msg)))
+            (is "rawcheckstack") (let (sz:i32 (getnum))
+                                   (lua_pushboolean L1 (lua_checkstack L1 sz)))
+            (is "compare") (let (opt:CStr (getstring)  ; EQ, LT or LE
+                                 op:i32 (cond (= (deref (bytes opt)) (ch \E)) LUA_OPEQ
+                                              (= (deref (p+ (bytes opt) 1)) (ch \T)) LUA_OPLT
+                                              true LUA_OPLE)
+                                 a:i32 (getindex)
+                                 b:i32 (getindex))
+                             (lua_pushboolean L1 (lua_compare L1 a b op)))
+            (is "concat") (lua_concat L1 (getnum))
+            (is "copy") (let (f:i32 (getindex))
+                          (lua_copy L1 f (getindex)))
+            (is "func2num") (let (func:lua_CFunction (lua_tocfunction L1 (getindex)))
+                              (lua_pushinteger L1 (unsafe/cast lua_Integer (unsafe/cast usize (unsafe/cast ptr func)))))
+            (is "getfield") (let (t:i32 (getindex)
+                                  tp:i32 (lua_getfield L1 t (getstring)))
+                              (lua_assert (= tp (lua_type L1 -1))))
+            (is "getglobal") (lua_getglobal L1 (getstring))
+            (is "getmetatable") (when (= (lua_getmetatable L1 (getindex)) 0)
+                                  (lua_pushnil L1))
+            (is "gettable") (let (tp:i32 (lua_gettable L1 (getindex)))
+                              (lua_assert (= tp (lua_type L1 -1))))
+            (is "gettop") (lua_pushinteger L1 (as lua_Integer (lua_gettop L1)))
+            (is "gsub") (let (a:i32 (getnum) b:i32 (getnum) c:i32 (getnum))
+                          (luaL_gsub L1 (lua_tostring L1 a) (lua_tostring L1 b) (lua_tostring L1 c)))
+            (is "insert") (lua_insert L1 (getnum))
+            (is "iscfunction") (lua_pushboolean L1 (lua_iscfunction L1 (getindex)))
+            (is "isfunction") (lua_pushboolean L1 (if (lua_isfunction L1 (getindex)) 1 0))
+            (is "isnil") (lua_pushboolean L1 (if (lua_isnil L1 (getindex)) 1 0))
+            (is "isnull") (lua_pushboolean L1 (if (lua_isnone L1 (getindex)) 1 0))
+            (is "isnumber") (lua_pushboolean L1 (lua_isnumber L1 (getindex)))
+            (is "isstring") (lua_pushboolean L1 (lua_isstring L1 (getindex)))
+            (is "istable") (lua_pushboolean L1 (if (lua_istable L1 (getindex)) 1 0))
+            (is "isudataval") (lua_pushboolean L1 (if (lua_islightuserdata L1 (getindex)) 1 0))
+            (is "isuserdata") (lua_pushboolean L1 (lua_isuserdata L1 (getindex)))
+            (is "len") (lua_len L1 (getindex))
+            (is "Llen") (lua_pushinteger L1 (luaL_len L1 (getindex)))
+            (is "loadfile") (luaL_loadfilex L1 (luaL_checkstring L1 (getnum)) "t")
+            (is "loadstring") (let (slen:(ptr usize) (alloca usize)
+                                    s:CStr (luaL_checklstring L1 (getnum) slen)
+                                    name:CStr (getstring)  ; 'buff', which the mode then fills,
+                                    mode:CStr (getstring))  ; as in ltests.c
+                                (luaL_loadbufferx L1 s (deref slen) name mode))
+            (is "newmetatable") (lua_pushboolean L1 (luaL_newmetatable L1 (getstring)))
+            (is "newtable") (lua_newtable L1)
+            (is "newthread") (lua_newthread L1)
+            (is "resetthread") (lua_pushinteger L1 (as lua_Integer (lua_resetthread L1)))  ; deprecated
+            (is "newuserdata") (lua_newuserdata L1 (cast_sizet (getnum)))
+            (is "next") (lua_next L1 -2)
+            (is "objsize") (lua_pushinteger L1 (l_castU2S (lua_rawlen L1 (getindex))))
+            (is "pcall") (let (narg:i32 (getnum) nres:i32 (getnum))
+                           (set! status (lua_pcall L1 narg nres (getnum))))
+            (is "pcallk") (let (narg:i32 (getnum) nres:i32 (getnum) i:i32 (getindex))
+                            (set! status (lua_pcallk L1 narg nres 0 (as lua_KContext i) cfunck)))
+            (is "pop") (lua_pop L1 (getnum))
+            (is "printstack") (let (n:i32 (getnum))
+                                (if (!= n 0)
+                                  (do (lua_printvalue (obj-at L n))
+                                      (printf "\n"))
+                                  (lua_printstack L1)))
+            (is "print") (printf "%s\n" (getstring))
+            (is "warningC") (lua_warning L1 (getstring) 1)
+            (is "warning") (lua_warning L1 (getstring) 0)
+            (is "pushbool") (lua_pushboolean L1 (getnum))
+            (is "pushcclosure") (lua_pushcclosure L1 test-c (getnum))
+            (is "pushint") (lua_pushinteger L1 (as lua_Integer (getnum)))
+            (is "pushnil") (lua_pushnil L1)
+            (is "pushnum") (lua_pushnumber L1 (cast_num (getnum)))
+            (is "pushstatus") (lua_pushstring L1 (aref statcodes status))
+            (is "pushstring") (lua_pushstring L1 (getstring))
+            (is "pushupvalueindex") (lua_pushinteger L1 (as lua_Integer (lua_upvalueindex (getnum))))
+            (is "pushvalue") (lua_pushvalue L1 (getindex))
+            (is "pushfstringI") (lua_pushfstring L1 (lua_tostring L -2) (cast_int (lua_tointeger L -1)))
+            (is "pushfstringS") (lua_pushfstring L1 (lua_tostring L -2) (lua_tostring L -1))
+            (is "pushfstringP") (lua_pushfstring L1 (lua_tostring L -2) (lua_topointer L -1))
+            (is "rawget") (let (t:i32 (getindex)) (lua_rawget L1 t))
+            (is "rawgeti") (let (t:i32 (getindex)) (lua_rawgeti L1 t (as lua_Integer (getnum))))
+            (is "rawgetp") (let (t:i32 (getindex))
+                             (lua_rawgetp L1 t (unsafe/cast ptr (cast_sizet (getnum)))))
+            (is "rawset") (let (t:i32 (getindex)) (lua_rawset L1 t))
+            (is "rawseti") (let (t:i32 (getindex)) (lua_rawseti L1 t (as lua_Integer (getnum))))
+            (is "rawsetp") (let (t:i32 (getindex))
+                             (lua_rawsetp L1 t (unsafe/cast ptr (cast_sizet (getnum)))))
+            (is "remove") (lua_remove L1 (getnum))
+            (is "replace") (lua_replace L1 (getindex))
+            (is "resume") (let (i:i32 (getindex)
+                                nres:(ptr i32) (alloca i32))
+                            (set! status (lua_resume (lua_tothread L1 i) L (getnum) nres)))
+            (is "traceback") (let (msg:CStr (getstring) level:i32 (getnum))
+                               (luaL_traceback L1 L1 msg level))
+            (is "threadstatus") (lua_pushstring L1 (aref statcodes (lua_status L1)))
+            (is "alloccount") (set! (l_memcontrol 'countlimit) (as ui64 (cast_uint (getnum))))
+            (is "return") (let (n:i32 (getnum))
+                            (when (!= L1 L)
+                              (for (i:i32 0) (< i n) (set! i (+ i 1))
+                                (let (idx:i32 (- 0 (- n i)))
+                                  (if (= (lua_type L1 idx) LUA_TBOOLEAN)
+                                    (lua_pushboolean L (lua_toboolean L1 idx))
+                                    (lua_pushstring L (lua_tostring L1 idx))))))
+                            (return n))
+            (is "rotate") (let (i:i32 (getindex)) (lua_rotate L1 i (getnum)))
+            (is "setfield") (let (t:i32 (getindex) s:CStr (getstring))
+                              (lua_setfield L1 t s))
+            (is "seti") (let (t:i32 (getindex)) (lua_seti L1 t (as lua_Integer (getnum))))
+            (is "setglobal") (lua_setglobal L1 (getstring))
+            (is "sethook") (let (mask:i32 (getnum) count:i32 (getnum) s:CStr (getstring))
+                             (sethookaux L1 mask count s))
+            (is "setmetatable") (let (idx:i32 (getindex)) (lua_setmetatable L1 idx))
+            (is "settable") (lua_settable L1 (getindex))
+            (is "settop") (lua_settop L1 (getnum))
+            (is "testudata") (let (i:i32 (getindex))
+                               (lua_pushboolean L1 (if (!= (luaL_testudata L1 i (getstring)) null) 1 0)))
+            (is "error") (lua_error L1)
+            (is "abort") (abort)
+            (is "throw") (luaL_error L1 "C++")  ; C builds have no exceptions to throw
+            (is "tobool") (lua_pushboolean L1 (lua_toboolean L1 (getindex)))
+            (is "tocfunction") (lua_pushcfunction L1 (lua_tocfunction L1 (getindex)))
+            (is "tointeger") (lua_pushinteger L1 (lua_tointeger L1 (getindex)))
+            (is "tonumber") (lua_pushnumber L1 (lua_tonumber L1 (getindex)))
+            (is "topointer") (lua_pushlightuserdata L1 (lua_topointer L1 (getindex)))
+            (is "touserdata") (lua_pushlightuserdata L1 (lua_touserdata L1 (getindex)))
+            (is "tostring") (let (s:CStr (lua_tostring L1 (getindex))
+                                  s1:CStr (lua_pushstring L1 s))
+                              (lua_assert (if (= (as ptr s) null)
+                                            (= (as ptr s1) null)
+                                            (= (strcmp s s1) 0))))
+            (is "Ltolstring") (luaL_tolstring L1 (getindex) null)
+            (is "type") (lua_pushstring L1 (luaL_typename L1 (getnum)))
+            (is "xmove") (let (f:i32 (getindex)
+                               t:i32 (getindex)
+                               fs:(ptr lua_State) (if (= f 0) L1 (lua_tothread L1 f))
+                               ts:(ptr lua_State) (if (= t 0) L1 (lua_tothread L1 t))
+                               n:i32 (getnum))
+                           (lua_xmove fs ts (if (= n 0) (lua_gettop fs) n)))
+            (is "isyieldable") (lua_pushboolean L1 (lua_isyieldable (lua_tothread L1 (getindex))))
+            (is "yield") (return (lua_yield L1 (getnum)))
+            (is "yieldk") (let (nres:i32 (getnum) i:i32 (getindex))
+                            (return (lua_yieldk L1 nres (as lua_KContext i) cfunck)))
+            (is "toclose") (lua_toclose L1 (getnum))
+            (is "closeslot") (lua_closeslot L1 (getnum))
+            (is "argerror") (let (arg:i32 (getnum))
+                              (luaL_argerror L1 arg (getstring)))
+            true (luaL_error L "unknown instruction %s" (cstr buff))))))
+    (return 0)))
+
+(defn- test-c (L:(ptr lua_State)):i32
+  (cond
+    (!= (lua_isuserdata L 1) 0) (return (run-c L (getstate L) (luaL_checkstring L 2)))
+    (lua_isthread L 1) (return (run-c L (lua_tothread L 1) (luaL_checkstring L 2)))
+    true (return (run-c L L (luaL_checkstring L 1)))))
+
+(defn- cfunc (L:(ptr lua_State)):i32
+  (return (run-c L L (lua_tostring L (lua_upvalueindex 1)))))
+
+(defn- cfunck (L:(ptr lua_State) status:i32 ctx:lua_KContext):i32
+  (lua_pushstring L (aref statcodes status))
+  (lua_setglobal L "status")
+  (lua_pushinteger L (as lua_Integer ctx))
+  (lua_setglobal L "ctx")
+  (return (run-c L L (lua_tostring L (cast_int ctx)))))
+
+(defn- make-cfunc (L:(ptr lua_State)):i32
+  (luaL_checkstring L 1)
+  (lua_pushcclosure L cfunc (lua_gettop L))
+  (return 1))
+
+; ---- C hooks ----
+
+(defvar- hookevents:(array CStr 5) (array CStr "call" "ret" "line" "count" "tailcall"))
+
+; Runs the script that sethookaux stored in registry.C_HOOK[L].
+(defn- chook (L:(ptr lua_State) ar:(ptr lua_Debug)):void
+  (lua_getfield L LUA_REGISTRYINDEX "C_HOOK")
+  (lua_pushlightuserdata L (as ptr L))
+  (lua_gettable L -2)  ; C_HOOK[L]
+  (let (scpt:CStr (lua_tostring L -1))  ; still anchored in C_HOOK after the pop
+    (lua_pop L 2)
+    (lua_pushstring L (aref hookevents (ar 'event)))  ; the script may use them
+    (lua_pushinteger L (as lua_Integer (ar 'currentline)))
+    (run-c L L scpt)))
+
+(defn- sethookaux (L:(ptr lua_State) mask:i32 count:i32 scpt:CStr):void
+  (when (= (deref (bytes scpt)) 0)  ; no script: hooks off
+    (lua_sethook L (unsafe/cast lua_Hook null) 0 0)
+    (return))
+  (lua_getfield L LUA_REGISTRYINDEX "C_HOOK")
+  (when (not (lua_istable L -1))  ; no hook table yet
+    (lua_pop L 1)
+    (lua_newtable L)
+    (lua_pushvalue L -1)
+    (lua_setfield L LUA_REGISTRYINDEX "C_HOOK"))
+  (lua_pushlightuserdata L (as ptr L))
+  (lua_pushstring L scpt)
+  (lua_settable L -3)  ; C_HOOK[L] = script
+  (lua_sethook L chook mask count))
+
+(defn- sethook (L:(ptr lua_State)):i32
+  (if (lua_isnoneornil L 1)
+    (lua_sethook L (unsafe/cast lua_Hook null) 0 0)
+    (let (scpt:CStr (luaL_checkstring L 1)
+          smask:CStr (luaL_checkstring L 2)
+          count:i32 (cast_int (luaL_optinteger L 3 0))
+          mask:i32 0)
+      (when (!= (as ptr (strchr smask (ch \c))) null) (set! mask (bit-or mask LUA_MASKCALL)))
+      (when (!= (as ptr (strchr smask (ch \r))) null) (set! mask (bit-or mask LUA_MASKRET)))
+      (when (!= (as ptr (strchr smask (ch \l))) null) (set! mask (bit-or mask LUA_MASKLINE)))
+      (when (> count 0) (set! mask (bit-or mask LUA_MASKCOUNT)))
+      (sethookaux L mask count scpt)))
+  (return 0))
+
+(defn- coresume (L:(ptr lua_State)):i32
+  (let (co:(ptr lua_State) (lua_tothread L 1)
+        nres:(ptr i32) (alloca i32))
+    (luaL_argcheck L (!= (as ptr co) null) 1 "coroutine expected")
+    (let (status:i32 (lua_resume co L 0 nres))
+      (if (and (!= status LUA_OK) (!= status LUA_YIELD))
+        (do (lua_pushboolean L 0)
+            (lua_insert L -2)
+            (return 2))  ; false and the error message
+        (do (lua_pushboolean L 1)
+            (return 1))))))
+
+(defn- nonblock (L:(ptr lua_State)):i32
+  (let (f:(ptr FILE) ((unsafe/cast (ptr luaL_Stream) (luaL_checkudata L 1 LUA_FILEHANDLE)) 'f)
+        fd:i32 (fileno f)
+        flags:i32 (fcntl fd F_GETFL 0))
+    (fcntl fd F_SETFL (bit-or flags O_NONBLOCK))
+    (return 0)))
+
+(defn- checkfinalmem ():void
+  (lua_assert (= (l_memcontrol 'numblocks) 0))
+  (lua_assert (= (l_memcontrol 'total) 0)))
+
+(defn luaB_opentests (L:(ptr lua_State)):i32
+  (let (ud:(ptr ptr) (alloca ptr)
+        f:lua_Alloc (lua_getallocf L ud))
+    (lua_atpanic L tpanic)
+    (lua_setwarnf L warnf (as ptr L))
+    (lua_pushboolean L 0)
+    (lua_setglobal L "_WARN")  ; _WARN = false
+    (regcodes L)
+    (atexit checkfinalmem)
+    (lua_assert (and (= (unsafe/cast ptr f) (unsafe/cast ptr debug_realloc))
+                     (= (deref ud) (as ptr (ref l_memcontrol)))))
+    (lua_setallocf L f (deref ud))  ; exercises it
+    (lua-newlib L
+      ("checkmemory" lua_checkmemory) ("closestate" closestate) ("d2s" d2s)
+      ("doonnewstack" doonnewstack) ("doremote" doremote) ("gccolor" gc-color)
+      ("gcage" gc-age) ("gcstate" gc-state) ("tracegc" tracegc) ("pobj" gc-printobj)
+      ("getref" getref) ("hash" hash-query) ("log2" log2-aux) ("limits" get-limits)
+      ("listcode" listcode) ("printcode" printcode) ("printallstack" lua_printallstack)
+      ("listk" listk) ("listabslineinfo" listabslineinfo) ("listlocals" listlocals)
+      ("loadlib" loadlib) ("checkpanic" checkpanic) ("newstate" newstate)
+      ("newuserdata" newuserdata) ("num2int" num2int) ("makeseed" makeseed)
+      ("pushuserdata" pushuserdata) ("gcquery" gc-query) ("querystr" string-query)
+      ("querytab" table-query) ("codeparam" test-codeparam) ("applyparam" test-applyparam)
+      ("ref" tref) ("resume" coresume) ("s2d" s2d) ("sethook" sethook)
+      ("stacklevel" stacklevel) ("resetCI" free-cis) ("reallocstack" reallocstack)
+      ("sizes" get-sizes) ("testC" test-c) ("makeCfunc" make-cfunc) ("totalmem" mem-query)
+      ("alloccount" alloc-count) ("allocfailnext" alloc-failnext) ("trick" settrick)
+      ("udataval" udataval) ("unref" unref) ("upvalue" upvalue) ("externKstr" extern-kstr)
+      ("externstr" externstr) ("nonblock" nonblock))
+    (return 1)))

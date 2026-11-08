@@ -1,0 +1,5 @@
+;; The port's build configuration, as a stock build's. tests/T/build.edn picks
+;; config/tests instead: Nucleus can't choose code by build (docs/build.md).
+{:kind :library
+ :name "luaconfig"
+ :version "5.5.1"}

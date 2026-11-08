@@ -1,0 +1,19 @@
+; ltests.h's configuration (see config/release). The T library is lua.tests, in
+; tests/T; the names below are ltests.h's C declarations, so this file stays a leaf.
+(ns luaconfig)
+(import-use "lua.h")
+(import-use "lauxlib.h")
+(import-use "lualib.h")
+
+(defconst LUA-ASSERTS true)
+(defconst LUAI_MAXSTACK 68000)
+(defconst MINSTRTABSIZE 2)
+(defconst LUA-COMPAT-MATHLIB true)
+
+(defmacro luai_tracegc (L first) `(luai_tracegctest ~L ~first))
+(defmacro lua-new-state ()
+  `(lua_newstate debug_realloc (as ptr (ref l_memcontrol)) (luaL_makeseed null)))
+(defmacro luai_openlibs (L)
+  `(do (luaL_openlibs ~L)
+       (luaL_requiref ~L "T" luaB_opentests 1)
+       (lua_pop ~L 1)))

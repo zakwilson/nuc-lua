@@ -37,6 +37,7 @@
 (import lua.undump)
 (import lua.init)
 (import-use lua.util)
+(import-use luaconfig)
 (import-use "stdio.h")
 (import-use "stdlib.h")
 (import-use "string.h")
@@ -433,7 +434,7 @@
           (lua_pushboolean L 1)  ; tells the libraries to ignore the environment too
           (lua_setfield L LUA_REGISTRYINDEX "LUA_NOENV"))
       (set! l-getenv getenv))
-    (luaL_openlibs L)
+    (luai_openlibs L)
     (createargtable L argv argc script)
     (lua_gc L LUA_GCRESTART)
     (lua_gc L LUA_GCGEN)  ; the standalone interpreter collects generationally
@@ -451,7 +452,7 @@
     (return 1)))
 
 (defn main (argc:i32 argv:(ptr CStr)):i32
-  (if-some (L (as ?&lua_State (luaL_newstate)))
+  (if-some (L (as ?&lua_State (lua-new-state)))
    (do
     (lua_gc L LUA_GCSTOP)  ; no collection while the state is being built
     (lua_pushcfunction L pmain)

@@ -1,0 +1,3 @@
+; The T build's entry: lua.c's interpreter (src/main.nuc) with the T library.
+(import-use "../../src/main.nuc")
+(import-use lua.tests)

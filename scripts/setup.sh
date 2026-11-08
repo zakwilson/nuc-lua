@@ -43,6 +43,15 @@ if [ ! -f build/suite/libs/lib1.so ]; then
   make -C build/suite/libs LUA_DIR="$ROOT/reference/build/src" >/dev/null
 fi
 
+# Stock built as tests/T builds the port (ltests.h, the T library), to compare
+# T-mode results against; -Wl,-E so the suite's C libraries can bind the API.
+if [ ! -x build/ref-T/lua-T ]; then
+  mkdir -p build/ref-T
+  cp reference/build/src/*.[ch] build/suite/ltests/ltests.[ch] build/ref-T/
+  (cd build/ref-T && gcc -O2 -DLUA_USE_LINUX '-DLUA_USER_H="ltests.h"' -I. -Wl,-E \
+    $(ls *.c | grep -v '^luac\.c$') -o lua-T -lm -ldl)
+fi
+
 # The C modules of the API matrix, built once; every host loads these same files.
 mkdir -p build/so/c
 for m in scratch/mayi.c tests/capi/capi.c; do

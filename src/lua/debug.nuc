@@ -30,7 +30,6 @@
 (import-use lua.code)  ; isvararg
 
 (defconst ABSLINEINFO -0x80)  ; a 'lineinfo' entry whose line is in 'abslineinfo'
-(defconst MAXIWTHABS 128)
 (defconst LUA_ENV "_ENV")  ; llex.h's string macro (ISSUE-012)
 
 (defmacro stack-diff-of (T q p) `(/ (byte-diff ~q ~p) (sizeof ~T)))

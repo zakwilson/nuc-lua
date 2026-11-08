@@ -1,0 +1,5 @@
+;; The configuration of Lua's ltests.h: assertions on, the T library and its
+;; checked allocator (tests/T).
+{:kind :library
+ :name "luaconfig"
+ :version "5.5.1"}

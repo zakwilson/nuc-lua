@@ -136,8 +136,9 @@
   ; "_ENV", "break" and "global" are fixed, so never collected
   (set! (ls 'envn) (string-newliteral L LUA_ENV))
   (set! (ls 'brkn) (string-newliteral L "break"))
-  (set! (ls 'glbn) (string-newliteral L "global"))  ; LUA_COMPAT_GLOBAL: not reserved
-  (set! ((ls 'glbn) 'extra) 0)
+  (when (!= LUA_COMPAT_GLOBAL 0)  ; "global" isn't a reserved word (luaconf.h)
+    (set! (ls 'glbn) (string-newliteral L "global"))
+    (set! ((ls 'glbn) 'extra) 0))
   (zio-resizebuffer (ls 'L) (ls 'buff) LUA_MINBUFFER))
 
 ; ---- the analyzer ----

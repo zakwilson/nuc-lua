@@ -1,0 +1,11 @@
+; ISSUE-053: two namespaces under (set-ir-prefix "") can't each have a private
+; helper of the same name, and the error says both are in one namespace.
+; expect: prints `1 2`; actual: `duplicate definition of 'helper' … both definitions are in namespace 'b'`
+; run: mkdir -p $W/p53 && cd $W/p53 && printf '(ns a)\n(set-ir-prefix "")\n(defn- helper ():i32 (return 1))\n(defn a-f ():i32 (return (helper)))\n' > a.nuc && printf '(ns b)\n(set-ir-prefix "")\n(defn- helper ():i32 (return 2))\n(defn b-f ():i32 (return (helper)))\n' > b.nuc && cp $P main.nuc && $NUCLEUSC main.nuc -o p 2>&1 | head -1 && ./p
+; fixed-when-output: 1 2
+(import-use "stdio.h")
+(import-use a)
+(import-use b)
+(defn main ():i32
+  (printf "%d %d\n" (a-f) (b-f))
+  (return 0))

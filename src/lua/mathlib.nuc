@@ -5,6 +5,7 @@
 (set-ir-prefix "")
 (import-use luacapi)
 (import-use lua.util)
+(import-use luaconfig)
 (import-ct nucleus.node)
 (import-use "math.h")
 (import-use "stdlib.h")
@@ -37,6 +38,13 @@
 (def-float-fns (math-sin sin) (math-cos cos) (math-tan tan) (math-asin asin)
                (math-acos acos) (math-sqrt sqrt) (math-exp exp) (math-deg deg)
                (math-rad rad))
+
+; LUA_COMPAT_MATHLIB's, registered only when luaconfig asks for them.
+(def-float-fns (math-cosh cosh) (math-sinh sinh) (math-tanh tanh) (math-log10 log10))
+
+(defn-lua math-pow (L (x number) (y number))
+  (lua_pushnumber L (pow x y))
+  (return 1))
 
 (defn-lua math-atan (L (y number) (x number 1.0))
   (lua_pushnumber L (atan2 y x))
@@ -254,4 +262,7 @@
   (lua_pushinteger L LUA_MININTEGER)
   (lua_setfield L -2 "mininteger")
   (set-rand-funcs L)
+  (when LUA-COMPAT-MATHLIB
+    (lua-setfuncs L 0 ("cosh" math-cosh) ("sinh" math-sinh) ("tanh" math-tanh)
+                      ("pow" math-pow) ("log10" math-log10)))
   (return 1))

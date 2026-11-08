@@ -1350,7 +1350,7 @@
 ; LUA_COMPAT_GLOBAL: the name 'global' starts a declaration when it is
 ; followed by an attribute, a name, '*' or 'function'.
 (defn- globalname (ls:(ptr LexState)):bool
-  (when (!= (seminfo ls 'ts) (ls 'glbn))
+  (when (or (= LUA_COMPAT_GLOBAL 0) (!= (seminfo ls 'ts) (ls 'glbn)))
     (return false))
   (let (lk:i32 (lex-lookahead ls))
     (return (or (= lk (ch \<)) (= lk TK_NAME) (= lk (ch \*)) (= lk TK_FUNCTION)))))

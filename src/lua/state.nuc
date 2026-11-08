@@ -29,10 +29,8 @@
 (import-use lua.do)
 (import-use lua.mem)
 
-(defconst LUAI_MAXCCALLS 200)
 (defconst BASIC_STACK_SIZE 40)  ; 2*LUA_MINSTACK
 (defconst EXTRA_STACK 5)
-(defconst LUA_EXTRASPACE 8)     ; sizeof(void *)
 (defconst GCSTPGC 2)            ; the collector stopped itself
 (defconst GCSpause 8)
 (defconst KGC_INC 0)

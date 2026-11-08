@@ -11,13 +11,13 @@
 (import-use "lmem.h")
 (import-use "string.h")
 (import-use lua.util)
+(import-use luaconfig)
 (import-use lua.core)
 (import-use lua.do)
 (import-use lua.gc)
 (import-use lua.mem)
 
 (defconst MAXSTRTB 2147483647)  ; mem-limit-n(INT_MAX, TString*) on 64 bits
-(defconst MINSTRTABSIZE 128)    ; a power of 2; the core alone makes about 50
 (defconst MEMERRMSG "not enough memory")
 
 (defn string-eqstr (a:(ptr TString) b:(ptr TString)):i32

@@ -6,4 +6,5 @@
  :source-root "../src"
  :cflags ["-I../include" "-I../reference/build/src" "-DLUA_USE_LINUX"]
  :libs ["m"]
- :deps {luacapi {:path "../capi"}}}
+ :deps {luacapi {:path "../capi"}
+        luaconfig {:path "../config/release"}}}

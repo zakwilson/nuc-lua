@@ -24,6 +24,7 @@
 (import-use "string.h")
 (import-use luacapi)  ; LUA_SIGNATURE
 (import-use lua.util)
+(import-use luaconfig)
 (import-use lua.core)
 (import-use lua.parser)
 (import-use lua.undump)
@@ -38,11 +39,9 @@
 (import-use lua.string)
 (import-use lua.state)
 
-(defconst LUAI_MAXCCALLS 200)
 (defconst BASIC_STACK_SIZE 40)  ; 2*LUA_MINSTACK
 (defconst STACKERRSPACE 200)    ; room to handle a stack error
-(defconst MAXSTACK 1000000)     ; LUAI_MAXSTACK, below MAXSTACK_BYSIZET
-(defconst ERRORSTACKSIZE 1000200)  ; MAXSTACK + STACKERRSPACE
+(defconst ERRORSTACKSIZE (+ LUAI_MAXSTACK 200))  ; LUAI_MAXSTACK + STACKERRSPACE
 (defconst NYCI 0x10001)         ; nyci: one more call, and not yieldable
 (defconst CIST_RECST 12)
 (defconst CIST_NRESULTS 0xff)
@@ -188,17 +187,17 @@
 ; Grows the stack by at least 'n'; a failure raises an error or returns 0.
 (defn do-growstack (L:(ptr lua_State) n:i32 raiseerror:i32):i32
   (let (size:i32 (stacksize L))
-    (when (> size MAXSTACK)
+    (when (> size LUAI_MAXSTACK)
       ;; already using the space kept for errors, handling a stack error:
       ;; it can't grow past that
       (when (!= raiseerror 0) (do-errerr L))
       (return 0))
-    (when (< n MAXSTACK)  ; no arithmetic overflow
+    (when (< n LUAI_MAXSTACK)  ; no arithmetic overflow
       (let (newsize:i32 (+ size (bit-shr size 1))  ; size * 1.5
             needed:i32 (+ (cast_int (stack-diff ((L 'top) 'p) ((L 'stack) 'p))) n))
-        (when (> newsize MAXSTACK) (set! newsize MAXSTACK))
+        (when (> newsize LUAI_MAXSTACK) (set! newsize LUAI_MAXSTACK))
         (when (< newsize needed) (set! newsize needed))  ; what was asked for
-        (when (<= newsize MAXSTACK)
+        (when (<= newsize LUAI_MAXSTACK)
           (return (do-reallocstack L newsize raiseerror)))))
     ;; a stack overflow: room to handle its message
     (do-reallocstack L ERRORSTACKSIZE raiseerror)
@@ -221,9 +220,9 @@
 ; overflow and no longer does comes back to a regular size this way too.
 (defn do-shrinkstack (L:(ptr lua_State)):void
   (let (inuse:i32 (stackinuse L)
-        max:i32 (if (> inuse (/ MAXSTACK 3)) MAXSTACK (* inuse 3)))
-    (when (and (<= inuse MAXSTACK) (> (stacksize L) max))
-      (do-reallocstack L (if (> inuse (/ MAXSTACK 2)) MAXSTACK (* inuse 2)) 0))  ; may fail
+        max:i32 (if (> inuse (/ LUAI_MAXSTACK 3)) LUAI_MAXSTACK (* inuse 3)))
+    (when (and (<= inuse LUAI_MAXSTACK) (> (stacksize L) max))
+      (do-reallocstack L (if (> inuse (/ LUAI_MAXSTACK 2)) LUAI_MAXSTACK (* inuse 2)) 0))  ; may fail
     (state-shrink-ci L)))
 
 ; ---- hooks ----

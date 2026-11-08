@@ -35,6 +35,13 @@ Latest (`b8e711e`): 1744 passed, bootstrap holds. After `a64ac73` it held only f
 the third round (a fix the compiler's own sources depend on changes the order a
 compiler built without it emits).
 
+## Configurations
+
+`lua` and `luac` depend on `config/release` as the library `luaconfig`; `tests/T`
+builds the same sources against `config/tests` with `ltests.h` and the `T` library.
+`scripts/check-T.sh` runs the suite on that build, `build/ref-T/lua-T` is stock built
+the same way.
+
 ## Gotchas
 
 - `pkill -f` / `pgrep -f` with a pattern that appears in your own command line

@@ -17,6 +17,7 @@
 (import-use "ltm.h")
 (import-use "string.h")
 (import-use lua.util)
+(import-use luaconfig)
 (import-use lua.core)
 (import-use lua.object)
 (import-use lua.do)
@@ -124,7 +125,7 @@
             LUA_VLNGSTR (let (ts:(ptr TString) (gco2ts o))
                           (string-sizelngstr ((ts 'u) 'lnglen) (as i32 (ts 'shrlen))))
             LUA_VUPVAL (cast_sizet (sizeof UpVal))
-            (as lu_mem 0)))
+            (do (lua_assert false) (as lu_mem 0))))
     (return (unsafe/cast l_mem res))))
 
 (defn- getgclist (o:(ptr GCObject)):(ptr (ptr GCObject))
@@ -134,10 +135,12 @@
     LUA_VCCL (return (ref ((gco2ccl o) 'gclist)))
     LUA_VTHREAD (return (ref ((gco2th o) 'gclist)))
     LUA_VPROTO (return (ref ((gco2p o) 'gclist)))
-    LUA_VUSERDATA (return (ref ((gco2u o) 'gclist)))
-    (return null)))
+    LUA_VUSERDATA (do (lua_assert (> ((gco2u o) 'nuvalue) 0))
+                      (return (ref ((gco2u o) 'gclist))))
+    (do (lua_assert false) (return null))))
 
 (defn- linkgclist- (o:(ptr GCObject) pnext:(ptr (ptr GCObject)) list:(ptr (ptr GCObject))):void
+  (lua_assert (not (isgray o)))  ; not in a gray list already
   (set! (deref pnext) (deref list))
   (set! (deref list) o)
   (set2gray o))  ; now it is
@@ -145,6 +148,7 @@
 ; An empty entry's key is marked dead: the key may be collected, but the entry
 ; stays, so a chain or a traversal isn't broken.
 (defn- clearkey (n:(ptr c/Node)):void
+  (lua_assert (isempty (gval n)))
   (when (keyiscollectable n)
     (setdeadkey n)))
 
@@ -162,16 +166,21 @@
 ; incremental sweep, 'o' is swept to white instead, so it needs no more barriers.
 (defn gc-barrier-fn (L:(ptr lua_State) o:(ptr GCObject) v:(ptr GCObject)):void
   (let (g:(ptr global_State) (G L))
+    (lua_assert (and (isblack o) (iswhite v) (not (isdead g v)) (not (isdead g o))))
     (if (keepinvariant g)
       (do (reallymarkobject g v)  ; restore the invariant
           (when (isold o)
+            (lua_assert (not (isold v)))  ; a white object can't be old
             (setage v G_OLD0)))
-      (when (!= (g 'gckind) KGC_GENMINOR)  ; incremental
-        (makewhite g o)))))
+      (do (lua_assert (issweepphase g))
+          (when (!= (g 'gckind) KGC_GENMINOR)  ; incremental
+            (makewhite g o))))))
 
 ; The backward barrier: black 'o' pointing to a white object turns gray again.
 (defn gc-barrierback-fn (L:(ptr lua_State) o:(ptr GCObject)):void
   (let (g:(ptr global_State) (G L))
+    (lua_assert (and (isblack o) (not (isdead g o))))
+    (lua_assert (or (!= (g 'gckind) KGC_GENMINOR) (and (isold o) (!= (getage o) G_TOUCHED1))))
     (if (= (getage o) G_TOUCHED2)  ; already in a gray list?
       (set2gray o)  ; gray, to become TOUCHED1
       (linkobjgclist o (g 'grayagain)))
@@ -179,7 +188,8 @@
       (setage o G_TOUCHED1))))
 
 (defn gc-fix (L:(ptr lua_State) o:(ptr GCObject)):void
-  (let (g:(ptr global_State) (G L))  ; 'o' is first in 'allgc'
+  (let (g:(ptr global_State) (G L))
+    (lua_assert (= (g 'allgc) o))  ; 'o' must be first in 'allgc'
     (set2gray o)  ; gray forever
     (setage o G_OLD)  ; and old forever
     (set! (g 'allgc) (o 'next))
@@ -223,7 +233,7 @@
           (linkobjgclist o (g 'gray))))
     (:or LUA_VLCL LUA_VCCL LUA_VTABLE LUA_VTHREAD LUA_VPROTO)
       (linkobjgclist o (g 'gray))  ; visited later
-    0))
+    (lua_assert false)))
 
 ; The basic types' metatables.
 (defn- markmt (g:(ptr global_State)):void
@@ -245,11 +255,14 @@
       (let (thread:(ptr lua_State) (deref p))
         (if (and (not (iswhite thread)) (!= (as ptr (thread 'openupval)) null))
           (set! p (ref (thread 'twups)))  ; marked, with upvalues: it stays
-          (do (set! (deref p) (thread 'twups))  ; out of the list
+          (do (lua_assert (or (not (isold thread)) (= (as ptr (thread 'openupval)) null)))
+              (set! (deref p) (thread 'twups))  ; out of the list
               (set! (thread 'twups) thread)  ; and marked as out
               (let (uv:(ptr UpVal) (thread 'openupval))
                 (while (!= (as ptr uv) null)
+                  (lua_assert (<= (getage uv) (getage thread)))
                   (when (not (iswhite uv))  ; visited already
+                    (lua_assert (and (upisopen uv) (isgray uv)))
                     (markvalue g ((uv 'v) 'p)))
                   (set! uv (((uv 'u) 'open) 'next))))))))))
 
@@ -275,6 +288,7 @@
 ; Whether 'o' goes back to 'grayagain' for 'correctgraylist': only TOUCHED1 does;
 ; a TOUCHED2 becomes OLD here. Nothing is touched in incremental mode.
 (defn- genlink (g:(ptr global_State) o:(ptr GCObject)):void
+  (lua_assert (isblack o))
   (cond (= (getage o) G_TOUCHED1) (linkobjgclist o (g 'grayagain))
         (= (getage o) G_TOUCHED2) (setage o G_OLD)
         true 0))
@@ -288,7 +302,8 @@
     (while (< (as ptr n) (as ptr limit))
       (if (isempty (gval n))
         (clearkey n)
-        (do (markkey g n)
+        (do (lua_assert (not (keyisnil n)))
+            (markkey g n)
             (when (and (not hasclears) (!= (iscleared g (gcvalueN (gval n))) 0))
               (set! hasclears true))))  ; a white value: to be cleared
       (set! n (p+ n 1)))
@@ -339,7 +354,8 @@
     (while (< (as ptr n) (as ptr limit))
       (if (isempty (gval n))
         (clearkey n)
-        (do (markkey g n)
+        (do (lua_assert (not (keyisnil n)))
+            (markkey g n)
             (markvalue g (gval n))))
       (set! n (p+ n 1)))
     (genlink g (obj2gco h))))
@@ -407,6 +423,7 @@
       (linkgclist th (g 'grayagain)))
     (when (= (as ptr o) null)
       (return 0))  ; the stack isn't built yet
+    (lua_assert (or (= (g 'gcstate) GCSatomic) (= (as ptr (th 'openupval)) null) (isintwups th)))
     (while (< (as ptr o) (as ptr ((th 'top) 'p)))  ; the live part
       (markvalue g (s2v o))
       (set! o (p+ o 1)))
@@ -438,7 +455,7 @@
       LUA_VCCL (return (traverse-cclosure g (gco2ccl o)))
       LUA_VPROTO (return (traverseproto g (gco2p o)))
       LUA_VTHREAD (return (traversethread g (gco2th o)))
-      (return 0))))
+      (do (lua_assert false) (return 0)))))
 
 (defn- propagateall (g:(ptr global_State)):void
   (while (!= (as ptr (g 'gray)) null)
@@ -504,7 +521,8 @@
   (mem-free L uv UpVal))
 
 (defn- freeobj (L:(ptr lua_State) o:(ptr GCObject)):void
-  (case (as i32 (o 'tt))
+  (let (newmem:l_mem (if LUA-ASSERTS (- (gettotalbytes (G L)) (objsize o)) 0))  ; objsize, checked
+   (case (as i32 (o 'tt))
     LUA_VPROTO (func-freeproto L (gco2p o))
     LUA_VUPVAL (freeupval L (gco2upv o))
     LUA_VLCL (let (cl:(ptr LClosure) (gco2lcl o))
@@ -522,7 +540,8 @@
                   (when (= (ts 'shrlen) LSTRMEM)  ; an external string to free
                     ((ts 'falloc) (ts 'ud) (as ptr (ts 'contents)) (+ ((ts 'u) 'lnglen) 1) 0))
                   (mem-freemem L (as ptr ts) (string-sizelngstr ((ts 'u) 'lnglen) (as i32 (ts 'shrlen)))))
-    0))
+    (lua_assert false))
+   (lua_assert (= (gettotalbytes (G L)) newmem))))
 
 ; Sweeps at most 'countin' objects of the list at 'p': frees the dead (marked
 ; with the other white) and turns the rest white and new. Where to go on, or
@@ -562,6 +581,7 @@
 ; The next object to finalize, moved from 'tobefnz' back to 'allgc'.
 (defn- udata2finalize (g:(ptr global_State)):(ptr GCObject)
   (let (o:(ptr GCObject) (g 'tobefnz))
+    (lua_assert (tofinalize o))
     (set! (g 'tobefnz) (o 'next))
     (set! (o 'next) (g 'allgc))
     (set! (g 'allgc) o)
@@ -578,6 +598,7 @@
 (defn- gctm (L:(ptr lua_State)):void
   (let (g:(ptr global_State) (G L)
         v:(ptr TValue) (alloca TValue))
+    (lua_assert (= (g 'gcemergency) 0))
     (setgcovalue v (udata2finalize g))
     (let (tm:(ptr TValue) (tm-gettmbyobj L v TM_GC))
       (when (not (notm tm))  ; a finalizer
@@ -619,7 +640,8 @@
       (let (curr:(ptr GCObject) (deref p))
         (if (not (or (iswhite curr) (!= all 0)))  ; not being collected
           (set! p (ref (curr 'next)))
-          (do (when (= curr (g 'finobjsur))
+          (do (lua_assert (tofinalize curr))
+              (when (= curr (g 'finobjsur))
                 (set! (g 'finobjsur) (curr 'next)))
               (set! (deref p) (curr 'next))  ; out of 'finobj'
               (set! (curr 'next) (deref lastnext))  ; onto the end of 'tobefnz'
@@ -676,7 +698,8 @@
     (while (!= (as ptr (deref p)) null)
       (let (curr:(ptr GCObject) (deref p))
         (if (iswhite curr)  ; dead
-          (do (set! (deref p) (curr 'next))
+          (do (lua_assert (isdead g curr))
+              (set! (deref p) (curr 'next))
               (freeobj L curr))
           (do (setage curr G_OLD)
               (cond (= (curr 'tt) LUA_VTHREAD)  ; threads are watched
@@ -701,13 +724,15 @@
     (while (!= (as ptr (deref p)) (as ptr limit))
       (let (curr:(ptr GCObject) (deref p))
         (if (iswhite curr)  ; dead
-          (do (set! (deref p) (curr 'next))
+          (do (lua_assert (and (not (isold curr)) (isdead g curr)))
+              (set! (deref p) (curr 'next))
               (freeobj L curr))
           (let (age:i32 (as i32 (getage curr)))
             (if (= age G_NEW)  ; back to white
               (set! (curr 'marked)
                     (cast_uchar (bit-or (bit-and (as i32 (curr 'marked)) NOTMASKGCBITS) G_SURVIVAL white)))
-              (do (setage curr (aref nextage age))  ; old: keeps its colour
+              (do (lua_assert (!= age G_OLD1))  ; advanced in markold
+                  (setage curr (aref nextage age))  ; old: keeps its colour
                   (when (= (getage curr) G_OLD1)
                     (set! addedold (+ addedold (objsize curr)))  ; bytes turning old
                     (when (= (as ptr (deref pfirstold1)) null)
@@ -727,11 +752,14 @@
             remain:bool false)
         (cond (iswhite curr) 0
               (= (getage curr) G_TOUCHED1)  ; touched in this cycle
-                (do (nw2black curr)  ; black, for the next barrier
+                (do (lua_assert (isgray curr))
+                    (nw2black curr)  ; black, for the next barrier
                     (setage curr G_TOUCHED2)
                     (set! remain true))
-              (= (curr 'tt) LUA_VTHREAD) (set! remain true)
-              true (do (when (= (getage curr) G_TOUCHED2)
+              (= (curr 'tt) LUA_VTHREAD) (do (lua_assert (isgray curr))
+                                             (set! remain true))
+              true (do (lua_assert (isold curr))  ; young objects are white here
+                       (when (= (getage curr) G_TOUCHED2)
                          (setage curr G_OLD))
                        (nw2black curr)))
         (if remain
@@ -760,6 +788,7 @@
       (when (= (getage p) G_OLD1)
         (setage p G_OLD)  ; old now
         (when (isblack p)
+          (lua_assert (not (iswhite p)))
           (reallymarkobject g p)))
       (set! p (p 'next)))))
 
@@ -798,6 +827,7 @@
   (let (addedold1:(ptr l_mem) (alloca l_mem)
         marked:l_mem (g 'GCmarked)  ; atomic loses it
         dummy:(ptr (ptr GCObject)) (alloca (ptr GCObject)))
+    (lua_assert (= (g 'gcstate) GCSpropagate))
     (set! (deref addedold1) 0)
     (when (!= (as ptr (g 'firstold1)) null)  ; regular OLD1 objects?
       (markold g (g 'firstold1) (g 'reallyold))
@@ -869,7 +899,8 @@
     (when (!= newmode (as i32 (g 'gckind)))
       (if (= newmode KGC_INC)
         (minor2inc L g KGC_INC)
-        (entergen L g)))))
+        (do (lua_assert (= newmode KGC_GENMINOR))
+            (entergen L g))))))
 
 (defn- fullgen (L:(ptr lua_State) g:(ptr global_State)):void
   (minor2inc L g KGC_INC)
@@ -896,6 +927,7 @@
 ; sweep skips the objects made between now and its start.
 (defn- entersweep (L:(ptr lua_State)):void
   (let (g:(ptr global_State) (G L))
+    (lua_assert (= (as ptr (g 'sweepgc)) null))
     (set! (g 'gcstate) GCSswpallgc)
     (set! (g 'sweepgc) (sweeptolive L (ref (g 'allgc))))))
 
@@ -913,14 +945,19 @@
     (set! (g 'gcstp) GCSTPCLS)  ; no finalizers past here
     (gc-changemode L KGC_INC)
     (separatetobefnz g 1)  ; every object with a finalizer
+    (lua_assert (= (as ptr (g 'finobj)) null))
     (callallpendingfinalizers L)
     (deletelist L (g 'allgc) (obj2gco (mainthread g)))
-    (deletelist L (g 'fixedgc) null)))
+    (lua_assert (= (as ptr (g 'finobj)) null))  ; no new finalizers
+    (deletelist L (g 'fixedgc) null)
+    (lua_assert (= ((g 'strt) 'nuse) 0))))
 
 (defn- atomic (L:(ptr lua_State)):void
   (let (g:(ptr global_State) (G L)
         grayagain:(ptr GCObject) (g 'grayagain))  ; the original list
     (set! (g 'grayagain) null)
+    (lua_assert (and (= (as ptr (g 'ephemeron)) null) (= (as ptr (g 'weak)) null)))
+    (lua_assert (not (iswhite (obj2gco (mainthread g)))))
     (set! (g 'gcstate) GCSatomic)
     (markobject g L)  ; the running thread
     (markvalue g (ref (g 'l_registry)))  ; the API may have changed these
@@ -931,6 +968,7 @@
     (set! (g 'gray) grayagain)
     (propagateall g)  ; 'grayagain'
     (convergeephemerons g)
+    (lua_assert (= (as ptr (g 'gray)) null))
     ; every strongly reachable object is marked: clear the weak values first
     (clearbyvalues g (g 'weak) null)
     (clearbyvalues g (g 'allweak) null)
@@ -962,6 +1000,7 @@
 (defn- singlestep (L:(ptr lua_State) fast:i32):l_mem
   (let (g:(ptr global_State) (G L)
         stepresult:l_mem 0)
+    (lua_assert (= (g 'gcstopem) 0))  ; the collector isn't reentrant
     (set! (g 'gcstopem) 1)  ; no emergency collections inside a collection
     (case (as i32 (g 'gcstate))
       GCSpause
@@ -999,12 +1038,13 @@
               (set! stepresult CWUFIN))
           (do (set! (g 'gcstate) GCSpause)  ; done, or no room to finalize
               (set! stepresult step2pause)))
-      (return 0))
+      (do (lua_assert false) (return 0)))
     (set! (g 'gcstopem) 0)
     (return stepresult)))
 
 (defn gc-runtilstate (L:(ptr lua_State) state:i32 fast:i32):void
   (let (g:(ptr global_State) (G L))
+    (lua_assert (= (g 'gckind) KGC_INC))
     (while (!= state (as i32 (g 'gcstate)))
       (singlestep L fast))))
 
@@ -1030,14 +1070,17 @@
 ; it from being called at every check.
 (defn gc-step (L:(ptr lua_State)):void
   (let (g:(ptr global_State) (G L))
+    (lua_assert (= (g 'gcemergency) 0))
     (if (!= (g 'gcstp) 0)
       (when (!= (bit-and (g 'gcstp) GCSTPUSR) 0)
         (state-setdebt g 20000))
-      (case (as i32 (g 'gckind))
-        (:or KGC_INC KGC_GENMAJOR) (incstep L g)
-        KGC_GENMINOR (do (youngcollection L g)
-                         (setminordebt g))
-        0))))
+      (do (luai_tracegc L 1)  ; for internal debugging
+          (case (as i32 (g 'gckind))
+            (:or KGC_INC KGC_GENMAJOR) (incstep L g)
+            KGC_GENMINOR (do (youngcollection L g)
+                             (setminordebt g))
+            0)
+          (luai_tracegc L 0)))))
 
 ; A full incremental collection. With the invariant kept there may be black
 ; objects, so everything is swept white first.
@@ -1052,6 +1095,7 @@
 ; A full cycle; in an emergency, without finalizers and shrinking.
 (defn gc-fullgc (L:(ptr lua_State) isemergency:i32):void
   (let (g:(ptr global_State) (G L))
+    (lua_assert (= (g 'gcemergency) 0))
     (set! (g 'gcemergency) (cast_uchar isemergency))
     (case (as i32 (g 'gckind))
       KGC_GENMINOR (fullgen L g)

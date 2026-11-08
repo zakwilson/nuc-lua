@@ -91,6 +91,10 @@
           (= tag LUA_VLCF) (return (hashpointer t (fvalue key)))
           true (return (hashpointer t (gcvalue key))))))
 
+; For the tests' T.hash (ltable.c defines it under LUA_DEBUG).
+(defn table-mainposition (t:(ptr Table) key:(ptr TValue)):(ptr c/Node)
+  (return (mainposition-tv t key)))
+
 (defn- mainpositionfromnode (t:(ptr Table) nd:(ptr c/Node)):(ptr c/Node)
   (let (key:(ptr TValue) (alloca TValue))
     (getnodekey null key nd)
