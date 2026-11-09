@@ -696,10 +696,10 @@
         (if (hashkeyisempty t m) (set! j m) (set! i m))))
     (return i)))
 
-(defn- binsearch (array:(ptr Table) i:ui32 j:ui32):ui32
+(defn- binsearch (arr:(ptr Table) i:ui32 j:ui32):ui32
   (while (> (- j i) 1)
     (let (m:ui32 (/ (+ i j) 2))
-      (if (arraykeyisempty array m) (set! j m) (set! i m))))
+      (if (arraykeyisempty arr m) (set! j m) (set! i m))))
   (return i))
 
 ; A border, kept as the hint for the next call.

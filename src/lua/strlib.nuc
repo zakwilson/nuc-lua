@@ -247,23 +247,23 @@
       (return p))))
 
 (defn- match-class (c:i32 cl:i32):i32
-  (let (res:i32 0)
-    (case (tolower cl)
-      (ch \a) (set! res (isalpha c))
-      (ch \c) (set! res (iscntrl c))
-      (ch \d) (set! res (isdigit c))
-      (ch \g) (set! res (isgraph c))
-      (ch \l) (set! res (islower c))
-      (ch \p) (set! res (ispunct c))
-      (ch \s) (set! res (isspace c))
-      (ch \u) (set! res (isupper c))
-      (ch \w) (set! res (isalnum c))
-      (ch \x) (set! res (isxdigit c))
-      (ch \z) (set! res (if (= c 0) 1 0))  ; deprecated
-      (return (if (= cl c) 1 0)))
-    (return (cond (!= (islower cl) 0) res
-                  (= res 0) 1
-                  true 0))))
+       (let (res:i32 0)
+         (case (tolower cl)
+               (ch \a) (set! res (is-alpha c))
+               (ch \c) (set! res (is-cntrl c))
+               (ch \d) (set! res (is-digit c))
+               (ch \g) (set! res (is-graph c))
+               (ch \l) (set! res (is-lower c))
+               (ch \p) (set! res (is-punct c))
+               (ch \s) (set! res (is-space c))
+               (ch \u) (set! res (is-upper c))
+               (ch \w) (set! res (is-alnum c))
+               (ch \x) (set! res (is-xdigit c))
+               (ch \z) (set! res (if (= c 0) 1 0)) ; deprecated
+               (return (if (= cl c) 1 0)))
+         (return (cond (!= (islower cl) 0) res
+                       (= res 0) 1
+                       true 0))))
 
 (defn- matchbracketclass (c:i32 p0:(ptr i8) ec:(ptr i8)):i32
   (let (sig:i32 1
@@ -398,7 +398,7 @@
                           (set! p ep)
                           (continue))
                         (set! s null)))  ; no match
-                (!= (isdigit (uc c1)) 0)  ; a back reference, %0-%9?
+                (!= (is-digit (uc c1)) 0)  ; a back reference, %0-%9?
                   (do (set! s (match-capture ms s (uc c1)))
                       (when (!= s null)
                         (set! p (p+ p 2))
@@ -591,7 +591,7 @@
         (= (deref p) (ch \%)) (luaL_addchar b (deref p))  ; '%%'
         (= (deref p) (ch \0))  ; '%0'
           (luaL_addlstring b (cstr s) (cast_sizet (byte-diff e s)))
-        (!= (isdigit (uc (deref p))) 0)  ; '%n'
+        (!= (is-digit (uc (deref p))) 0)  ; '%n'
           (let (cap:(ptr i8) null
                 resl:i64 (get-onecapture ms (- (as i32 (deref p)) (ch \1)) s e &cap))
             (if (= resl CAP_POSITION)
@@ -698,7 +698,7 @@
           (do (luaL_addchar b (ch \\))
               (luaL_addchar b (deref s)))
         (!= (iscntrl (uc (deref s))) 0)
-          (do (if (= (isdigit (uc (aref s 1))) 0)
+          (do (if (= (is-digit (uc (aref s 1))) 0)
                 (snprintf buff 10 "\\%d" (uc (deref s)))
                 (snprintf buff 10 "\\%03d" (uc (deref s))))
               (luaL_addstring b (cstr buff)))
@@ -746,9 +746,9 @@
       true (luaL_argerror L arg "value has no literal form"))))
 
 (defn- get2digits (s:(ptr i8)):(ptr i8)
-  (when (= (isdigit (uc (deref s))) 0) (return s))
+  (when (= (is-digit (uc (deref s))) 0) (return s))
   (let (t:(ptr i8) (p+ s 1))
-    (return (if (!= (isdigit (uc (deref t))) 0) (p+ t 1) t))))  ; two digits at most
+    (return (if (!= (is-digit (uc (deref t))) 0) (p+ t 1) t))))  ; two digits at most
 
 ; Whether the specification in 'form' (from '%' to its conversion) takes only
 ; 'flags', a width, and a precision when 'precision' says so.
@@ -759,7 +759,7 @@
       (set! spec (get2digits spec))
       (when (and (= (deref spec) (ch \.)) precision)
         (set! spec (get2digits (p+ spec 1)))))
-    (when (= (isalpha (uc (deref spec))) 0)  ; not at the end?
+    (when (= (is-alpha (uc (deref spec))) 0)  ; not at the end?
       (luaL_error L "invalid conversion specification: '%s'" form))))
 
 ; Copies a specification into 'form', and returns where its last character is.

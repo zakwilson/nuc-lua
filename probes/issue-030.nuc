@@ -6,4 +6,4 @@
 (import-use "lua.h")
 (defconst X LUA_IDSIZE)
 (defstruct S a:i32 b:(array i8 X))
-(defn main ():i32 (printf "%d %d\n" (as i32 X) (as i32 (sizeof S))) (return 0))
+(defn main ():i32 (printf "%d %d\n" (as i32 X) (unsafe/cast i32 (sizeof S))) (return 0))

@@ -1,7 +1,7 @@
 ; ISSUE-034: in a namespaced file, a header's `Node` is silently the prelude's AST Node.
-; expect: prints `7`; actual: `field: no field 'u' on struct 'Node'`
-; run: $NUCLEUSC --cflag=-I$D $P -o $W/p && $W/p
-; fixed-when-output: 7
+; expect: an error naming both `Node`s (fixed: the use is refused); actual: `field: no field 'u' on struct 'Node'`
+; run: $NUCLEUSC --cflag=-I$D $P -o $W/p 2>&1 | grep -o "error: 'Node' is the prelude's nucleus.core/Node in this namespaced file"
+; fixed-when-output: error: 'Node' is the prelude's nucleus.core/Node in this namespaced file
 (ns p34)
 (import-use "stdio.h")
 (import-use "issue-034.h")

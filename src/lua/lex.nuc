@@ -161,7 +161,7 @@
 ; %d(%x|%.|([Ee][+-]?))* or 0[Xx](%x|%.|([Pp][+-]?))*, a sign only after an
 ; exponent mark, so that '3-4' and '0xe+1' aren't one numeral. The caller may
 ; have read a dot already.
-(defn- read-numeral (ls:(ptr LexState) seminfo:(ptr SemInfo)):i32
+(defn- read-numeral (ls:(ptr LexState) seminf:(ptr SemInfo)):i32
   (let (obj:(ptr TValue) (alloca TValue)
         e1:i32 (ch \E)
         e2:i32 (ch \e)
@@ -180,9 +180,9 @@
     (when (= (obj-str2num (cstr (zio-buffer (ls 'buff))) obj) 0)
       (lexerror ls "malformed number" TK_FLT))
     (if (ttisinteger obj)
-      (do (set! (seminfo 'i) (ivalue obj))
+      (do (set! (seminf 'i) (ivalue obj))
           (return TK_INT))
-      (do (set! (seminfo 'r) (fltvalue obj))
+      (do (set! (seminf 'r) (fltvalue obj))
           (return TK_FLT)))))
 
 ; Reads '[=*[' or ']=*]', leaving the last bracket: the number of '='s plus 2
@@ -198,7 +198,7 @@
                   (= count 0) 1
                   true 0))))
 
-(defn- read-long-string (ls:(ptr LexState) seminfo:(ptr SemInfo) sep:usize):void
+(defn- read-long-string (ls:(ptr LexState) seminf:(ptr SemInfo) sep:usize):void
   (let (line:i32 (ls 'linenumber))  ; for the error message
     (save_and_next ls)  ; the second '['
     (when (currIsNewline ls)  ; a first newline is skipped
@@ -206,7 +206,7 @@
     (while true
       (let (c:i32 (ls 'current))
         (cond (= c EOZ)
-                (let (what:CStr (if (!= seminfo null) "string" "comment"))
+                (let (what:CStr (if (!= seminf null) "string" "comment"))
                   (lexerror ls (obj-pushfstring (ls 'L) "unfinished long %s (starting at line %d)"
                                                  what line)
                             TK_EOS))
@@ -217,12 +217,12 @@
               (or (= c LF) (= c CR))
                 (do (save ls LF)
                     (inclinenumber ls)
-                    (when (= seminfo null)  ; a comment: don't waste space
+                    (when (= seminf null)  ; a comment: don't waste space
                       (zio-resetbuffer (ls 'buff))))
               true
-                (if (!= seminfo null) (save_and_next ls) (next-char ls)))))
-    (when (!= seminfo null)
-      (set! (seminfo 'ts) (lex-newstring ls (cstr (p+ (zio-buffer (ls 'buff)) sep))
+                (if (!= seminf null) (save_and_next ls) (next-char ls)))))
+    (when (!= seminf null)
+      (set! (seminf 'ts) (lex-newstring ls (cstr (p+ (zio-buffer (ls 'buff)) sep))
                                           (- (zio-bufflen (ls 'buff)) (* 2 sep)))))))
 
 (defn- esccheck (ls:(ptr LexState) c:bool msg:CStr):void
@@ -284,7 +284,7 @@
 (defconst ONLY-SAVE 1)  ; save 'c'
 (defconst NO-SAVE 2)
 
-(defn- read-string (ls:(ptr LexState) del:i32 seminfo:(ptr SemInfo)):void
+(defn- read-string (ls:(ptr LexState) del:i32 seminf:(ptr SemInfo)):void
   (save_and_next ls)  ; the delimiter, for error messages
   (while (!= (ls 'current) del)
     (let (cur:i32 (ls 'current))
@@ -325,10 +325,10 @@
                   (save ls c)))
             true (save_and_next ls))))
   (save_and_next ls)  ; the delimiter
-  (set! (seminfo 'ts) (lex-newstring ls (cstr (p+ (zio-buffer (ls 'buff)) 1))
+  (set! (seminf 'ts) (lex-newstring ls (cstr (p+ (zio-buffer (ls 'buff)) 1))
                                       (- (zio-bufflen (ls 'buff)) 2))))
 
-(defn- llex (ls:(ptr LexState) seminfo:(ptr SemInfo)):i32
+(defn- llex (ls:(ptr LexState) seminf:(ptr SemInfo)):i32
   (zio-resetbuffer (ls 'buff))
   (while true
     (let (c:i32 (ls 'current))
@@ -353,7 +353,7 @@
             (= c (ch \[))  ; a long string or a '['
               (let (sep:usize (skip-sep ls))
                 (when (>= sep 2)
-                  (read-long-string ls seminfo sep)
+                  (read-long-string ls seminf sep)
                   (return TK_STRING))
                 (when (= sep 0)  ; '[=...' without the second bracket
                   (lexerror ls "invalid long string delimiter" TK_STRING))
@@ -381,7 +381,7 @@
               (do (next-char ls)
                   (return (if (check-next1 ls (ch \:)) TK_DBCOLON (ch \:))))
             (or (= c (ch \")) (= c 39))  ; a short string; 39 is '
-              (do (read-string ls c seminfo)
+              (do (read-string ls c seminf)
                   (return TK_STRING))
             (= c (ch \.))  ; '.', '..', '...' or a numeral
               (do (save_and_next ls)
@@ -389,8 +389,8 @@
                     (return (if (check-next1 ls (ch \.)) TK_DOTS TK_CONCAT)))
                   (if (not (lisdigit (ls 'current)))
                     (return (ch \.))
-                    (return (read-numeral ls seminfo))))
-            (and (>= c (ch \0)) (<= c (ch \9))) (return (read-numeral ls seminfo))
+                    (return (read-numeral ls seminf))))
+            (and (>= c (ch \0)) (<= c (ch \9))) (return (read-numeral ls seminf))
             (= c EOZ) (return TK_EOS)
             (lislalpha c)  ; a name or a reserved word
               (do (while true
@@ -401,7 +401,7 @@
                                                        (zio-bufflen (ls 'buff))))
                     (if (isreserved ts)
                       (return (+ (- (as i32 (ts 'extra)) 1) FIRST_RESERVED))
-                      (do (set! (seminfo 'ts) (anchorstr ls ts))
+                      (do (set! (seminf 'ts) (anchorstr ls ts))
                           (return TK_NAME)))))
             true  ; a single-byte token: '+', '*', '%', '{', '}', ...
               (do (next-char ls)

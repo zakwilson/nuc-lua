@@ -229,10 +229,12 @@ struct worked, so the diagnostic contradicted itself.
 
 - **Severity:** major
 - **Kind:** missing-feature
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Probe:** `probes/issue-004.nuc` — expected `3`; actual `defvar: unsupported init symbol 'f'`
 - **Port sites:** every `luaL_Reg` table (one per library), opcode and metamethod tables
 - **Workaround:** fill the table at run time, or push each function in `luaopen_`.
+- **Ruling:** make it a constant all the time if that doesn't cause problems, allow a storage class attribute (like stage 14) if it does.
+- **Fix:** a function's name is a constant in any `defvar` initializer, a field of an aggregate included; no storage class was needed. A slot of another function type is refused with both types; a bare `ptr` slot takes any function. `probes/issue-004.nuc` prints `3`.
 
 Context: `(defvar g:(fn i32)(i32) f)` is accepted, as a run-time initializer, but
 the same name inside `(array Reg (Reg "f" f) …)` is refused, though LLVM takes `@f`
@@ -242,10 +244,12 @@ as a constant. C writes `static const luaL_Reg regs[] = {{"mayi", f_mayi}, {NULL
 
 - **Severity:** major
 - **Kind:** design
-- **Status:** open
+- **Status:** deferred (ruling)
 - **Probe:** `probes/issue-005.nuc` — expected `mine`; actual: the process dies of SIGHUP
 - **Port sites:** every Lua C function in `libs/`
 - **Workaround:** `defn-` for everything a library doesn't export.
+- **Ruling:** defer
+- **Note:** acknowledged; nothing changed.
 
 Context: the first spike module defined `(defn raise (L:ptr):i32 …)` and pushed it
 as a Lua function. `pcall(s.raise)` returned nothing at all: the call went to libc's
@@ -272,9 +276,11 @@ whatever the last call left, because the declared tail took the fixed-argument p
 
 - **Severity:** minor
 - **Kind:** tooling
-- **Status:** worked-around
+- **Status:** not a bug (ruling)
 - **Port sites:** `libs/mayi`, `libs/nucdemo`
 - **Workaround:** the scripts copy `build/lib/libmayi.so` to `mayi.so`.
+- **Ruling:** notabug, users can name dependencies appropriately
+- **Note:** acknowledged; nothing changed.
 
 Context: `require "mayi"` searches `?.so`, so a Lua module is `mayi.so`. `build.edn`
 has no key for the output name.
@@ -283,11 +289,13 @@ has no key for the output name.
 
 - **Severity:** major
 - **Kind:** design
-- **Status:** worked-around
+- **Status:** not a bug (ruling)
 - **Probe:** none needed: `(as f64 a)` with `a:i64` gives `as: lossy conversion from i64 to f64 -- use unsafe/cast`
 - **Port sites:** the first was `build/idiom` (a test module); Lua's `cast_num`
   and every `luai_num*` on a mixed operand will follow
 - **Workaround:** `(unsafe/cast f64 a)`
+- **Ruling:** notabug - (unsafe/cast f64 9007199254740993) yields 9007199254740992.0. A lossy conversion is a canonical example of unsafe behavior.
+- **Note:** acknowledged; nothing changed.
 
 Context: Lua converts integers to floats everywhere arithmetic mixes them, and the
 conversion is fully defined (it rounds). Nucleus files it under `unsafe`, beside
@@ -301,10 +309,12 @@ undefined out of range and does deserve a check; Lua checks it itself
 
 - **Severity:** papercut
 - **Kind:** tooling
-- **Status:** open
+- **Status:** deferred (ruling)
 - **Probe:** any library project with an error: `nucleus build` prints it once for
   `build/obj/<name>.o`, once for `build/include/<name>.nuch` and once for
   `build/include/<name>.h`
+- **Ruling:** defer
+- **Note:** acknowledged; nothing changed.
 
 Context: the three outputs are separate compiler runs over the same source.
 
@@ -312,12 +322,14 @@ Context: the three outputs are separate compiler runs over the same source.
 
 - **Severity:** minor
 - **Kind:** missing-feature
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Port sites:** `scripts/check-layout.sh`; `string.nuc` (`sizestrshr`,
   `luaS_sizelngstr`, `udatamemoffset`); `lfunc.h`'s `sizeofCclosure` and `ltable.c` will follow
 - **Workaround:** the layout gate takes a global of the struct and subtracts its
   address from the field's. The core has `offsetof` in `util.nuc`, which reads the
   field's address off a struct pointer cast from the constant 4096; it folds to a constant.
+- **Ruling:** Add `offsetof` as a macro, or if there's an efficiency advantage, a special form
+- **Fix:** `(offsetof T field)` is a special form, as `sizeof` is, so it folds in a `defconst`, an array length and any constant initializer; it is `usize`, takes a bare or quoted field name, and refuses a bit-field, an opaque type and an unknown field. It is a special form rather than a macro because only the compiler knows a layout, and the form is a constant where the 4096 trick is an expression. **The port must delete `util.nuc`'s `offsetof` macro**: a macro of that name is now refused ("'offsetof' already names a special form").
 
 Context: the layout gate needs every field offset of `luaL_Buffer` and `lua_Debug`.
 The compiler has the number; the docs say `make layout-test` compares Nucleus's
@@ -333,6 +345,11 @@ The compiler has the number; the docs say `make layout-test` compares Nucleus's
   `sizeof(arr)/sizeof(arr[0])` in the C (`lstrlib.c`, `lbaselib.c`, `ltm.c`)
 - **Workaround:** `luaL_newlibtable` counts entries up to the `{NULL, NULL}`
   sentinel at run time; a table with a known length repeats it as a constant.
+- **Ruling:** `sizeof` should take a type, not just a symbol naming one
+- **Question:** not built; the ruling reads as already true. `sizeof` takes any type expression today, not only a name: `(sizeof (array i32 3))`, `(sizeof (ptr i8))` and `(sizeof (union a:i8 b:i64))` all fold. What the port lacks is a way to get from a *value* to its type or length, which is what `sizeof(l)/sizeof((l)[0])` does. Which did you mean?
+  - A. `(sizeof (type-of expr))`: `type-of` is a type expression naming an expression's static type, unevaluated, like C's `sizeof expr` and `typeof`. The most general answer; it needs `node-type` in type position, so it is a new kind of type expression.
+  - B. `(countof arr)`: the element count of an `(array T N)` variable or field, a constant. It answers `luaL_newlibtable` directly and refuses a pointer, where C's idiom silently gives the wrong number.
+  - C. Both.
 
 Context: C's `luaL_newlibtable(L, l)` is `lua_createtable(L, 0, sizeof(l)/sizeof((l)[0]) - 1)`.
 A macro can't ask for an array variable's type or length, so the macro can't keep
@@ -343,11 +360,13 @@ the C signature without a loop the C didn't need.
 - **Severity:** minor
 - **Kind:** known-limitation (`docs/compiler.md`, "Integer constants from a C header":
   "string bodies … are skipped")
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Port sites:** `capi/src/luacapi.nuc` (32 `defconst`s), and `LUA_PATH_DEFAULT`,
   `LUA_NUMBER_FMT`, `LUA_SIGNATURE` in the port
 - **Workaround:** each is written out as a `defconst`, and `scripts/check-layout.sh`
   diffs every one against the C compiler's value so none can drift.
+- **Ruling:** Nucleus should support these, probably by having the importer treat them like `defconst`. Feel free to use an obviously superior mechanism instead if there is one.
+- **Fix:** a macro whose body is string literals and names of other string macros, concatenated as C does (`LUA_VERSION_MAJOR "." LUA_VERSION_MINOR`), imports as a `defconst` of a `c"…"` literal: a `CStr`, C's `const char *`. Escapes are C's. A body with a NUL byte or a non-ASCII escape is skipped with a reason. A user `defconst` of the same name wins, as for integer macros.
 
 Context: `LUA_FILEHANDLE`, `LUA_LOADED_TABLE` and `LUA_VERSION` are as much the API as
 `LUA_REGISTRYINDEX`, and a module author reaches for them by name. Most are a plain
@@ -379,9 +398,11 @@ an overload.
 
 - **Severity:** minor
 - **Kind:** interop
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Port sites:** `src/main.nuc` (2)
 - **Workaround:** `(defconst sig-dfl null)`
+- **Ruling:** If the mechinery for ISSUE-013 can support casts, support them. Else defer.
+- **Fix:** a macro whose body is a cast to a pointer type imports as a constant of that type: `((T) 0)` is a typed null, `SIG_DFL` included, and any other integer (`((void *) -1)`) is that address, as `unsafe/cast` would make it. A cast of a non-zero integer to a *function* pointer (glibc's `SIG_ERR`, `SIG_IGN`) is skipped with a reason, since no Nucleus constant can hold it. The machinery is ISSUE-012's folder, not 013's.
 
 Context: `#define SIG_DFL ((__sighandler_t) 0)` folds as an integer constant, so it
 arrives as `i32` and `(setsignal SIGINT SIG_DFL)` is a type error against the handler
@@ -392,10 +413,12 @@ type or be skipped with a reason, not become an `int`.
 
 - **Severity:** minor
 - **Kind:** design
-- **Status:** worked-around
+- **Status:** deferred (ruling)
 - **Port sites:** all 157 API symbols as the port takes them over
 - **Workaround:** `scripts/check-capi.sh` compares function against data, not strong
   against weak.
+- **Ruling:** defer
+- **Note:** acknowledged; nothing changed.
 
 Context: linkage follows ownership, so every `defn` in an imported file is `weak_odr`, and
 `nm -D` on the port shows `W lua_pushinteger` where stock shows `T`. Loading works the same,
@@ -410,6 +433,8 @@ can be silently replaced by any strong one.
 - **Status:** worked-around
 - **Port sites:** every character test in `lua.c`, `lauxlib.c`, `llex.c`, `lstrlib.c`
 - **Workaround:** `lua.util/ch`, a macro that turns `\e` into the integer literal 101.
+- **Ruling:** adding a byte literal should be possible with a reader macro. If practical, do that with `b\` as the prefix. If not, write up, but do not implement a proposal to add a builtin.
+- **Proposal:** not built: a reader macro can't take `b\` (a prefix may not start with a byte that begins an atom, and every symbol starting with `b` would be ambiguous). The proposal the ruling asks for is nucleus `design/lua-bugfixes/byte-literal.md`: `b\e` read as the integer literal `101`, ASCII only, plus two alternatives. It ends with two questions for the owner.
 
 Context: C writes `if (argv[i][1] == 'e')`. In Nucleus `\e` is a `Char`, a 32-bit
 codepoint, and `(= (aref a 1) \e)` compares an `i8` with it; `(as i8 \e)` is refused as
@@ -420,10 +445,12 @@ almost every line of its lexer and pattern matcher.
 
 - **Severity:** minor
 - **Kind:** design
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Port sites:** `src/main.nuc`, `src/lua/aux.nuc`, and every C string walk to come
 - **Workaround:** `lua.util/bytes`, `(as (ptr i8) (as ptr s))`; pointer arithmetic then
   needs `unsafe/ptr+`, and a result going back to C needs `(as CStr (as ptr p))`.
+- **Ruling:** `aref` should accept a C string as a pointer to an array of bytes/c-chars.
+- **Fix:** `(aref s i)` on a `CStr` reads an `i8`, and `&(aref s i)` is still a `CStr`, so a walk needs no conversion either way. `(set! (aref s i) …)` is refused: a `CStr` is `const char *`, so a write goes through `(ptr i8)`.
 
 Context: `aref` on a `CStr` is `operand must be typed pointer`. Every `const char *` in a
 C API imports as `CStr`, so walking one takes two conversions each way.
@@ -437,6 +464,12 @@ C API imports as `CStr`, so walking one takes two conversions each way.
   `WTERMSIG`), every `errno` in `lauxlib.c`, `liolib.c`, `loslib.c`
 - **Workaround:** `lua.util/errno` and `set-errno` expand to `(deref (__errno_location))`;
   the wait macros are written out by hand from glibc's bit layout in `aux.nuc`.
+- **Ruling:** If practical, roll this into the enhancements in issues 12 and 13.
+- **Question:** not built; this is not practical as part of 012/013. Those fold a macro to one constant. `errno` and the wait macros need the importer to translate C *expressions*, with calls, dereferences and parameters, into Nucleus forms. That is a new translator, the largest item on this list, and executive summary item 3 depends on it. A proposed scope, in order:
+  - E-1: object-like macros whose body is an expression over imported names: `errno` → `(deref (__errno_location))`. Nucleus has no symbol macros, so how is it spelled: `(errno)`, a zero-argument macro (assignable, since `set!` now expands a macro place, ISSUE-020), or a new symbol-macro kind so it stays `errno`?
+  - E-2: function-like macros over arithmetic, bit operations, comparisons and `?:` on their parameters (`WIFEXITED`, `WEXITSTATUS`, `LUA_VNUMINT`'s `makevariant`, ISSUE-029). Import each as an untyped Nucleus `defmacro`, which keeps C's textual semantics, or as an inline `defn` over `i32`, which types it but changes C's promotions?
+  - E-3: calls to other imported functions and macros, and casts, in such bodies (`isalpha`'s table lookup, ISSUE-056).
+  Is that the scope and order you want, and which spelling for E-1 and E-2?
 
 Context: `errno` is `(*__errno_location ())` and the wait macros are function-like
 macros over shifts and masks. Neither imports, so the port spells out glibc's private
@@ -447,11 +480,13 @@ glibc's encoding of a wait status.
 
 - **Severity:** minor
 - **Kind:** design
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Port sites:** `luaL_typeerror`, `luaL_fileresult`, `luaL_tolstring`, the panic
   function; every `cond x ? lua_tostring(...) : "literal"` in the libraries;
   `errorlimit`, `jumpscopeerror`, `getvarattribute` in `parser.nuc`
 - **Workaround:** `lua.util/cstr`, `(as CStr (as ptr p))`.
+- **Ruling:** `char`/`i8` should be accepted as a safe implicit conversion, and `cond`, which `if` expands to should handle them as well as anywhere else.
+- **Fix:** a `char *` (`(ptr i8)` or `(ptr ui8)`) joins a `CStr` or a string literal as `CStr`, in `if`, `cond` and every other join, so `(if c (lua_tostring L -1) "nil")` is a `CStr`. A literal branch beside a `char *` is materialized as a C string, not a `StrView`. The conversion isn't implicit outside joins: a `CStr` slot already accepted a `(ptr i8)`.
 
 Context: a `const char *` parameter imports as `CStr`, but a return value or a struct
 field of the same type imports as `(ptr i8)`. A `let` with a `CStr` slot accepts a
@@ -462,10 +497,12 @@ or CStr". C's `?:` with a string literal on one side is common in Lua's sources.
 
 - **Severity:** papercut
 - **Kind:** missing-feature
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Port sites:** `errno = 0` in `luaL_loadfilex` (3), `liolib.c`, `loslib.c`; the
   `expdesc` union's setters (`set-u`, `set-ind`, `set-uvar`) in `code.nuc`
 - **Workaround:** a second macro, `set-errno`.
+- **Ruling:** `set!` should expand its arguments.
+- **Fix:** `set!` macroexpands a place whose head is a macro, so `(set! (errno) 0)` and the `expdesc` setters work, and `set-errno` can go. A local that shadows the macro's name is still the local (`(set! (into 'opt) …)` with `into` a parameter).
 
 Context: with `(defmacro errno () ...)` expanding to a `deref` place, `(set! (errno) 0)`
 is refused as "not an assignable place". Lisp's `setf` expands the place first; here a
@@ -475,10 +512,12 @@ macro that names a place can be read but not written.
 
 - **Severity:** minor
 - **Kind:** missing-feature
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Port sites:** `luaL_addgsub`; `lstrlib.c` measures every match as `e - s`, and
   `llex.c`, `lobject.c` do the same
 - **Workaround:** `lua.util/byte-diff`, which casts both to `i64` with `unsafe/cast`.
+- **Ruling:** add `unsafe/ptr-`
+- **Fix:** `(unsafe/ptr- p q)` is the element count between two pointers of one element type, an `ssize`, as C's `p - q`. Pointers of different element types, or untyped `ptr`s, are refused.
 
 Context: `unsafe/ptr+` exists, but there is no difference, so `p - q` goes through
 integers: two unchecked casts for an operation C considers safe within one array, and
@@ -492,6 +531,12 @@ the element size is the porter's to remember for anything wider than a byte.
 - **Port sites:** `luaL_checkoption`
 - **Workaround:** the parameter is declared `ptr`, as the import reads
   `const char *const lst[]`, and cast to `(ptr CStr)` inside.
+- **Ruling:** when a header prototype exists, an overload without a definition that conforms to the protoype is an error showing both signatures.
+- **Question:** not built: as written, the ruling would refuse code the standard library depends on. Stage 24 made `free` an overload set: `(defn free (self:&Box):void …)` in `nucleus.box` sits beside `stdlib.h`'s `void free(void *)`, and other library methods overload C names on purpose. Each is "an overload without a definition that conforms to the prototype". Which rule do you want?
+  - A. The ruling literally: any `defn` named like a header function must conform, and the standard library renames (`box-free`, …). This breaks the Stage 24 `free`/`Drop` spelling.
+  - B. Refuse only a definition with the prototype's arity whose parameter types are all C types (pointers, integers, `CStr`), so it reads as an attempt at the C function. `luaL_checkoption` is refused, `free (self:&Box)` is not.
+  - C. Refuse a mismatch only under `(set-ir-prefix "")`, where a definition exists to implement the C name, which is the port's case.
+  B and C can combine. Either way the error shows both signatures as Nucleus types, which also answers "nothing shows how a header's types were read".
 
 Context: written as `lst:(ptr CStr)`, the definition didn't match the header's
 prototype, so it was registered as an overload named
@@ -527,6 +572,8 @@ element of a `&T` had no type for the receiver check.
 - **Port sites:** `luaV_execute` in `vm.nuc`
 - **Workaround:** a module-level `(defvar- vm-disptab:(array ptr 85))`, filled with
   `label-addr`s on the first call, when its first slot is still null.
+- **Ruling:** Write up a plan to support storage class attributes, but defer implementation. Stage14 sketched attributes for storage classes, but didn't implement everything. That's probably needed now.
+- **Plan:** plan written, not built, as ruled: nucleus `design/lua-bugfixes/storage-classes.md`. It covers `:static` (and `:static :const`) `let` bindings with constant initializers, `label-addr` in their initializers lowering to `blockaddress`, and `:align`/`:section`/`:weak`, in phases SC-1 to SC-4. It ends with two questions for the owner.
 
 Context: `lvm.c` threads its dispatch through `static const void *const disptab[] =
 {&&L_OP_MOVE, …}`, which C compiles to a constant table in read-only data. Nucleus
@@ -544,13 +591,15 @@ let the compiler emit C's constant table.
 
 - **Severity:** papercut
 - **Kind:** known-limitation
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Probe:** `probes/issue-046.nuc` — expected `UTC`; actual `undefined: 'tzname' — its
   C header declaration was skipped (/usr/include/time.h:224: an array variable)`
 - **Port sites:** `tests/capi/nuc/src/capi.nuc`
 - **Workaround:** `(extern lua_ident:(array i8 1))` in the module that reads it: the
   length is a guess, harmless while only the address is read, and wrong anywhere
   the definition is also compiled.
+- **Ruling:** `extern` of `(array T 0)` should be allowed
+- **Fix:** `(extern x:(array T 0))` declares C's `extern T x[]`, an array of unknown extent, before or after a `defvar` of any length. A header's array variables now import: `[N]` with its extent folded, and `[]` as length 0. So `lua_ident` reads as `(as ptr lua_ident)`. A `[N]` whose extent doesn't fold is skipped with a reason.
 
 Context: `lua.h` declares one variable, `extern const char lua_ident[]`, and the
 importer skips it, saying why (to its credit). Declaring it in the binding instead,
@@ -597,7 +646,7 @@ landing pads, though a stock C host would still `longjmp`.
 
 - **Severity:** major
 - **Kind:** design
-- **Status:** worked-around
+- **Status:** deferred (ruling)
 - **Probe:** none standalone: it takes two libraries and a host. In
   `libs/nucdemo` without its version script, `nm -D` lists 255 symbols: `luaopen_nucdemo`,
   253 weak functions (`nuc_conj.pnuc_Vector.f64.f64`, `nuc_heap-allocate`, …) and two
@@ -605,6 +654,8 @@ landing pads, though a stock C host would still `longjmp`.
 - **Port sites:** `libs/nucdemo/build.edn`
 - **Workaround:** a version script, `libs/nucdemo/exports.map`, exporting
   `luaopen_nucdemo` only, through `:link-args` (which needed ISSUE-048's fix).
+- **Ruling:** defer
+- **Note:** acknowledged; nothing changed.
 
 Context: every program or library that imports `nucleus.vector` instantiates the
 methods it uses, as `weak_odr` symbols with default visibility, and the prelude's
@@ -638,13 +689,15 @@ the only way to stop ISSUE-049. The fix adds them to that line.
 
 - **Severity:** papercut
 - **Kind:** design
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Probe:** `probes/issue-050.nuc` — expected `7`; actual `macro 'twice' names 'helper',
   which is private to its file`
 - **Port sites:** `libs/nucdemo` (`defn-stat` over `check-stats`), `tests/unit/main.nuc`
   (`check-format` over `formatted`)
 - **Workaround:** give the file an `(ns …)`, with `(set-ir-prefix "")` where a C name
   must survive (`luaopen_nucdemo`, `main`).
+- **Ruling:** files without a namespace add to the `user` namespace. If that's hard to implement, then make a namespace name from the filename. Namespaces are strongly encouraged for production code.
+- **Fix:** took the ruling's fallback, a namespace per file. A file with no `(ns …)` already gives its private names a synthetic namespace of its own (`#pN`). A template now names a `defn-` by that full name, and the file resolves it, so a macro naming its own file's helper works there. The ruling's first choice, the `user` namespace, can't hold private names: two such files with a `defn- helper` each would collide. Expanded in another file, the macro is refused at the use: "'helper', which a macro names, is private to <file>".
 
 Context: a template names what its file defines by full name, so that it expands the
 same in another file; a private name in a file without a namespace has no full name,
@@ -658,9 +711,11 @@ another file would keep the guarantee without the cost.
 
 - **Severity:** papercut
 - **Kind:** design
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Port sites:** `f_setvbuf` (`_IONBF`, `_IOFBF`, `_IOLBF`)
 - **Workaround:** glibc's values, 2, 0 and 1, written out in `iolib.nuc`.
+- **Ruling:** remove the spelling rule; ensure the import checks for collisions.
+- **Fix:** the spelling rule is gone: `_IOFBF`, `_Exit` and every other `_` name a header defines import like any other. Collisions are checked as for any C constant: a user definition of the name wins and the C one yields, and a name the importer already registered is not redefined. The skip-notes table still omits `_` names, because glibc has thousands of them. `unsafe/import-private` is no longer needed for them.
 
 Context: the importer treats every name starting with `_` as the implementation's own
 and leaves it out unless the import is `unsafe/import-private`. ISO C gives a few public
@@ -671,10 +726,12 @@ private name of the header to reach three constants.
 
 - **Severity:** papercut
 - **Kind:** design
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Port sites:** `str_pack`'s `Kstring` case
 - **Workaround:** compare with a constant (`SZINT`), or bind `(sizeof T)` to a `usize` first,
   which converts.
+- **Ruling:** `sizeof` should return `usize`
+- **Fix:** `sizeof` and `alignof` are `usize`, and so is `offsetof`. So that `(* n (sizeof T))` over a signed `n` keeps working, a size query beside a signed operand adapts as a literal does: it takes the signed type, widened to pointer width. `(>= size (sizeof T))` with `size:usize` compares unsigned.
 
 Context: `(>= size (sizeof lua_Unsigned))` with `size:usize` stops with `>=: mixed
 signed/unsigned operands`. `sizeof` yields `ptr-int-type`, which is `i64` on this
@@ -690,6 +747,7 @@ target; the docs call it "a pointer-sized integer (size_t)", meaning its width. 
 - **Probe:** `probes/issue-026.nuc`
 - **Port sites:** every call into `ldebug.h`'s and `ldo.h`'s error functions, starting
   with `lmem`'s `luaG_runerror` and `luaD_throw`
+- **Ruling:** the importer should accept this shape
 
 Context: `llimits.h` defines `l_noret` as `void __attribute__((noreturn))`, so
 `LUAI_FUNC l_noret luaG_runerror (lua_State *L, const char *fmt, ...);` puts the
@@ -702,10 +760,12 @@ after its parameters. No module of the core can raise an error without this.
 
 - **Severity:** major
 - **Kind:** bug
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Probe:** `probes/issue-027.nuc`
 - **Port sites:** `numarith`'s `LUA_OPUNM` in `lobject.nuc`
 - **Workaround:** `(* -1.0 x)`, which is exact and flips the sign of a zero.
+- **Ruling:** if the macro can special case this, do that. If not, update this issue with options.
+- **Fix:** the `-` macro's unary arm is `(_* -1 x)`, not `(_- 0 x)`. For a float, multiplying by -1 is exact and flips the sign of a zero, as `fneg` does. For an integer, signed or unsigned, it is bit-identical to `0 - x`, and constants still fold. LLVM folds the multiply to `fneg`/`neg` at `-O1`. At `-O0` it stays a multiply, which on AVR is a libcall for `i16`/`i32`. If that matters, the alternative is a unary primitive the macro expands to, which needs a boot refresh first, since the boot compiler reads `lib/nucleus/macros.nuc`. `probes/issue-027.nuc` prints `-0 -0`.
 
 Context: `lib/nucleus/macros.nuc` expands `(- x)` to `(_- 0 x)`. For an integer that is
 negation, but IEEE subtraction from zero isn't: `0.0 - 0.0` is `+0.0`, where C's `-x`
@@ -718,10 +778,12 @@ operator can lower to `fneg`, which `node-type` must model too; the macro can't 
 
 - **Severity:** minor
 - **Kind:** bug
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Probe:** `probes/issue-028.nuc`
 - **Workaround:** `bit-xor` with the type's all-ones literal (`0xFFFFFFFF`), or `bit-not`
   on a signed value and a cast.
+- **Ruling:** add the rule for a negative literal to the macro
+- **Fix:** The rule is in the operators, not the macro: `bit-not` can't see its operand's type, as with 027, but `_bit-and`, `_bit-or` and `_bit-xor` see both. A negative literal beside an unsigned operand is its bit pattern at that width, as C converts it, so `(bit-not u)` and a written `(bit-and u -2)` both work. The workaround's `0xFFFFFFFF` can go.
 
 Context: `bit-not` is `(_bit-xor x -1)`, and a literal that doesn't fit its partner's
 type is an error, so every unsigned operand fails with `integer literal -1 does not fit
@@ -734,10 +796,12 @@ operator.
 
 - **Severity:** minor
 - **Kind:** known-limitation
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Port sites:** every variant tag (`lobject.h`), `MAX_LMEM`, `MAX_SIZE` (`llimits.h`),
   `CIST_FRESH` to `CIST_FIN` (`lstate.h`)
 - **Workaround:** `defconst`s in `src/lua/core.nuc`, with the value written out.
+- **Ruling:** Explore supporting this use case. Do so if it's under a hundred lines or so. Report back if not.
+- **Fix:** Built, in about 90 lines. The importer keeps each function-like macro, and a call of one in a constant's body folds: the macro's body with each parameter replaced by the argument's text, as C substitutes it, then folded as any body. So `LUA_VNUMINT` is 3, the twenty variant tags import, and `CIST_FRESH` (`cast(l_uint32, CIST_C) << 1`, a type argument) and `MAX_LMEM` fold to clang's values. A call with the wrong number of arguments, a body using `#` or `##`, and a variadic macro still don't fold. The `defconst`s in `core.nuc` can go.
 
 Context: `#define LUA_VNUMINT makevariant(LUA_TNUMBER, 0)` is skipped as "a macro whose
 body does not fold to an integer constant", though `makevariant(t,v)` is `((t) | ((v) <<
@@ -750,10 +814,12 @@ reach them.
 
 - **Severity:** minor
 - **Kind:** bug
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Probe:** `probes/issue-030.nuc`
 - **Port sites:** `BuffFS` in `lobject.nuc` (`BUFVFS`)
 - **Workaround:** the value written out, 219.
+- **Ruling:** fix
+- **Fix:** The layout prescan ran before the header's constants were in, folded `X` to nothing and marked it done. It now folds a pending constant only if its value folds then; otherwise the use waits for the constant's own form. The probe now writes `(unsafe/cast i32 (sizeof S))`, since `sizeof` is `usize` (025).
 
 Context: `(defconst X LUA_IDSIZE)` folds to 60, and `(defconst BUFVFS (+ LUA_IDSIZE
 LUA_N2SBUFFSZ 95))` to 219, until a `(defstruct S … b:(array i8 X))` names it. Then the
@@ -766,12 +832,14 @@ and the message blames the `defconst`, not the struct that triggered it.
 
 - **Severity:** minor
 - **Kind:** bug
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Probe:** `probes/issue-031.nuc`
 - **Port sites:** `global_State.strcache` in `string.nuc` (`luaS_new`, `luaS_init`,
   `luaS_clearcache`)
 - **Workaround:** `strcache-row` in `core.nuc`: the row's address, `unsafe/cast` to a
   pointer to its element, as C's `TString **p = g->strcache[i]`.
+- **Ruling:** fix
+- **Fix:** An element of an array of arrays decays as a field does: `(aref (g 'strcache) i)` is the row's address, typed `&(ptr TString)`, so `(aref (aref (g 'strcache) i) j)` reads and stores. `strcache-row` can go.
 
 Context: `TString *strcache[STRCACHE_N][STRCACHE_M]` imports, and `(g 'strcache)` decays
 to `&(array (ptr TString) 2)`. `(aref (g 'strcache) i)` is then an `(array (ptr TString)
@@ -789,6 +857,7 @@ of arrays itself, so only an imported type reaches this.
 - **Probe:** `probes/issue-032.nuc`
 - **Port sites:** `UpVal`'s `u.open` in `func.nuc`; `ltable`'s `Node` (a union whose
   `u` is a struct) and `lgc`'s upvalue lists would have followed
+- **Ruling:** 
 
 Context: `(set! (((uv 'u) 'open) 'next) n)`, C's `uv->u.open.next = n`, failed with
 "the receiver is a temporary struct value, so it has no address", for an imported union
@@ -818,11 +887,13 @@ removed.
 
 - **Severity:** minor
 - **Kind:** design
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Probe:** `probes/issue-034.nuc`
 - **Port sites:** `Node` (`lobject.h`'s hash node) in `table.nuc`, and `lgc`, `lvm` to come
 - **Workaround:** a second, prefixed import, `(import "lobject.h" c)`, and `c/Node`
   wherever the type is named.
+- **Ruling:** check for collisions on input and error in this case with a suggestion to use `exclude-prelude` or `import-prefixed` as appropriate.
+- **Fix:** The collision is refused at the use, not the import, which differs from the ruling: refusing the import would stop every namespaced module that imports `lua.h`, the ones that already write `c/Node` among them (18 in the port), though they use nothing ambiguous. In a namespaced file, a bare name that resolves to the prelude's type while a flattened header also defines it is an error naming both, with the ways out: `(import "lobject.h" c)` and `c/Node`, `(exclude-prelude)` in the entry file, or `nucleus.core/Node` for the prelude's. The probe now expects that error. If you want the import-time check instead, say so; it's a small change in where the test runs.
 
 Context: `(import-use "lstate.h")` in a file with `(ns lua.table)` makes `Node` the
 prelude's AST node (`nucleus/core.nuc`), so `((n 'u) 'next)` fails with "no field 'u'
@@ -838,10 +909,12 @@ the prelude, or refusing the ambiguity, is a design decision.
 
 - **Severity:** papercut
 - **Kind:** bug
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Probe:** `probes/issue-035.nuc`
 - **Port sites:** `hashpointer` and `equalkey` in `table.nuc` (a light C function as a key)
 - **Workaround:** through `ptr`: `(unsafe/cast usize (unsafe/cast ptr f))`.
+- **Ruling:** fix
+- **Fix:** `unsafe/cast` takes a function pointer to an integer and back, as C's `(size_t)f`.
 
 Context: C's `point2uint(f)` hashes a `lua_CFunction` by its address. `(unsafe/cast usize
 f)` fails with "cast: unsupported conversion", though `unsafe/cast` takes a function
@@ -853,10 +926,12 @@ whose contract is reinterpreting bits, has no reason to be.
 
 - **Severity:** papercut
 - **Kind:** bug
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Probe:** `probes/issue-036.nuc`
 - **Port sites:** `luaP_opmodes` in `opcodes.nuc`
 - **Workaround:** the macro makes the whole `defvar`, which works at top level.
+- **Ruling:** fix
+- **Fix:** A macro-headed initializer at an array or struct slot expands before its shape is checked, so `(defvar g:(array i32 3) (three))` works.
 
 Context: `luaP_opmodes` is generated from the opcode rows by a macro expanding to an
 `(array ui8 …)` literal, the shape the slot wants. `(defvar luaP_opmodes:(array ui8 85)
@@ -869,12 +944,14 @@ which the docs recommend `macmap` and `~e` for, is the case it stops.
 
 - **Severity:** minor (papercut until M9)
 - **Kind:** missing-feature
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Probe:** `probes/issue-037.nuc`
 - **Port sites:** `Block` in `parser.nuc`; and the layouts as a whole, which stay in the
   stock internal headers (M9)
 - **Workaround:** the struct takes another name, and the header's field is cast at
   each read and store (`fs-bl`).
+- **Ruling:** allow defstruct to complete the empty struct declaration
+- **Fix:** A `defstruct` that links as the same LLVM type as a header's body-less declaration completes it: the declaration takes the fields, and the two are one type, so a header's `struct BlockCnt *` field and the module's `&BlockCnt` agree with no cast.
 
 Context: `lparser.h` declares `struct BlockCnt;` and `FuncState` points to one;
 `lparser.c` gives the body. In C the `.c` file completes the type. A Nucleus
@@ -896,11 +973,13 @@ struct, as C's `.c` file does, is the one change that would free the layouts.
 
 - **Severity:** papercut
 - **Kind:** design
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Probe:** `probes/issue-038.nuc`
 - **Port sites:** `closegoto` (`label` is `lb`), `fieldexp` (C's `field`), `condexp`
   (C's `cond`) in `parser.nuc`
 - **Workaround:** rename.
+- **Ruling:** check for this collision and error.
+- **Fix:** A `let`/`with` binding or parameter named like a special form is refused at its line: `cannot bind 'label': 'label' already names a special form — a symbol may name only one kind of thing`. A private `defn- field` was already refused by the top-level rule. The probe now expects the refusal. The compiler and stdlib renamed their own locals; the port will need the same sweep (`label`, `field`, `quote`, `new` and any local named like a macro, see 051).
 
 Context: `lparser.c` has a function `field` and a parameter `label`. `(defn- field …)`
 is refused at once, plainly: "'field' already names a special form". But
@@ -933,13 +1012,15 @@ same reason, though the type is plain.
 
 - **Severity:** papercut
 - **Kind:** bug
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Probe:** `probes/issue-041.nuc` — expected `4286578687`; actual `integer literal -1
   does not fit ui32`
 - **Port sites:** `luaG_traceexec` in `debug.nuc`, and every `ci->callstatus &= ~CIST_…`
   in `ldo`
 - **Workaround:** `clearbits` in `util.nuc` widens the mask to `i64`, complements it and
   casts back.
+- **Ruling:** add the rule for a negative value to the macro
+- **Fix:** As 028: a negative literal beside an unsigned operand of a bitwise operator is its bit pattern, so `(bit-not (as ui32 0x800000))` is `0xFF7FFFFF`.
 
 Context: `bit-not` is a prelude macro, `(_bit-xor x -1)`, documented as "correct at
 any width in two's complement". The literal `-1` takes the other operand's type, and
@@ -950,10 +1031,12 @@ all-ones literal of the operand's type, or `(- 0 1)` in it, would do.
 
 - **Severity:** minor
 - **Kind:** design
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Probe:** `probes/issue-042.nuc` — expected `different`; actual a crash in `strcmp`
 - **Port sites:** `isEnv` in `debug.nuc`
 - **Workaround:** compare `(as ptr …)` where C compares pointers.
+- **Ruling:** compare pointers first, fall back to comparing contents for two non-null pointers
+- **Fix:** `=` and `!=` on CStrs compare pointers first: the same pointer is equal, a null against a non-null unequal, and only two distinct non-null pointers reach `strcmp`. So `if (what != strlocal)` ports as written.
 
 Context: `ldebug.c` returns `strlocal` or `strupval` and tests the result by identity:
 `what != strlocal && what != strupval`, with `what` possibly `NULL`. Ported as
@@ -991,12 +1074,14 @@ matrix caught it.
 
 - **Severity:** papercut
 - **Kind:** missing-feature
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Probe:** `probes/issue-044.nuc` — expected `abc`; actual `an (array i8 4) slot must
   be initialized with an (array T ...) literal`
 - **Port sites:** `lua_ident` in `api.nuc`
 - **Workaround:** the `defident` macro reads the string literal's bytes and writes the
   `defvar` with an `(array i8 ...)` of them.
+- **Ruling:** I believe a string literal can already conform to a CStr, so a CStr just needs to conform to (array i8 ...)
+- **Fix:** An `(array i8 N)` or `(array ui8 N)` global takes a string initializer, NUL-padded to `N`, as C's `const char x[] = "…"`; one longer than `N - 1` bytes is refused.
 
 Context: `lapi.c` exports `const char lua_ident[]`, a C string whose size is part of
 its type. A `CStr` global would be a pointer, which a C caller's `extern const char
@@ -1008,13 +1093,15 @@ expect of a byte array.
 
 - **Severity:** papercut
 - **Kind:** tooling
-- **Status:** worked-around
-- **Probe:** `probes/issue-039.nuc` — expected no warning; actual one per path that
-  leaves the project
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
+- **Probe:** `probes/issue-039.nuc` — expected `two` from a second program in one
+  `build.edn`; was a warning per path a second project's settings leave by
 - **Port sites:** `luac/build.edn`
 - **Workaround:** `luac` is its own project under `luac/`, whose `:entry` and
   `:source-root` climb to the port's (as its `:c-sources` did until M7); the warnings
   are ignored.
+- **Ruling:** add the `:programs` map
+- **Fix:** `:programs` maps each program's name to its entry, sharing every other setting: `{:programs {lua "src/lua.nuc" luac "src/luac.nuc"}}` builds `build/lua` and `build/luac`, and a shared `:c-sources` object once. `nucleus build` builds all; `--program=luac` one; `run` and `run-repl` need `--program=` when there are several. `:programs` replaces `:entry` (both is an error). `luac/` can fold into the main project. The probe now builds two programs from one `build.edn`.
 
 Context: Lua builds two programs, `lua` and `luac`, from one core. `build.edn` has one
 `:entry` and one `:name`, and a target can't set either, so a second program needs a
@@ -1029,13 +1116,15 @@ of the settings, would cover both.
 
 - **Severity:** minor
 - **Kind:** design
-- **Status:** worked-around
-- **Probe:** `probes/issue-051.nuc` — expected `5`; actual `quote needs the node
-  runtime — add (import-use nucleus.node)`
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
+- **Probe:** `probes/issue-051.nuc` — expected the binding refused, per the ruling;
+  was `quote needs the node runtime — add (import-use nucleus.node)`
 - **Port sites:** `state-shrink-ci` in `state.nuc` and the upvalue list in `func.nuc`
   (a local `next`), once M9's imports made `lex.nuc`'s `next` macro visible there
 - **Workaround:** rename the macro (`next-char`); the core's shared macros got names
   no local would take (`exp-u`, not `u`).
+- **Ruling:** refuse the binding, as with 038
+- **Fix:** The binding is refused, as with 038: `cannot bind 'next': 'next' names a macro in scope, which a list headed by it would expand`, with a note to rename one. A local can no longer shadow a macro, so `next-char` stays as it is, and a module's public macros are names its importers can't bind, which the port's short macro names (`u`, `next`) will meet. The probe now expects the refusal.
 
 Context: `(x 'f)` is how Nucleus reads a field through a pointer, so a local in head
 position is ordinary: `next:(ptr CallInfo)` then `(next 'next)`. If any macro named
@@ -1050,12 +1139,14 @@ every importer's reserved words, so the risk grows with each `import-use`.
 
 - **Severity:** minor
 - **Kind:** known-limitation
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Port sites:** the core's modules, which call one another in cycles (`ldo` raises
   through `ldebug`, which calls `ldo`); 34 macros that a second module used, from
   `mainthread` to `exp-u`
 - **Workaround:** every macro a second module uses lives in `core.nuc`, which
   imports no other core module.
+- **Ruling:** register macros graph-wide
+- **Fix:** Every file's `defmacro` is recorded by the whole-graph prescan, and a use the emission order hasn't reached, across a cycle, compiles the partner's macro then, in its own file's namespace and imports. Its body may still call only what is defined above it in its file. A macro of the `user` namespace is reached this way only from a file that imports its file directly. The shared macros can move back beside their structures. The second complaint, a missing import reported as a cycle, isn't touched: with macros carried, the cycle message is now only about `deferror` ids and `extern` declarations.
 
 Context: until M9 the core's functions kept their C names, so the stock headers
 declared them and every module reached every other without importing it. Renamed,
@@ -1074,12 +1165,14 @@ missing import: a function whose module the file never imported was reported as
 
 - **Severity:** papercut
 - **Kind:** design
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Probe:** `probes/issue-053.nuc` — expected `1 2`; actual `duplicate definition of
   'helper' … both definitions are in namespace 'b'`
 - **Port sites:** `tests/T/src/lua/tests.nuc`, whose `resetCI` met `state.nuc`'s
   private `reset-ci`
 - **Workaround:** rename one (`free-cis`).
+- **Ruling:** add internal linkage if practical, otherwise fix the error message
+- **Fix:** Both. A private `defn-` has internal linkage, so under `(set-ir-prefix "")` it links under its namespace's name (`a__helper` for namespace `a`), and two namespaces' private helpers of one name each link. Public names keep their bare C names. The duplicate message names both namespaces when two share an IR prefix.
 
 Context: the port keeps C's link names with `(set-ir-prefix "")`, so a `defn-` in two
 namespaces is one IR symbol. Refusing that is fair, as two `static` functions of one
@@ -1091,12 +1184,14 @@ should name both namespaces, not say both are in the second.
 
 - **Severity:** papercut
 - **Kind:** bug
-- **Status:** worked-around
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Probe:** `probes/issue-054.nuc` — expected `8`; actual `import: cannot find
   'z.nuc'` when compiled from another directory
 - **Port sites:** `tests/T/src/tmain.nuc`, whose `"../../src/main.nuc"` is relative to
   `tests/T`, where `nucleus build` runs, not to `tests/T/src`
 - **Workaround:** write the path relative to the build directory.
+- **Ruling:** look up the path relative to the importing file
+- **Fix:** A relative `.nuc`/`.nuch` string path is tried beside the importing file first, then as written, so `"../../src/main.nuc"` in `tests/T/src/tmain.nuc` means one file wherever the build starts.
 
 Context: docs/toplevel.md, "Where an import is found", puts "the directory of the file
 that holds the import" first, for a library name or a `.nuc` string path. A library
@@ -1107,12 +1202,14 @@ The same source then means different files depending on where the compiler start
 
 - **Severity:** minor
 - **Kind:** bug
-- **Status:** open
+- **Status:** fixed in nucleus `lua-bugfixes` (uncommitted; see nucleus `design/lua-bugfixes/overview.md`)
 - **Probe:** `probes/issue-055.nuc` — expected `1`; actual `0`: `0x7fff…ffff < 0x8000…0000`
   is false
 - **Port sites:** every pointer comparison: the matcher's `s < src_end`, the stack's
   `top < stack_last`, the lexer's and the dumper's buffer ends
 - **Workaround:** none needed here: x86-64 Linux user addresses are below 2^47.
+- **Ruling:** compare pointers unsigned
+- **Fix:** Pointers compare unsigned: `<`, `<=`, `>`, `>=` on pointers emit `ult`/`ule`/`ugt`/`uge`.
 
 Context: the emitter writes `icmp slt ptr` for `<` on pointers; C compares them
 unsigned. Found reading `singlematch`'s assembly beside clang's (`jle` for `jbe`). On
@@ -1123,12 +1220,14 @@ targets, the port's bound checks would invert. Pointers should take `ult`/`ule`.
 
 - **Severity:** minor
 - **Kind:** interop
-- **Status:** open
+- **Status:** deferred (ruling)
 - **Probe:** `probes/issue-056.nuc` — expected no `call i32 @isalpha` in the IR; actual one
 - **Port sites:** `match-class` in `strlib.nuc` (`tolower`, `isalpha`, `islower`, … per
   character matched); `lctype` has its own table, so the lexer is unaffected
 - **Workaround:** none taken; the fix in the port would read glibc's private
   `__ctype_b_loc` table, which ISSUE-018 already does too much of.
+- **Ruling:** Defer, I'll revisit this and 018 together.
+- **Note:** Deferred, to revisit with 018.
 
 Context: `ctype.h` declares `isalpha` and, under `__OPTIMIZE__`, defines a macro and an
 inline `tolower` over `__ctype_b_loc()`. The import keeps the declaration and drops the
@@ -1142,10 +1241,12 @@ fix would have to choose: the macro, as C does.
 
 - **Severity:** papercut
 - **Kind:** missing-feature
-- **Status:** open
+- **Status:** deferred (ruling)
 - **Port sites:** `vm.nuc`'s `vmbreak` (the hook trap after every opcode) and every
   `l_likely`/`l_unlikely` of the C (51 in the core, 114 in all), written as plain tests
 - **Workaround:** none.
+- **Ruling:** defer
+- **Note:** Deferred.
 
 Context: C's `l_unlikely` is `__builtin_expect`; Nucleus has neither an expectation
 nor a `cold` attribute (`fn-attr` takes string attributes only, and `cold` is an enum
@@ -1174,3 +1275,21 @@ keep the VM's error and hook paths out of its hot loop.
 - `!T` fits `luac`'s option parser (PROMPT §9): it is self-contained, so `doargs`
   returns `(Result i32 CStr)`, the first file's index or what `usage` should say,
   and only `main` exits. A throw that crosses Lua's frames still needs `longjmp`.
+  
+----
+
+      - ISSUE-010 → the port's util.nuc. offsetof is now a reserved special form, so the port's own offsetof macro collides with it. Whichever issue
+        introduced that workaround should say the macro must be deleted or renamed.
+      - ISSUE-025 → ISSUE-011. sizeof and alignof now return usize, and a signed partner adapts as if they were literals. The 011 question (whether "sizeof
+        of an expression" meant (type-of expr) or an array-length form) should say that.
+      - ISSUE-017 → ISSUE-016. (aref s i) on a CStr is now an i8. That is exactly the comparison the byte-literal proposal targets: (= (aref s 1) b\e), or
+        the (as i8 \e) alternative. 016 should cite the 017 fix as the context.
+      - ISSUE-017 → ISSUE-021. &(aref s i) keeps the CStr type, which is what makes (unsafe/ptr- &(aref s 3) s) work. Each entry should mention the other.
+      - ISSUE-024 → any issue whose workaround used unsafe/import-private. _-prefixed C names are now imported normally, so that workaround can go. Two
+        compiler tests, s17-cmacro-refused and s21-cenum-refused, still expect the old refusal. They're our tests, not port issues, but they must be
+        updated.
+      - ISSUE-012, 014 and 046. All three are covered by the single lua-header-macros test and its fixture. Each entry can point to the same test.
+      - ISSUE-045 → ISSUE-015. The storage-class plan (design/lua-bugfixes/storage-classes.md) folds in :weak, which is 015's half. 015 should point to that
+        plan.
+      - ISSUE-022. It conflicts with Stage 24's free (self:&Box) overload. That isn't another port issue, but the entry's questions should name the
+        conflict.

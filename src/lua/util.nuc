@@ -59,11 +59,6 @@
 ; The largest size that fits both size_t and lua_Integer (llimits.h's MAX_SIZE).
 (defmacro MAX_SIZE () `(cast_sizet LUA_MAXINTEGER))
 
-; C's offsetof, read off a struct placed at a fixed address: offsetof itself is
-; missing, and a field's offset can't be had otherwise (ISSUE-010).
-(defmacro offsetof (T f)
-  `(unsafe/cast usize (- (unsafe/cast i64 (as ptr (ref ((unsafe/cast (ptr ~T) 4096) '~f)))) 4096)))
-
 ; 'p' moved by 'n' elements, whatever integer type 'n' is.
 (defmacro p+ (p n) `(unsafe/ptr+ ~p (unsafe/cast i64 ~n)))
 
@@ -109,3 +104,49 @@
                 (< ~d (- 0.0 (unsafe/cast f64 LUA_MININTEGER))))
          (do (set! ~p (unsafe/cast i64 ~d)) true)
          false))))
+
+
+(defconst alpha-table:&bool
+        (array bool false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false true true true true true true true true true true true true true true true true true true true true true true true true true true true false false false false false false true true true true true true true true true true true true true true true true true true true true true true true true true true false false false false false))
+
+(defconst digit-table:&bool
+        (array bool false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false true true true true true true true true true true false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false))
+
+(defconst punct-table:&bool
+        (array bool false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false true true true true true true true true true true true true true true true false false false false false false false false false false true true true true true true true false false false false false false false false false false false false false false false false false false false false false false false false false false true true true true true true false false false false false false false false false false false false false false false false false false false false false false false false false false true true true true false))
+
+(defconst cntrl-table:&bool
+          (array bool true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false true))
+
+(defconst graph-table:&bool
+          (array bool false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true false))
+
+(defconst lower-table:&bool
+          (array bool false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false true true true true true true true true true true true true true true true true true true true true true true true true true true false false false false false))
+
+(defconst space-table:&bool
+          (array bool false false false false false false false false false true true true true true false false false false false false false false false false false false false false false false false false true false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false))
+
+(defconst upper-table:&bool
+          (array bool false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false true true true true true true true true true true true true true true true true true true true true true true true true true true false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false))
+
+(defconst alnum-table:&bool
+          (array bool false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false true true true true true true true true true true false false false false false false false true true true true true true true true true true true true true true true true true true true true true true true true true true false false false false false false true true true true true true true true true true true true true true true true true true true true true true true true true false false false false false))
+
+(defconst xdigit-table:&bool
+          (array bool false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false true true true true true true true true true true false false false false false false false true true true true true true false false false false false false false false false false false false false false false false false false false false false false false false false false true true true true true true false false false false false false false false false false false false false false false false false false false false false false false false false))
+
+(defmacro defcomp (name table)
+  `(defmacro ~name (c)
+     `(as i32 (aref ~'~table ~c))))
+
+(defcomp is-alpha alpha-table)
+(defcomp is-digit digit-table)
+(defcomp is-punct punct-table)
+(defcomp is-cntrl cntrl-table)
+(defcomp is-graph graph-table)
+(defcomp is-lower lower-table)
+(defcomp is-upper upper-table)
+(defcomp is-space space-table)
+(defcomp is-alnum alnum-table)
+(defcomp is-xdigit xdigit-table)

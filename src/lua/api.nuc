@@ -45,19 +45,6 @@
 (defconst HOK 0)
 (defconst HNOTATABLE 2)
 
-; C's 'const char lua_ident[] = "..."': an i8 array takes no string initializer
-; (ISSUE-044), so the macro spells the string out as bytes.
-(defmacro defident (s)
-  (let (vals (node-list-new (s 'line))
-        p ((s 's) 'p)
-        i 0)
-    (while (!= (aref p i) 0)
-      (node-push vals (node-int (as i64 (aref p i))))
-      (set! i (+ i 1)))
-    (node-push vals (node-int 0))
-    `(defvar lua_ident:(array i8 ~(node-int (as i64 (+ i 1)))) (array i8 ~@vals))))
-(defident "$LuaVersion: Lua 5.5.1  Copyright (C) 1994-2026 Lua.org, PUC-Rio $$LuaAuthors: R. Ierusalimschy, L. H. de Figueiredo, W. Celes $")
-
 (defmacro isvalid (L o) `(!= (as ptr ~o) (as ptr (ref ((G ~L) 'nilvalue)))))
 (defmacro ispseudo (i) `(<= ~i LUA_REGISTRYINDEX))
 (defmacro isupvalue (i) `(< ~i LUA_REGISTRYINDEX))

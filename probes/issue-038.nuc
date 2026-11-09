@@ -1,7 +1,7 @@
 ; ISSUE-038: a special form's name can't be a parameter or a private function.
-; expect: prints `3 4`; actual: `label: name must be symbol`
-; run: $NUCLEUSC $P -o $W/p && $W/p
-; fixed-when-output: 3 4
+; expect: a located refusal of each binding (fixed: refused, per the ruling); actual: `label: name must be symbol`
+; run: $NUCLEUSC $P -o $W/p 2>&1 | grep -o "error: 'field' already names a special form"
+; fixed-when-output: error: 'field' already names a special form
 (import-use "stdio.h")
 (defstruct Label pc:i32)
 (defn- field (x:i32):i32 (return (+ x 1)))

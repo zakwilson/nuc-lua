@@ -371,3 +371,315 @@ at `-O2`; a ratio above 1 is the port slower.
 | patterns | 303 | 336 | 1.11 |
 | strings | 195 | 184 | 0.94 |
 | tables | 370 | 339 | 0.92 |
+
+### Benchmark, 2026-11-08, Nucleus b8e711e
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 398 | 460 | 1.16 |
+| closures | 425 | 423 | 1.00 |
+| floats | 280 | 266 | 0.95 |
+| gc | 634 | 597 | 0.94 |
+| metamethods | 375 | 381 | 1.02 |
+| patterns | 289 | 332 | 1.15 |
+| strings | 176 | 171 | 0.97 |
+| tables | 346 | 342 | 0.99 |
+
+### Benchmark, 2026-11-08, Nucleus b8e711e
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 412 | 464 | 1.13 |
+| closures | 429 | 426 | 0.99 |
+| floats | 271 | 265 | 0.98 |
+| gc | 632 | 592 | 0.94 |
+| metamethods | 380 | 378 | 0.99 |
+| patterns | 291 | 333 | 1.14 |
+| strings | 182 | 173 | 0.95 |
+| tables | 347 | 348 | 1.00 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 422 | 476 | 1.13 |
+| closures | 430 | 428 | 1.00 |
+| floats | 267 | 266 | 1.00 |
+| gc | 631 | 597 | 0.95 |
+| metamethods | 380 | 384 | 1.01 |
+| patterns | 289 | 338 | 1.17 |
+| strings | 181 | 170 | 0.94 |
+| tables | 347 | 341 | 0.98 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 413 | 474 | 1.15 |
+| closures | 429 | 430 | 1.00 |
+| floats | 275 | 265 | 0.96 |
+| gc | 645 | 583 | 0.90 |
+| metamethods | 387 | 384 | 0.99 |
+| patterns | 289 | 314 | 1.09 |
+| strings | 178 | 171 | 0.96 |
+| tables | 353 | 339 | 0.96 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 415 | 462 | 1.11 |
+| closures | 427 | 426 | 1.00 |
+| floats | 289 | 267 | 0.92 |
+| gc | 643 | 591 | 0.92 |
+| metamethods | 385 | 385 | 1.00 |
+| patterns | 290 | 321 | 1.11 |
+| strings | 181 | 170 | 0.94 |
+| tables | 344 | 342 | 0.99 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 408 | 467 | 1.14 |
+| closures | 426 | 426 | 1.00 |
+| floats | 277 | 266 | 0.96 |
+| gc | 638 | 597 | 0.94 |
+| metamethods | 374 | 386 | 1.03 |
+| patterns | 288 | 321 | 1.11 |
+| strings | 179 | 174 | 0.97 |
+| tables | 341 | 339 | 0.99 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 411 | 471 | 1.15 |
+| closures | 426 | 431 | 1.01 |
+| floats | 269 | 263 | 0.98 |
+| gc | 649 | 593 | 0.91 |
+| metamethods | 383 | 383 | 1.00 |
+| patterns | 291 | 325 | 1.12 |
+| strings | 181 | 171 | 0.94 |
+| tables | 351 | 361 | 1.03 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 415 | 463 | 1.12 |
+| closures | 426 | 431 | 1.01 |
+| floats | 268 | 263 | 0.98 |
+| gc | 638 | 613 | 0.96 |
+| metamethods | 378 | 375 | 0.99 |
+| patterns | 288 | 325 | 1.13 |
+| strings | 183 | 167 | 0.91 |
+| tables | 350 | 359 | 1.03 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 422 | 464 | 1.10 |
+| closures | 428 | 441 | 1.03 |
+| floats | 270 | 264 | 0.98 |
+| gc | 642 | 586 | 0.91 |
+| metamethods | 379 | 368 | 0.97 |
+| patterns | 285 | 326 | 1.14 |
+| strings | 185 | 170 | 0.92 |
+| tables | 350 | 361 | 1.03 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 430 | 465 | 1.08 |
+| closures | 427 | 435 | 1.02 |
+| floats | 269 | 263 | 0.98 |
+| gc | 633 | 585 | 0.92 |
+| metamethods | 379 | 378 | 1.00 |
+| patterns | 290 | 324 | 1.12 |
+| strings | 181 | 169 | 0.93 |
+| tables | 349 | 362 | 1.04 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 410 | 473 | 1.15 |
+| closures | 427 | 429 | 1.00 |
+| floats | 270 | 263 | 0.97 |
+| gc | 640 | 589 | 0.92 |
+| metamethods | 371 | 374 | 1.01 |
+| patterns | 291 | 332 | 1.14 |
+| strings | 178 | 168 | 0.94 |
+| tables | 350 | 360 | 1.03 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 415 | 468 | 1.13 |
+| closures | 426 | 411 | 0.96 |
+| floats | 272 | 263 | 0.97 |
+| gc | 642 | 606 | 0.94 |
+| metamethods | 378 | 372 | 0.98 |
+| patterns | 287 | 317 | 1.10 |
+| strings | 180 | 170 | 0.94 |
+| tables | 352 | 342 | 0.97 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 427 | 466 | 1.09 |
+| closures | 428 | 411 | 0.96 |
+| floats | 270 | 263 | 0.97 |
+| gc | 630 | 621 | 0.99 |
+| metamethods | 378 | 378 | 1.00 |
+| patterns | 287 | 317 | 1.10 |
+| strings | 179 | 173 | 0.97 |
+| tables | 355 | 344 | 0.97 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 414 | 474 | 1.14 |
+| closures | 426 | 413 | 0.97 |
+| floats | 269 | 263 | 0.98 |
+| gc | 635 | 615 | 0.97 |
+| metamethods | 381 | 384 | 1.01 |
+| patterns | 292 | 318 | 1.09 |
+| strings | 177 | 166 | 0.94 |
+| tables | 348 | 343 | 0.99 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 410 | 481 | 1.17 |
+| closures | 427 | 414 | 0.97 |
+| floats | 268 | 263 | 0.98 |
+| gc | 637 | 616 | 0.97 |
+| metamethods | 376 | 386 | 1.03 |
+| patterns | 291 | 317 | 1.09 |
+| strings | 179 | 173 | 0.97 |
+| tables | 343 | 343 | 1.00 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 400 | 468 | 1.17 |
+| closures | 429 | 413 | 0.96 |
+| floats | 274 | 263 | 0.96 |
+| gc | 642 | 607 | 0.95 |
+| metamethods | 378 | 377 | 1.00 |
+| patterns | 287 | 318 | 1.11 |
+| strings | 179 | 176 | 0.98 |
+| tables | 341 | 344 | 1.01 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 413 | 480 | 1.16 |
+| closures | 427 | 411 | 0.96 |
+| floats | 273 | 264 | 0.97 |
+| gc | 643 | 610 | 0.95 |
+| metamethods | 381 | 375 | 0.98 |
+| patterns | 292 | 315 | 1.08 |
+| strings | 180 | 171 | 0.95 |
+| tables | 348 | 336 | 0.97 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 412 | 470 | 1.14 |
+| closures | 429 | 411 | 0.96 |
+| floats | 269 | 264 | 0.98 |
+| gc | 631 | 607 | 0.96 |
+| metamethods | 377 | 378 | 1.00 |
+| patterns | 290 | 318 | 1.10 |
+| strings | 183 | 171 | 0.93 |
+| tables | 346 | 343 | 0.99 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 424 | 473 | 1.12 |
+| closures | 428 | 431 | 1.01 |
+| floats | 280 | 262 | 0.94 |
+| gc | 636 | 612 | 0.96 |
+| metamethods | 379 | 376 | 0.99 |
+| patterns | 293 | 317 | 1.08 |
+| strings | 181 | 171 | 0.94 |
+| tables | 349 | 380 | 1.09 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 418 | 464 | 1.11 |
+| closures | 427 | 434 | 1.02 |
+| floats | 270 | 265 | 0.98 |
+| gc | 638 | 615 | 0.96 |
+| metamethods | 378 | 376 | 0.99 |
+| patterns | 293 | 322 | 1.10 |
+| strings | 180 | 171 | 0.95 |
+| tables | 351 | 374 | 1.07 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 426 | 475 | 1.12 |
+| closures | 429 | 433 | 1.01 |
+| floats | 272 | 266 | 0.98 |
+| gc | 642 | 611 | 0.95 |
+| metamethods | 378 | 376 | 0.99 |
+| patterns | 292 | 321 | 1.10 |
+| strings | 181 | 173 | 0.96 |
+| tables | 352 | 378 | 1.07 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 417 | 473 | 1.13 |
+| closures | 423 | 432 | 1.02 |
+| floats | 268 | 263 | 0.98 |
+| gc | 642 | 596 | 0.93 |
+| metamethods | 373 | 376 | 1.01 |
+| patterns | 288 | 317 | 1.10 |
+| strings | 182 | 173 | 0.95 |
+| tables | 353 | 378 | 1.07 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 416 | 467 | 1.12 |
+| closures | 428 | 432 | 1.01 |
+| floats | 272 | 265 | 0.97 |
+| gc | 632 | 626 | 0.99 |
+| metamethods | 378 | 374 | 0.99 |
+| patterns | 296 | 320 | 1.08 |
+| strings | 179 | 167 | 0.93 |
+| tables | 340 | 360 | 1.06 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 410 | 462 | 1.13 |
+| closures | 427 | 437 | 1.02 |
+| floats | 277 | 265 | 0.96 |
+| gc | 630 | 605 | 0.96 |
+| metamethods | 377 | 375 | 0.99 |
+| patterns | 288 | 317 | 1.10 |
+| strings | 177 | 168 | 0.95 |
+| tables | 355 | 364 | 1.03 |

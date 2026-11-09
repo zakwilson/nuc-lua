@@ -47,7 +47,7 @@
       (return null))
     (while true
       (let (c:i32 (as i32 (cast_uchar (deref s)))
-            digit:ui32 (cast_uint (if (!= (isdigit c) 0)
+            digit:ui32 (cast_uint (if (!= (is-digit c) 0)
                                     (- c (ch \0))
                                     (+ (- (toupper c) (ch \A)) 10))))
         (when (>= digit base) (return null))  ; invalid numeral
