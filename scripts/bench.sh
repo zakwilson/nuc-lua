@@ -29,6 +29,6 @@ for f in "${files[@]}"; do
   rows+=$'\n'"| $(basename "$f" .lua) | $s | $p | $r |"
 done
 echo "$rows"
-if [ -z "${NOAPPEND:-}" ]; then
-  { echo; echo "### Benchmark, $(date +%F), Nucleus $(git -C "$NUCLEUS_HOME" rev-parse --short HEAD 2>/dev/null)"; echo; echo "$rows"; } >> "$ROOT/PROGRESS.md"
-fi
+#if [ -z "${NOAPPEND:-}" ]; then
+#  { echo; echo "### Benchmark, $(date +%F), Nucleus $(git -C "$NUCLEUS_HOME" rev-parse --short HEAD #2>/dev/null)"; echo; echo "$rows"; } >> "$ROOT/PROGRESS.md"
+#fi
