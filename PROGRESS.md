@@ -436,3 +436,17 @@ at `-O2`; a ratio above 1 is the port slower.
 | patterns | 290 | 264 | 0.91 |
 | strings | 176 | 171 | 0.97 |
 | tables | 350 | 346 | 0.99 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19 - -O3
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 419 | 446 | 1.06 |
+| closures | 430 | 411 | 0.96 |
+| floats | 275 | 259 | 0.94 |
+| gc | 639 | 612 | 0.96 |
+| ints | 317 | 351 | 1.11 |
+| metamethods | 378 | 374 | 0.99 |
+| patterns | 289 | 249 | 0.86 |
+| strings | 182 | 176 | 0.97 |
+| tables | 353 | 337 | 0.95 |
