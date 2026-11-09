@@ -43,7 +43,7 @@
     (cond
       (= (deref s) (ch \-)) (do (set! s (unsafe/ptr+ s 1)) (set! neg true))
       (= (deref s) (ch \+)) (set! s (unsafe/ptr+ s 1)))
-    (when (= (isalnum (as i32 (cast_uchar (deref s)))) 0)  ; no digit?
+    (when (= (is-alnum (as i32 (cast_uchar (deref s)))) 0)  ; no digit?
       (return null))
     (while true
       (let (c:i32 (as i32 (cast_uchar (deref s)))
@@ -53,7 +53,7 @@
         (when (>= digit base) (return null))  ; invalid numeral
         (set! n (+ (* n (as lua_Unsigned base)) (as lua_Unsigned digit)))
         (set! s (unsafe/ptr+ s 1)))
-      (when (= (isalnum (as i32 (cast_uchar (deref s)))) 0) (break)))
+      (when (= (is-alnum (as i32 (cast_uchar (deref s)))) 0) (break)))
     (set! s (unsafe/ptr+ s (as i64 (strspn (cstr s) SPACECHARS))))  ; trailing spaces
     (set! (deref pn) (l_castU2S (if neg (- 0 n) n)))
     (return s)))

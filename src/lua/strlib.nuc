@@ -261,7 +261,7 @@
                (ch \x) (set! res (is-xdigit c))
                (ch \z) (set! res (if (= c 0) 1 0)) ; deprecated
                (return (if (= cl c) 1 0)))
-         (return (cond (!= (islower cl) 0) res
+         (return (cond (!= (is-lower cl) 0) res
                        (= res 0) 1
                        true 0))))
 

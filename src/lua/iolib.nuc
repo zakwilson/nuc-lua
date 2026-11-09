@@ -231,7 +231,7 @@
 
 (defn- readdigits (rn:&RN hex:bool):i32
   (let (count:i32 0)
-    (while (and (!= (if hex (isxdigit (rn 'c)) (isdigit (rn 'c))) 0) (nextc rn))
+    (while (and (!= (if hex (is-xdigit (rn 'c)) (is-digit (rn 'c))) 0) (nextc rn))
       (inc! count))
     (return count)))
 
@@ -248,7 +248,7 @@
     (set! (aref decp 1) (ch \.))  ; and always a dot
     (flockfile f)
     (set! (rn 'c) (getc_unlocked f))
-    (while (!= (isspace (rn 'c)) 0)  ; skip spaces
+    (while (!= (is-space (rn 'c)) 0)  ; skip spaces
       (set! (rn 'c) (getc_unlocked f)))
     (test2 rn (bytes "-+"))  ; a sign
     (when (test2 rn (bytes "00"))

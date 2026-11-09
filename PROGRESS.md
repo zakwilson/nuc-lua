@@ -683,3 +683,42 @@ at `-O2`; a ratio above 1 is the port slower.
 | patterns | 288 | 317 | 1.10 |
 | strings | 177 | 168 | 0.95 |
 | tables | 355 | 364 | 1.03 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 423 | 474 | 1.12 |
+| closures | 427 | 411 | 0.96 |
+| floats | 278 | 263 | 0.95 |
+| gc | 648 | 613 | 0.95 |
+| metamethods | 378 | 376 | 0.99 |
+| patterns | 289 | 264 | 0.91 |
+| strings | 181 | 171 | 0.94 |
+| tables | 351 | 349 | 0.99 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 415 | 467 | 1.13 |
+| closures | 430 | 412 | 0.96 |
+| floats | 269 | 264 | 0.98 |
+| gc | 632 | 622 | 0.98 |
+| metamethods | 377 | 382 | 1.01 |
+| patterns | 291 | 265 | 0.91 |
+| strings | 178 | 170 | 0.96 |
+| tables | 351 | 341 | 0.97 |
+
+### Benchmark, 2026-11-09, Nucleus bd50e19
+
+| program | stock ms | port ms | ratio |
+|---|---:|---:|---:|
+| calls | 417 | 480 | 1.15 |
+| closures | 428 | 411 | 0.96 |
+| floats | 273 | 264 | 0.97 |
+| gc | 639 | 609 | 0.95 |
+| metamethods | 379 | 374 | 0.99 |
+| patterns | 289 | 268 | 0.93 |
+| strings | 179 | 172 | 0.96 |
+| tables | 347 | 342 | 0.99 |
